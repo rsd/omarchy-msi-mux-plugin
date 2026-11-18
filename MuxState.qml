@@ -1,0 +1,548 @@
+pragma Singleton
+import QtQuick
+import Quickshell
+import Quickshell.Io
+import "Model.js" as Model
+
+// The GPU MUX state every bar reads, and the only place a process is started
+// for it. A bar surface exists per monitor, so BarWidget.qml exists once per
+// output; the state is the same for all of them (qmldir declares this file a
+// singleton, which is load-bearing: without it every property read off the
+// name is undefined).
+//
+// What runs, and when (every command an argv array from Model.js):
+//   - DMI read (Model.dmiArgv): once, when the first widget attaches.
+//     Decides hidden / available / unavailable and the override flags
+//     (Model.hardwareDecision).
+//   - stat of the binary and every directory above it (Model.statArgv):
+//     after the DMI read, when the binary path changes, on a panel opening,
+//     and again right before a switch (Model.ownershipVerdict).
+//   - the read-only state read, `<binary> --debug --json [flags]` as the
+//     user (Model.debugArgv): after each stat that finds the binary on
+//     available hardware, and after each switch. Never on a timer: only this
+//     tool changes the mode.
+//   - AC (Model.acArgv): at startup, on a panel opening, every
+//     Model.AC_POLL_MS only while a panel is open, and right before a switch.
+//   - `pgrep -x msi-mux-switch` (Model.pgrepArgv): right before a switch,
+//     once no debug read of this plugin's is running; any msi-mux-switch
+//     already running (a switch from a shell instance left behind by a
+//     reload, or one started by hand) refuses the switch.
+//   - the switch, `pkexec --disable-internal-agent <binary> <mode> --json
+//     [flags]` (Model.switchArgv): only from requestSwitch, after the user
+//     confirmed, and only when the fresh stat, AC read and pgrep all pass.
+//     One at a time. stdout and stderr are read line by line
+//     (Model.applySwitchLine).
+//   - the env file (~/.config/uwsm/env.d/90-msi-mux-gpu): read with a
+//     bounded read that refuses anything but a regular file
+//     (Model.envReadArgv); written only from setEnvChoice
+//     (Model.envWriteArgv: mkdir -p of env.d, the text of Model.envFileText
+//     to the dot-prefixed temporary file Model.ENV_TEMP_NAME beside it,
+//     renamed over it with `mv -T`, the temporary file removed on failure),
+//     removed with `rm -f` (never recursive; also the two temporary names,
+//     Model.envRemoveArgv) on Auto and after Discrete or Integrated is
+//     staged. One change at a time; a choice made while one runs is
+//     applied after it (the latest wins); after each, the file is read back
+//     and the dropdown follows what is on disk. No other file is read for writing, renamed or touched.
+Singleton {
+  id: root
+
+  readonly property string home: Model.cleanHome(Quickshell.env("HOME"))
+  readonly property string pluginDir: Model.pluginDirFromUrl(Qt.resolvedUrl("manifest.json"))
+  readonly property string envFilePath: Model.envFilePath(root.home)
+
+  // The binary path from the widget's setting (Model.binaryPathSetting).
+  property string binaryPath: Model.DEFAULT_BINARY
+
+  // DMI and the hardware decision.
+  property bool dmiRead: false
+  property var dmi: ({ vendor: "", model: "", board: "", bios: "" })
+  readonly property var hardware: Model.hardwareDecision(root.dmi)
+  readonly property bool hidden: !root.dmiRead || root.hardware.state === "hidden"
+
+  // The last stat and what it means.
+  property bool statRead: false
+  property var stats: ({})
+  readonly property var ownership: root.statRead
+    ? Model.ownershipVerdict(root.binaryPath, root.stats)
+    : { ok: false, kind: "", reason: "Checking the backend…" }
+  readonly property bool present: root.statRead && Model.binaryPresent(root.binaryPath, root.stats)
+
+  // Why switching is impossible ("" when it is not): the hardware first,
+  // then the binary.
+  readonly property string unavailableReason: root.hardware.state === "unavailable" ? root.hardware.reason
+    : (root.ownership.ok ? "" : root.ownership.reason)
+  readonly property bool available: root.dmiRead && root.hardware.state === "available" && root.ownership.ok
+  readonly property bool canSetUp: root.hardware.state === "available" && Model.setupHelps(root.ownership)
+    && root.pluginDir !== ""
+
+  // The last debug read (Model.parseDebug).
+  property var debug: Model.emptyDebug()
+
+  // AC: true, false or null (unknown).
+  property var ac: null
+
+  // The switch: "" idle, "checking" (fresh stat and AC), "running".
+  property string phase: ""
+  property string switchMode: ""
+  property bool switchCancel: false
+  property var switchOwner: null
+  property var switchRun: Model.newSwitchRun()
+  // The last finished switch (Model.switchOutcome) and whose it was.
+  property var outcome: null
+  property var outcomeOwner: null
+  property int outcomes: 0
+  readonly property bool busy: root.phase !== ""
+
+  // The env file's state for the dropdown (Model.envChoiceFromFile), and
+  // whether it was changed this session (then the panel says log out).
+  property string envChoice: "auto"
+  property bool envChanged: false
+  property string envError: ""
+  // A write or remove in flight, and the choice asked for meanwhile ("" for
+  // none).
+  property bool envBusy: false
+  property string envQueued: ""
+
+  property var attached: []
+  property var openPanels: []
+  property bool started: false
+
+  signal switchFinished(var owner, var outcome)
+  // The env file was read back and envChoice set from it, changed or not:
+  // the dropdown follows it, so a failed pick does not stay shown.
+  signal envRead()
+
+  // ------------------------------------------------------------ attachment
+
+  function attach(owner, path) {
+    if (root.attached.indexOf(owner) === -1) root.attached = root.attached.concat([owner])
+    root.setBinaryPath(path)
+    if (!root.started) {
+      root.started = true
+      startDelay.restart()
+    }
+  }
+
+  function detach(owner) {
+    root.attached = root.attached.filter(function(o) { return o !== owner })
+    root.releaseOpen(owner)
+  }
+
+  function setBinaryPath(path) {
+    var p = Model.binaryPathSetting(path)
+    if (p === root.binaryPath) return
+    root.binaryPath = p
+    root.statRead = false
+    root.stats = ({})
+    root.debug = Model.emptyDebug()
+    if (root.started && !startDelay.running) root.checkBinary()
+  }
+
+  // A panel opening: everything is read again.
+  function holdOpen(owner) {
+    if (root.openPanels.indexOf(owner) === -1) root.openPanels = root.openPanels.concat([owner])
+    if (!root.dmiRead) root.readDmi()
+    else root.checkBinary()
+    root.readAc()
+    root.rereadEnv()
+  }
+
+  // The last switch's result, once seen: a panel opening clears it (except
+  // the one that reopens itself to show it).
+  function clearOutcome() {
+    root.outcome = null
+    root.outcomeOwner = null
+  }
+
+  function releaseOpen(owner) {
+    root.openPanels = root.openPanels.filter(function(o) { return o !== owner })
+  }
+
+  // The bar hands a widget its settings right after it completes; the first
+  // reads wait for them so they never run against the default by mistake.
+  Timer {
+    id: startDelay
+    interval: 250
+    repeat: false
+    onTriggered: {
+      root.readDmi()
+      root.readAc()
+    }
+  }
+
+  // ------------------------------------------------------------------ reads
+
+  function readDmi() {
+    if (dmiProc.running) return
+    dmiProc.command = Model.dmiArgv()
+    dmiProc.running = true
+  }
+
+  Process {
+    id: dmiProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var parsed = Model.parseDmi(text)
+        if (parsed) root.dmi = parsed
+        root.dmiRead = true
+        root.checkBinary()
+      }
+    }
+  }
+
+  property bool statAgain: false
+
+  function checkBinary() {
+    if (!root.dmiRead || root.hardware.state !== "available") return
+    if (statProc.running) { root.statAgain = true; return }
+    var argv = Model.statArgv(root.binaryPath)
+    if (argv.length === 0) {
+      root.stats = ({})
+      root.statRead = true
+      return
+    }
+    statProc.path = root.binaryPath
+    statProc.command = argv
+    statProc.running = true
+  }
+
+  Process {
+    id: statProc
+    property string path: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (statProc.path !== root.binaryPath) return
+        root.stats = Model.parseStat(text)
+        root.statRead = true
+        root.readDebug()
+      }
+    }
+    onRunningChanged: {
+      if (statProc.running || !root.statAgain) return
+      root.statAgain = false
+      Qt.callLater(root.checkBinary)
+    }
+  }
+
+  property bool debugAgain: false
+
+  function readDebug() {
+    if (!root.present || root.hardware.state !== "available") return
+    // Not while a switch is being checked: pgrep must not see this plugin's
+    // own debug read (finish() reads again).
+    if (debugProc.running || root.phase === "checking") { root.debugAgain = true; return }
+    var argv = Model.debugArgv(root.binaryPath, root.hardware.flags)
+    if (argv.length === 0) return
+    debugProc.path = root.binaryPath
+    debugProc.out = ""
+    debugProc.err = ""
+    debugProc.outDone = false
+    debugProc.errDone = false
+    debugProc.exitCode = -1
+    debugProc.exited = false
+    debugProc.command = argv
+    debugProc.running = true
+  }
+
+  // Finished only when both streams and the exit status are in, in whatever
+  // order they arrive.
+  function finishDebug() {
+    if (!debugProc.outDone || !debugProc.errDone || !debugProc.exited) return
+    if (debugProc.path !== root.binaryPath) return
+    root.debug = Model.parseDebug(debugProc.out, debugProc.err, debugProc.exitCode)
+  }
+
+  Process {
+    id: debugProc
+    property string path: ""
+    property string out: ""
+    property string err: ""
+    property bool outDone: false
+    property bool errDone: false
+    property bool exited: false
+    property int exitCode: -1
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        debugProc.out = text
+        debugProc.outDone = true
+        root.finishDebug()
+      }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        debugProc.err = text
+        debugProc.errDone = true
+        root.finishDebug()
+      }
+    }
+    onExited: function(exitCode, exitStatus) { debugProc.exitCode = exitCode }
+    // Also reached when the binary could not be started (no exited signal):
+    // the exit status is then -1, which reads as a failure.
+    onRunningChanged: {
+      if (debugProc.running) return
+      Qt.callLater(function() {
+        debugProc.exited = true
+        root.finishDebug()
+        if (root.pgrepWaiting) {
+          root.pgrepWaiting = false
+          checkRunning.running = true
+        }
+        if (!root.debugAgain || root.phase === "checking") return
+        root.debugAgain = false
+        root.readDebug()
+      })
+    }
+  }
+
+  function readAc() {
+    if (acProc.running) return
+    acProc.command = Model.acArgv()
+    acProc.running = true
+  }
+
+  Process {
+    id: acProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.ac = Model.parseAc(text)
+    }
+  }
+
+  Timer {
+    interval: Model.AC_POLL_MS
+    running: root.openPanels.length > 0
+    repeat: true
+    onTriggered: root.readAc()
+  }
+
+  // ----------------------------------------------------------------- switch
+
+  // Asked by a widget after its confirmation dialog. The ownership and AC
+  // checks run again first (checkStat, checkAc), and pgrep looks for an
+  // msi-mux-switch already running (checkRunning, started once this plugin's
+  // own debug read is over); the switch starts only if all pass
+  // (startSwitch).
+  property bool pgrepWaiting: false
+
+  function requestSwitch(owner, mode, isCancel) {
+    if (root.busy || !Model.isMode(mode)) return false
+    if (Model.switchBlocker({ unavailableReason: root.unavailableReason, debug: root.debug, busy: false, ac: root.ac }) !== "")
+      return false
+    root.phase = "checking"
+    root.switchMode = mode
+    root.switchCancel = isCancel === true
+    root.switchOwner = owner
+    root.switchRun = Model.newSwitchRun()
+    root.outcome = null
+    checkStat.result = null
+    checkAc.result = undefined
+    checkRunning.result = undefined
+    checkStat.command = Model.statArgv(root.binaryPath)
+    checkStat.path = root.binaryPath
+    checkAc.command = Model.acArgv()
+    checkRunning.command = Model.pgrepArgv()
+    checkStat.running = true
+    checkAc.running = true
+    if (debugProc.running) root.pgrepWaiting = true
+    else checkRunning.running = true
+    return true
+  }
+
+  function finish(outcome) {
+    var owner = root.switchOwner
+    root.pgrepWaiting = false
+    root.phase = ""
+    root.switchOwner = null
+    root.outcome = outcome
+    root.outcomeOwner = owner
+    root.outcomes++
+    root.switchFinished(owner, outcome)
+    // A debug read asked for while the switch was checked.
+    if (root.debugAgain && !debugProc.running) {
+      root.debugAgain = false
+      root.readDebug()
+    }
+  }
+
+  function refused(reason) {
+    root.finish({ kind: "error", message: reason, warning: "", offerShutdown: false })
+  }
+
+  function startSwitch() {
+    if (root.phase !== "checking" || checkStat.result === null || checkAc.result === undefined
+        || checkRunning.result === undefined) return
+    if (checkStat.path !== root.binaryPath) return root.refused("The binary path changed; nothing was run.")
+    root.stats = checkStat.result
+    var verdict = Model.ownershipVerdict(root.binaryPath, checkStat.result)
+    if (!verdict.ok) return root.refused(verdict.reason + " Nothing was run.")
+    root.ac = checkAc.result
+    if (checkAc.result !== true) return root.refused(Model.acText(checkAc.result))
+    var running = Model.runningProblem(checkRunning.result)
+    if (running !== "") return root.refused(running)
+    var argv = Model.switchArgv(root.binaryPath, root.switchMode, root.hardware.flags)
+    if (argv.length === 0 || root.hardware.state !== "available") return root.refused("The switch could not be prepared.")
+    root.phase = "running"
+    switchProc.exitCode = -1
+    switchProc.command = argv
+    switchProc.running = true
+  }
+
+  Process {
+    id: checkStat
+    property string path: ""
+    property var result: null
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        checkStat.result = Model.parseStat(text)
+        root.startSwitch()
+      }
+    }
+  }
+
+  Process {
+    id: checkAc
+    property var result: undefined
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        checkAc.result = Model.parseAc(text)
+        root.startSwitch()
+      }
+    }
+  }
+
+  // pgrep's exit status (1: none running); -1 when it could not start.
+  Process {
+    id: checkRunning
+    property var result: undefined
+    property int exitCode: -1
+    onExited: function(exitCode, exitStatus) { checkRunning.exitCode = exitCode }
+    onRunningChanged: {
+      if (checkRunning.running) { checkRunning.exitCode = -1; return }
+      Qt.callLater(function() {
+        checkRunning.result = checkRunning.exitCode
+        root.startSwitch()
+      })
+    }
+  }
+
+  function ingest(line) {
+    root.switchRun = Model.applySwitchLine(root.switchRun, line)
+  }
+
+  // Handled a turn after the process stopped (callLater), so the lines
+  // still buffered at its exit are folded in first.
+  function switchExited() {
+    if (root.phase !== "running") return
+    var outcome = Model.switchOutcome(root.switchRun, switchProc.exitCode, root.switchMode, root.switchCancel)
+    if ((outcome.kind === "success" || outcome.kind === "cancelled")
+        && (root.switchMode === "discrete" || root.switchMode === "integrated"))
+      root.removeEnvFile()
+    root.finish(outcome)
+    root.readDebug()
+  }
+
+  Process {
+    id: switchProc
+    property int exitCode: -1
+    stdout: SplitParser {
+      onRead: function(data) { root.ingest(data) }
+    }
+    stderr: SplitParser {
+      onRead: function(data) { root.ingest(data) }
+    }
+    onExited: function(exitCode, exitStatus) { switchProc.exitCode = exitCode }
+    // Also reached when pkexec could not be started (exit status stays -1).
+    onRunningChanged: if (!switchProc.running) Qt.callLater(root.switchExited)
+  }
+
+  // --------------------------------------------------------------- env file
+
+  // The read is bounded and never follows a link or opens a FIFO
+  // (Model.envReadArgv); its answer is the dropdown's value.
+  function rereadEnv() {
+    var argv = Model.envReadArgv(root.home)
+    if (argv.length === 0) return
+    if (envReadProc.running) { envReadProc.again = true; return }
+    envReadProc.command = argv
+    envReadProc.running = true
+  }
+
+  Process {
+    id: envReadProc
+    property bool again: false
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (envReadProc.again || root.envBusy) return
+        root.envChoice = Model.parseEnvRead(text)
+        root.envRead()
+      }
+    }
+    onRunningChanged: {
+      if (envReadProc.running || !envReadProc.again) return
+      envReadProc.again = false
+      Qt.callLater(root.rereadEnv)
+    }
+  }
+
+  // Auto removes the file; Intel or RTX writes it. While a change runs, the
+  // latest choice waits and is applied after it.
+  function setEnvChoice(value) {
+    if (!Model.isEnvChoice(value) || root.envFilePath === "") return
+    if (root.envBusy) {
+      root.envQueued = value
+      root.envChanged = true
+      return
+    }
+    if (value === root.envChoice) return
+    root.startEnv(value, true)
+  }
+
+  // After Discrete or Integrated is staged.
+  function removeEnvFile() {
+    if (root.envFilePath === "") return
+    if (root.envBusy) { root.envQueued = "auto"; return }
+    root.startEnv("auto", false)
+  }
+
+  function startEnv(value, byUser) {
+    var argv = value === "auto" ? Model.envRemoveArgv(root.home) : Model.envWriteArgv(root.home, value)
+    if (argv.length === 0) return
+    if (byUser) root.envChanged = true
+    root.envError = ""
+    root.envBusy = true
+    envProc.value = value
+    envProc.command = argv
+    envProc.running = true
+  }
+
+  // A change finished: the next queued choice, or the file read back.
+  function envDone() {
+    var done = envProc.value
+    root.envBusy = false
+    var next = root.envQueued
+    root.envQueued = ""
+    if (next !== "" && next !== done) {
+      root.startEnv(next, true)
+      return
+    }
+    root.rereadEnv()
+  }
+
+  Process {
+    id: envProc
+    property string value: ""
+    onExited: function(exitCode, exitStatus) {
+      if (exitCode !== 0)
+        root.envError = (envProc.value === "auto" ? "Could not remove " : "Could not write ") + root.envFilePath + "."
+    }
+    // Also reached when the command could not be started.
+    onRunningChanged: if (!envProc.running) Qt.callLater(root.envDone)
+  }
+}

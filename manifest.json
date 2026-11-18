@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.rsd.msi-mux",
+  "name": "MSI GPU MUX",
+  "version": "0.1.0",
+  "author": "Raul Dias",
+  "license": "MIT",
+  "description": "Switch the hardware GPU MUX of supported MSI laptops (Discrete, MSHybrid, Integrated) from the Omarchy bar, through msi-mux-switch and the shell's polkit prompt. Shows the current and the staged mode, and in MSHybrid can choose the GPU Hyprland composites on.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "MSI GPU MUX",
+    "description": "GPU icon showing the current MUX mode, with a badge while a switch waits for a full shutdown; click for the three modes, the AC state and, in MSHybrid, Hyprland's base GPU. Hidden on non-MSI hardware.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "binaryPath": "/opt/msi-mux-switch/msi-mux-switch",
+      "warnBeforeIntegrated": true
+    },
+    "schema": [
+      {
+        "key": "binaryPath",
+        "type": "path",
+        "label": "msi-mux-switch path",
+        "defaultValue": "/opt/msi-mux-switch/msi-mux-switch",
+        "description": "Absolute path to the msi-mux-switch binary. The plugin only switches when this file and every directory above it are owned by root and not writable by group or others; Set up backend in the panel fixes the file and its folder. Empty: the default."
+      },
+      {
+        "key": "warnBeforeIntegrated",
+        "type": "boolean",
+        "label": "Warn about external screens before Integrated",
+        "defaultValue": true,
+        "description": "Adds the external-screen warning to the confirmation before staging Integrated (the external outputs are wired to the RTX GPU and probably stay dark)."
+      }
+    ]
+  }
+}

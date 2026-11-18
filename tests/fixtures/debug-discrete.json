@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-11-18T09:20:53.677747948-03:00",
+  "elevated": false,
+  "machine": {
+    "manufacturer": "Micro-Star International Co., Ltd.",
+    "model": "Vector 16 HX AI A2XWIG",
+    "board": "MS-15M3",
+    "board_revision": "REV:1.0",
+    "bios": "E15M3IMS.10E",
+    "expected_hardware": false
+  },
+  "secure_boot": {
+    "available": true,
+    "value": false
+  },
+  "registry": {},
+  "firmware": {
+    "available": true,
+    "value": {
+      "length": 20,
+      "attributes": "0x00000007",
+      "byte5": "0x35",
+      "selected_target_value": 1,
+      "selected_target_mode": "discrete",
+      "current_value": 1,
+      "current_mode": "discrete",
+      "new_switch_supported": true,
+      "integrated_supported": true,
+      "discrete_supported": true,
+      "bit7": false
+    }
+  },
+  "wmi_ap": {
+    "available": false,
+    "error": "inspect /sys/kernel/debug/msi-wmi-platform-ABBC0F6E-8EA1-11D1-00A0-C90629100000-0/get_ap; ensure debugfs is mounted and the process is root: Permission denied (os error 13)"
+  },
+  "display_devices": [
+    {
+      "friendly_name": "PCI display controller 0x10de:0x2c19 at 0000:01:00.0",
+      "status": "driver-bound",
+      "problem_code": null,
+      "present": true,
+      "hardware_ids": [
+        "pci:0x10de:0x2c19",
+        "pci:v000010DEd00002C19sv00001462sd00001474bc03sc00i00"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,74 @@
+#!/bin/bash
+
+# A stand-in for msi-mux-switch in the tests. Logs its arguments (one line per
+# run) to $MM_FAKE_LOG and answers `--debug --json` (plus the two override
+# flags) with the capture in $MM_FAKE_CAPTURE (default: debug-discrete.json
+# beside this file), its selected target replaced by the one a fake switch
+# staged in $MM_FAKE_STATE, if any.
+#
+# A mode argument is refused unless MM_FAKE_SWITCH=1 (set only by the switch
+# flow test, which reaches this through a fake pkexec): then it prints the
+# real tool's event sequence for a successful switch (or `unchanged`) and
+# records the staged target in $MM_FAKE_STATE.
+
+printf '%s\n' "$*" >>"${MM_FAKE_LOG:-/dev/null}"
+
+refuse() {
+  printf '{"event":"error","level":"error","message":"fake msi-mux-switch: refused %s"}\n' "$1" >&2
+  exit 1
+}
+
+capture=${MM_FAKE_CAPTURE:-$(dirname -- "${BASH_SOURCE[0]}")/debug-discrete.json}
+state=${MM_FAKE_STATE:-}
+
+flags_ok() {
+  local a
+  for a in "$@"; do
+    case $a in
+      --allow-unsupported-hardware | --allow-unvalidated-bios) ;;
+      *) refuse "an unknown argument" ;;
+    esac
+  done
+}
+
+if [[ ${1:-} == --debug && ${2:-} == --json ]]; then
+  flags_ok "${@:3}"
+  if [[ -n $state && -s $state ]]; then
+    target=$(<"$state")
+    sed "s/\"selected_target_mode\": \"[a-z-]*\"/\"selected_target_mode\": \"$target\"/" -- "$capture"
+  else
+    cat -- "$capture"
+  fi
+  exit 0
+fi
+
+[[ ${MM_FAKE_SWITCH:-} == 1 ]] || refuse "a non-debug run"
+case ${1:-} in
+  mshybrid) mode=ms-hybrid value=0 ;;
+  discrete) mode=discrete value=1 ;;
+  integrated) mode=integrated value=2 ;;
+  *) refuse "an unknown mode" ;;
+esac
+[[ ${2:-} == --json ]] || refuse "a run without --json"
+flags_ok "${@:3}"
+
+current=discrete
+selected=$current
+[[ -n $state && -s $state ]] && selected=$(<"$state")
+
+event() { printf '{"event":"%s","message":"%s","data":%s}\n' "$1" "$2" "$3"; }
+event current_mode "Current mode: $current" "{\"mode\":\"$current\",\"value\":1}"
+event available_modes "Available modes" '{"modes":["ms-hybrid","discrete","integrated"]}'
+if [[ $mode == "$current" && $mode == "$selected" ]]; then
+  event unchanged "The machine is already in $mode mode. No state was changed." "{\"mode\":\"$mode\",\"value\":$value}"
+  exit 0
+fi
+event selected_mode "Selected mode: $mode" "{\"mode\":\"$mode\",\"value\":$value}"
+event shutdown_required "A full shutdown is required" '{"automatic_shutdown":false}'
+event confirmation_skipped "JSON mode" '{"json_mode":true}'
+printf '{"event":"bitlocker_reminder","level":"warning","message":"fake reminder","data":null}\n' >&2
+event target_staged "staged" '{"byte5_before":"0x35","byte5_after":"0x34"}'
+event apply_ready "ready" '{"data_byte1":"0x01","apply_ready":true}'
+[[ -n $state ]] && printf '%s' "$mode" >"$state"
+event success "Mode '$mode' is staged and the firmware apply handshake succeeded." "{\"mode\":\"$mode\",\"value\":$value,\"manual_shutdown_required\":true,\"verification_command\":\"x\"}"
+exit 0

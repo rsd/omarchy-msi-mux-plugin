@@ -1,0 +1,8 @@
+# What makes MuxState.qml a singleton. `pragma Singleton` in the file alone
+# is not enough: the type has to be declared singleton here too, or the name
+# resolves to the component type instead of an instance and every property
+# read off it is undefined.
+#
+# No `module` line on purpose: the shell loads BarWidget.qml by file URL, and
+# the name below is reached through the implicit import of its directory.
+singleton MuxState 1.0 MuxState.qml
