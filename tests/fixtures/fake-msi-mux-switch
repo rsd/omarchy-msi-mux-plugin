@@ -14,7 +14,10 @@
 # does: the firmware's apply-ready flag stays set until a full shutdown, so
 # after the events printed before its Get_AP preflight it prints the
 # "apply-ready is already set" error on stderr, exits 1 and stages nothing.
-# Removing $MM_FAKE_STATE stands for that shutdown.
+# Removing $MM_FAKE_STATE stands for that shutdown. A file named
+# $MM_FAKE_STATE.apply-ready stands for the flag left set by a failed switch
+# that rolled back, with nothing staged: every mode run is refused the same
+# way.
 
 printf '%s\n' "$*" >>"${MM_FAKE_LOG:-/dev/null}"
 
@@ -72,7 +75,7 @@ event selected_mode "Selected mode: $mode" "{\"mode\":\"$mode\",\"value\":$value
 event shutdown_required "A full shutdown is required" '{"automatic_shutdown":false}'
 event confirmation_skipped "JSON mode" '{"json_mode":true}'
 printf '{"event":"bitlocker_reminder","level":"warning","message":"fake reminder","data":null}\n' >&2
-if [[ $selected != "$current" ]]; then
+if [[ $selected != "$current" || ( -n $state && -e $state.apply-ready ) ]]; then
   printf '{"event":"error","level":"error","message":"apply-ready is already set before any write; refusing an ambiguous transition"}\n' >&2
   exit 1
 fi

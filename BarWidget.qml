@@ -22,6 +22,10 @@ import "Model.js" as Model
 //     offers Shut down now (`omarchy-system shutdown`) or Later. While a
 //     switch is staged no mode has a button: it can be neither replaced nor
 //     cancelled before a full shutdown (Model.STAGED_LOCK_TEXT says so).
+//   - Shut down now on that lock line (Model.lockNotice), shown while a
+//     switch is staged and after an apply-ready refusal with nothing staged
+//     (a leftover firmware flag): the same shutdown dialog, then the same
+//     command.
 //   - Hyprland base GPU (shown in every mode; acts only in MSHybrid):
 //     MuxState.setEnvChoice, which writes or removes
 //     ~/.config/uwsm/env.d/90-msi-mux-gpu only.
@@ -63,9 +67,14 @@ Panel {
     return isFinite(s) && s > 0 ? s : 12
   }
 
-  // The dialogs: which mode is being confirmed, and the shutdown offer.
+  // The dialogs: which mode is being confirmed, and the shutdown offer
+  // (shutdownKind: a Model.lockNotice kind, for the dialog's text).
   property string confirmMode: ""
   property bool shutdownOffered: false
+  property string shutdownKind: "staged"
+
+  // The line under the modes that offers Shut down now (Model.lockNotice).
+  readonly property var lockNotice: Model.lockNotice({ debug: MuxState.debug, outcome: MuxState.outcome, busy: MuxState.busy })
 
   // The panel reopening itself to show a finished switch keeps the result;
   // any other opening clears a result already seen.
@@ -76,7 +85,7 @@ Panel {
   // a time.
   property bool cursorActive: false
   property string cursorKey: ""
-  readonly property var cursorStops: Model.cursorStops(root.rows, { canSetUp: MuxState.canSetUp })
+  readonly property var cursorStops: Model.cursorStops(root.rows, { canSetUp: MuxState.canSetUp, canShutDown: root.lockNotice.kind !== "" })
   readonly property string cursorAt: Model.cursorKeyIn(root.cursorStops, root.cursorKey)
   readonly property bool dialogOpen: confirmDialog.opened || shutdownDialog.opened
 
@@ -103,6 +112,13 @@ Panel {
     var row = root.rows.find(function(r) { return r.mode === mode })
     if (!row || row.action !== "switch" || !row.enabled) return
     MuxState.requestSwitch(root, mode)
+  }
+
+  // The shutdown dialog, opened by a staged switch or the lock line.
+  function offerShutdown(kind) {
+    root.shutdownKind = kind
+    shutdownDialog.selectedIndex = 0
+    root.shutdownOffered = true
   }
 
   function shutDownNow() {
@@ -136,6 +152,7 @@ Panel {
     var a = Model.cursorAction(root.cursorAt)
     if (a.kind === "setup") root.setUpBackend()
     else if (a.kind === "env") envDropdown.open()
+    else if (a.kind === "shutdown") root.offerShutdown(root.lockNotice.kind)
     else if (a.kind === "mode") {
       for (var i = 0; i < root.rows.length; i++)
         if (root.rows[i].mode === a.arg) root.askSwitch(root.rows[i])
@@ -207,10 +224,7 @@ Panel {
         root.reopenForOutcome = true
         root.open()
       }
-      if (outcome && outcome.offerShutdown) {
-        shutdownDialog.selectedIndex = 0
-        root.shutdownOffered = true
-      }
+      if (outcome && outcome.offerShutdown) root.offerShutdown("staged")
     }
     function onEnvChoiceChanged() { root.syncEnvDropdown() }
     function onEnvRead() { root.syncEnvDropdown() }
@@ -410,18 +424,38 @@ Panel {
             }
           }
 
-          // A staged switch locks the mode until a full shutdown. Hidden while
-          // the result below already says the same sentence (a refused switch).
-          Text {
-            visible: MuxState.debug.ok && MuxState.debug.pending
-              && !(!MuxState.busy && MuxState.outcome !== null && MuxState.outcome.message === Model.STAGED_LOCK_TEXT)
+          // A staged switch (or a leftover firmware flag) locks the mode
+          // until a full shutdown, offered here. After a refused switch this
+          // line carries the refusal, so the result below does not repeat it.
+          RowLayout {
+            visible: root.lockNotice.kind !== ""
             width: parent.width
-            text: Model.STAGED_LOCK_TEXT
-            textFormat: Text.PlainText
-            wrapMode: Text.Wrap
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
+            spacing: Style.space(8)
+
+            Text {
+              Layout.fillWidth: true
+              text: root.lockNotice.text
+              textFormat: Text.PlainText
+              wrapMode: Text.Wrap
+              color: root.lockNotice.urgent ? root.urgent : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: root.lockNotice.urgent ? Style.font.bodySmall : Style.font.caption
+            }
+
+            Button {
+              id: shutdownButton
+              readonly property string key: "shutdown"
+              hasCursor: root.cursorActive && root.cursorAt === "shutdown"
+              onHasCursorChanged: if (shutdownButton.hasCursor) root.scrollItemIntoView(shutdownButton)
+              onHovered: function(isHovered) { if (isHovered) root.pointAt("shutdown") }
+              text: "Shut down now"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.bodySmall
+              bordered: true
+              Layout.alignment: Qt.AlignVCenter
+              onClicked: root.offerShutdown(root.lockNotice.kind)
+            }
           }
 
           // The last switch's result; the trigger warning stands out.
@@ -431,6 +465,7 @@ Panel {
             spacing: Style.space(4)
 
             Text {
+              visible: MuxState.busy || !(MuxState.outcome && MuxState.outcome.lock === true)
               width: parent.width
               text: MuxState.busy
                 ? (MuxState.phase === "checking" ? "Checking the backend and AC power…" : "Switching: waiting for authentication and the firmware…")
@@ -533,7 +568,7 @@ Panel {
         anchors.fill: parent
         z: 11
         opened: root.shutdownOffered && root.confirmMode === ""
-        message: Model.SHUTDOWN_MESSAGE
+        message: Model.shutdownMessage(root.shutdownKind)
         cancelText: "Later"
         confirmText: "Shut down now"
         fontFamily: root.fontFamily

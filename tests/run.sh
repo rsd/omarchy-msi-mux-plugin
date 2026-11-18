@@ -523,6 +523,7 @@ ShellRoot {
         shell.log("staged pending " + s.debug.pending + " target " + s.debug.target + " env " + s.envChoice)
         shell.logShown("mshybrid pending")
         shell.logPanel("mshybrid pending")
+        shell.logLock("mshybrid pending")
         // The staged switch locks the mode: a direct re-stage reaches the
         // tool, which refuses it; the panel says so in plain words.
         shell.outcome = null
@@ -576,6 +577,26 @@ ShellRoot {
       } else if (shell.step === 38) {
         if (shell.reads === 0) return
         shell.log("round trip pending " + s.debug.pending + " env " + s.envChoice)
+        // A leftover firmware flag (a failed switch rolled back): nothing
+        // staged, Switch buttons shown, but the tool refuses.
+        flagSet.running = true
+        shell.step = 41
+      } else if (shell.step === 41) {
+        if (flagSet.running) return
+        shell.logPanel("flag before")
+        shell.logLock("flag before")
+        shell.outcome = null
+        shell.log("flag request " + s.requestSwitch(holder, "integrated"))
+        shell.step = 42
+      } else if (shell.step === 42) {
+        if (!shell.outcome || s.busy) return
+        shell.log("flag refused pending " + s.debug.pending)
+        shell.logPanel("flag refused")
+        shell.logLock("flag refused")
+        flagClear.running = true
+        shell.step = 43
+      } else if (shell.step === 43) {
+        if (flagClear.running) return
         s.setEnvChoice("intel")
         shell.step = 4
       } else if (shell.step === 4) {
@@ -680,6 +701,28 @@ ShellRoot {
   Process { id: blocker; command: ["$cfg/run/msi-mux-switch", "30"] }
   Process { id: envDirMode }
   Process { id: stateReset; command: ["rm", "-f", "--", "$cfg/state"] }
+  Process { id: flagSet; command: ["touch", "--", "$cfg/state.apply-ready"] }
+  Process { id: flagClear; command: ["rm", "-f", "--", "$cfg/state.apply-ready"] }
+  // The lock line (its text, shown or not), its Shut down now button and
+  // cursor stop; then the button is pressed through the cursor: the shutdown
+  // dialog opens with its text and is dismissed (Later). Nothing shuts down.
+  function logLock(when) {
+    var w = shell.widget
+    var btn = shell.findAll(w, function(it) { return it.key === "shutdown" && it.text === "Shut down now" }, 0, [])
+    var texts = shell.findAll(w, function(it) { return it.text === w.lockNotice.text && it.wrapMode !== undefined }, 0, [])
+    var line = "lockline " + when + " kind " + w.lockNotice.kind + " text " + (w.lockNotice.text !== ""
+      && texts.filter(function(t) { return shell.shownSelf(t) }).length === 1)
+      + " button " + (btn.length === 1 && shell.shownSelf(btn[0])) + " stop " + (w.cursorStops.indexOf("shutdown") !== -1)
+    if (w.lockNotice.kind !== "") {
+      w.pointAt("shutdown")
+      w.activateCursor()
+      var dlg = shell.findAll(w, function(it) { return it.confirmText === "Shut down now" && it.message !== undefined }, 0, [])
+      line += " offered " + w.shutdownOffered + " dialog " + w.shutdownKind + " open " + (dlg.length === 1 && dlg[0].opened)
+        + " :: " + (dlg.length === 1 ? dlg[0].message : "")
+      w.shutdownOffered = false
+    }
+    shell.log(line + " :: " + w.lockNotice.text)
+  }
   // The widget's env dropdown, found by its label (it has no id outside).
   property int reads: 0
   // Whether the dropdown and every item above it up to the widget are
@@ -765,6 +808,14 @@ EOF
   expect_flow "dropdown integrated pending shown true" "the dropdown is shown with Integrated pending"
   expect_flow "panel integrated pending rows 3 buttons 0 [] lock true" "Integrated staged: no button; the lock line is shown"
   expect_flow "round trip pending false env rtx" "after the round trip the RTX choice is still on disk"
+  expect_flow "lockline mshybrid pending kind staged text true button true stop true offered true dialog staged open true :: The switch is staged. Shut down now to apply it?" "staged: Shut down now on the lock line, a cursor stop, opening the shutdown dialog"
+  expect_flow "panel flag before rows 3 buttons 2 [Switch,Switch] lock false" "a leftover firmware flag looks like nothing staged: two Switch buttons"
+  expect_flow "lockline flag before kind  text false button false stop false :: " "no lock line before the refusal"
+  expect_flow "flag request true" "a switch is asked for with the flag left set"
+  expect_flow "finished owner true kind error offer false warning false :: The firmware still has a switch in progress. A full shutdown clears it." "the refusal with nothing staged reads as the leftover flag"
+  expect_flow "flag refused pending false" "nothing staged after the refusal"
+  expect_flow "panel flag refused rows 3 buttons 2 [Switch,Switch] lock false" "the staged sentence is not shown for the leftover flag"
+  expect_flow "lockline flag refused kind flag text true button true stop true offered true dialog flag open true :: The firmware still has a switch in progress. Shut down now to clear it?" "the leftover flag: its sentence once, Shut down now, a cursor stop, the shutdown dialog's own text"
   expect_flow "env intel" "Intel writes the plugin's exact text"
   expect_flow "env auto" "Auto removes it"
   expect_flow "queued busy true next auto" "Auto picked while RTX is written waits in the queue"
@@ -780,9 +831,9 @@ EOF
   local flags want_pk
   flags=$(sed -n '1s/^--debug --json//p' "$cfg/fake.log" 2>/dev/null)
   want_pk=$(printf '%s\n' "--disable-internal-agent $bin mshybrid --json$flags" "--disable-internal-agent $bin integrated --json$flags" \
-    "--disable-internal-agent $bin integrated --json$flags")
+    "--disable-internal-agent $bin integrated --json$flags" "--disable-internal-agent $bin integrated --json$flags")
   if [[ $(cat "$cfg/pkexec.log" 2>/dev/null) == "$want_pk" ]]; then
-    echo "ok   pkexec ran three times (the refused re-stage included), with exactly the argv arrays expected"
+    echo "ok   pkexec ran four times (the refused re-stage and the leftover-flag refusal included), with exactly the argv arrays expected"
   else
     echo "FAIL pkexec log: $(tr '\n' '|' <"$cfg/pkexec.log" 2>/dev/null)"
     ok=1

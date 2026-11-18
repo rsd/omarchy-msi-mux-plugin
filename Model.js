@@ -488,17 +488,23 @@ var TRIGGER_WARNING = "The firmware may already have received the switch. Save y
 // Once a switch is staged, the firmware's apply-ready flag stays set until a
 // full shutdown, and the tool refuses every further mode run with
 // STAGED_LOCK_ERROR: a staged switch can be neither replaced nor cancelled.
+// A failed switch that rolled back can leave the flag set with nothing
+// staged (target equal to current): the same refusal then reads
+// FIRMWARE_FLAG_TEXT.
 var STAGED_LOCK_TEXT = "A switch is staged. It can't be changed or cancelled until after a full shutdown."
+var FIRMWARE_FLAG_TEXT = "The firmware still has a switch in progress. A full shutdown clears it."
 var STAGED_LOCK_ERROR = "apply-ready is already set before any write"
 
-// What a finished run means: { kind, message, warning, offerShutdown }.
+// What a finished run means: { kind, message, warning, offerShutdown }, plus
+// lock: true on the tool's apply-ready refusal.
 // kind: "success" | "unchanged" | "auth-cancelled" | "not-authorized" |
 // "error". Success needs both the success event and exit status 0. pkexec's
 // own 126 and 127 are the dialog dismissed and authorization refused;
 // pkexec's own explanation (the first line that is not a JSON event, e.g.
 // "No authentication agent found.") is added to the 127 message. The tool's
-// refusal while a switch is staged (STAGED_LOCK_ERROR) is STAGED_LOCK_TEXT.
-function switchOutcome(run, exitCode, mode) {
+// refusal (STAGED_LOCK_ERROR) is STAGED_LOCK_TEXT while the debug read shows
+// a switch staged (`staged`), else FIRMWARE_FLAG_TEXT.
+function switchOutcome(run, exitCode, mode, staged) {
   var r = run || newSwitchRun()
   var warning = r.triggerSent ? TRIGGER_WARNING : ""
   var notes = r.warnings.length ? " " + r.warnings.join(" ") : ""
@@ -515,7 +521,7 @@ function switchOutcome(run, exitCode, mode) {
   if (exitCode < 0 && r.events.length === 0)
     return { kind: "error", message: "pkexec could not be started. Nothing was changed.", warning: warning, offerShutdown: false }
   if (r.errors.length && r.errors[0].indexOf(STAGED_LOCK_ERROR) !== -1)
-    return { kind: "error", message: STAGED_LOCK_TEXT, warning: warning, offerShutdown: false }
+    return { kind: "error", message: staged === true ? STAGED_LOCK_TEXT : FIRMWARE_FLAG_TEXT, warning: warning, offerShutdown: false, lock: true }
   var why = r.errors.length ? r.errors[0] : exitCode === 0
     ? "msi-mux-switch did not report success."
     : "msi-mux-switch failed (exit status " + exitCode + ")."
@@ -847,6 +853,25 @@ function confirmMessage(mode, warnIntegrated) {
 }
 
 var SHUTDOWN_MESSAGE = "The switch is staged. Shut down now to apply it? Save your work first. A reboot does not apply it; it needs a full shutdown and power-on."
+var SHUTDOWN_FLAG_MESSAGE = "The firmware still has a switch in progress. Shut down now to clear it? Save your work first. A reboot is not enough; it needs a full shutdown and power-on."
+
+// The shutdown dialog's text for a lockNotice kind ("flag", else staged).
+function shutdownMessage(kind) {
+  return kind === "flag" ? SHUTDOWN_FLAG_MESSAGE : SHUTDOWN_MESSAGE
+}
+
+// The line under the mode rows that offers Shut down now: { kind, text,
+// urgent }. kind "staged" while the debug read shows a switch staged,
+// "flag" after an apply-ready refusal with nothing staged (the leftover
+// firmware flag), else "" (no line). urgent: it answers a refused switch.
+function lockNotice(s) {
+  var st = s || {}
+  var d = st.debug || emptyDebug()
+  var refused = st.busy !== true && !!st.outcome && st.outcome.lock === true
+  if (d.ok && d.pending) return { kind: "staged", text: STAGED_LOCK_TEXT, urgent: refused }
+  if (refused) return { kind: "flag", text: FIRMWARE_FLAG_TEXT, urgent: true }
+  return { kind: "", text: "", urgent: false }
+}
 
 // The setting as the widget reads it: anything but false is true.
 function warnSetting(value) {
@@ -856,11 +881,12 @@ function warnSetting(value) {
 // ---------------------------------------------------------------- cursor
 
 // The panel's keyboard cursor stands on one control, named by a key:
-//   setup  mode|<mode>  env
+//   setup  mode|<mode>  shutdown  env
 // in screen order: Set up backend (when offered), each mode row's enabled
-// button (none while a switch is staged), the Hyprland base GPU dropdown
-// (always shown). Disabled controls are not stops. Up/Down (and Left/Right)
-// step through them.
+// button (none while a switch is staged), Shut down now on the lock line
+// (when shown, see lockNotice), the Hyprland base GPU dropdown (always
+// shown). Disabled controls are not stops. Up/Down (and Left/Right) step
+// through them.
 function cursorStops(rows, o) {
   var opt = o || {}
   var stops = []
@@ -870,14 +896,15 @@ function cursorStops(rows, o) {
     var r = list[i]
     if (r && r.action !== "" && r.enabled) stops.push("mode|" + r.mode)
   }
+  if (opt.canShutDown === true) stops.push("shutdown")
   stops.push("env")
   return stops
 }
 
-// { kind: "setup" | "mode" | "env" | "", arg }
+// { kind: "setup" | "mode" | "shutdown" | "env" | "", arg }
 function cursorAction(key) {
   var k = String(key === undefined || key === null ? "" : key)
-  if (k === "setup" || k === "env") return { kind: k, arg: "" }
+  if (k === "setup" || k === "env" || k === "shutdown") return { kind: k, arg: "" }
   if (k.indexOf("mode|") === 0 && isMode(k.slice(5))) return { kind: "mode", arg: k.slice(5) }
   return { kind: "", arg: "" }
 }

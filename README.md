@@ -30,10 +30,17 @@ effect after a **full shutdown** and power-on. A reboot is not enough. After a
 successful switch the panel offers **Shut down now** (Omarchy's
 `omarchy-system shutdown`) or **Later**. Once staged, the switch can't be
 changed or cancelled until after a full shutdown: the firmware keeps it armed
-and msi-mux-switch refuses any further mode change until then.
+and msi-mux-switch refuses any further mode change until then. While it waits,
+the panel says so and offers **Shut down now** on that line, through the same
+confirmation.
+
+A failed switch that rolled back can leave the firmware's flag set with nothing
+staged. The panel then still shows the Switch buttons, but msi-mux-switch
+refuses them; the panel says "The firmware still has a switch in progress. A
+full shutdown clears it." and offers **Shut down now** there too.
 
 The panel works from the keyboard too: the first key press shows a cursor,
-the arrow keys (or `j`/`k`) move it between the enabled buttons and the
+the arrow keys (or `j`/`k`) move it between the enabled buttons (Shut down now included) and the
 dropdown, Enter or Space activates, Esc closes.
 
 The widget is hidden on machines that are not MSI. On an MSI machine it is

@@ -439,7 +439,8 @@ Singleton {
   // still buffered at its exit are folded in first.
   function switchExited() {
     if (root.phase !== "running") return
-    var outcome = Model.switchOutcome(root.switchRun, switchProc.exitCode, root.switchMode)
+    var outcome = Model.switchOutcome(root.switchRun, switchProc.exitCode, root.switchMode,
+      root.debug.ok && root.debug.pending)
     root.finish(outcome)
     root.readDebug()
   }

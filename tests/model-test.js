@@ -427,14 +427,20 @@ test("events: the refusal while a switch is staged is the plain sentence; other 
   assert.strictEqual(M.STAGED_LOCK_TEXT, "A switch is staged. It can't be changed or cancelled until after a full shutdown.")
   // The real tool's refusal, after the events it prints before Get_AP.
   const refusal = SUCCESS_RUN.slice(0, 6).concat([errLine("apply-ready is already set before any write; refusing an ambiguous transition")])
-  const o = M.switchOutcome(fold(refusal), 1, "integrated")
-  assert.deepStrictEqual(o, { kind: "error", message: M.STAGED_LOCK_TEXT, warning: "", offerShutdown: false })
+  const o = M.switchOutcome(fold(refusal), 1, "integrated", true)
+  assert.deepStrictEqual(o, { kind: "error", message: M.STAGED_LOCK_TEXT, warning: "", offerShutdown: false, lock: true })
+  // The same refusal with nothing staged: a leftover firmware flag.
+  assert.strictEqual(M.FIRMWARE_FLAG_TEXT, "The firmware still has a switch in progress. A full shutdown clears it.")
+  for (const staged of [false, undefined, "yes"])
+    assert.deepStrictEqual(M.switchOutcome(fold(refusal), 1, "integrated", staged),
+      { kind: "error", message: M.FIRMWARE_FLAG_TEXT, warning: "", offerShutdown: false, lock: true }, String(staged))
   // Only that error: a neighbour stays raw.
   const other = M.switchOutcome(fold([errLine("apply-ready never asserted after the trigger")]), 1, "integrated")
   assert.strictEqual(other.message, "apply-ready never asserted after the trigger")
+  assert.strictEqual(other.lock, undefined, "only the apply-ready refusal is a lock")
   // No "cancelled" kind is left.
   assert.ok(!/"cancelled"/.test(source))
-  assert.strictEqual(M.switchOutcome.length, 3, "no isCancel parameter")
+  assert.strictEqual(M.switchOutcome.length, 4, "run, exit status, mode, staged; no isCancel parameter")
 })
 
 test("events: unchanged is a no-op", () => {
@@ -629,6 +635,38 @@ test("dialogs: the mode and the full shutdown are named; Integrated warns unless
   assert.strictEqual(M.warnSetting(undefined), true)
   assert.strictEqual(M.warnSetting(false), false)
   assert.ok(/Shut down now/.test(M.SHUTDOWN_MESSAGE) && /full shutdown/.test(M.SHUTDOWN_MESSAGE))
+  // One dialog, two texts: a staged switch, or a leftover firmware flag.
+  assert.strictEqual(M.shutdownMessage("staged"), M.SHUTDOWN_MESSAGE)
+  assert.strictEqual(M.shutdownMessage(""), M.SHUTDOWN_MESSAGE)
+  assert.strictEqual(M.shutdownMessage(undefined), M.SHUTDOWN_MESSAGE)
+  const flag = M.shutdownMessage("flag")
+  assert.strictEqual(flag, M.SHUTDOWN_FLAG_MESSAGE)
+  for (const msg of [M.SHUTDOWN_MESSAGE, flag]) {
+    assert.ok(/Shut down now/.test(msg) && /full shutdown/.test(msg) && /Save your work/.test(msg), msg)
+    assert.ok(/A reboot (does not apply it|is not enough)/.test(msg), msg)
+  }
+  assert.ok(/firmware still has a switch in progress/.test(flag) && !/staged/.test(flag))
+})
+
+test("lock line: staged, leftover firmware flag, or nothing", () => {
+  const staged = M.parseDebug(withFirmware({ selected_target_mode: "ms-hybrid" }), "", 0)
+  const clean = M.parseDebug(CAPTURE, "", 0)
+  assert.strictEqual(staged.pending, true)
+  assert.strictEqual(clean.pending, false)
+  const lockOut = { kind: "error", message: M.FIRMWARE_FLAG_TEXT, warning: "", offerShutdown: false, lock: true }
+  const otherOut = { kind: "error", message: "x", warning: "", offerShutdown: false }
+  const none = { kind: "", text: "", urgent: false }
+  assert.deepStrictEqual(M.lockNotice({ debug: staged, outcome: null, busy: false }), { kind: "staged", text: M.STAGED_LOCK_TEXT, urgent: false })
+  assert.deepStrictEqual(M.lockNotice({ debug: staged, outcome: lockOut, busy: false }), { kind: "staged", text: M.STAGED_LOCK_TEXT, urgent: true },
+    "a refusal while staged: the line says it, once, in the error colour")
+  assert.deepStrictEqual(M.lockNotice({ debug: staged, outcome: lockOut, busy: true }), { kind: "staged", text: M.STAGED_LOCK_TEXT, urgent: false })
+  assert.deepStrictEqual(M.lockNotice({ debug: clean, outcome: lockOut, busy: false }), { kind: "flag", text: M.FIRMWARE_FLAG_TEXT, urgent: true },
+    "nothing staged but the firmware refused: the leftover flag")
+  assert.deepStrictEqual(M.lockNotice({ debug: clean, outcome: lockOut, busy: true }), none, "a new run hides the old refusal")
+  assert.deepStrictEqual(M.lockNotice({ debug: clean, outcome: otherOut, busy: false }), none)
+  assert.deepStrictEqual(M.lockNotice({ debug: clean, outcome: null, busy: false }), none)
+  assert.deepStrictEqual(M.lockNotice(null), none)
+  assert.deepStrictEqual(M.lockNotice({ debug: Object.assign({}, staged, { ok: false }), outcome: null }), none, "an unread state shows no line")
 })
 
 test("wording: shut down, never an instruction to reboot", () => {
@@ -652,6 +690,11 @@ test("cursor: stops in screen order, disabled buttons skipped", () => {
   assert.deepStrictEqual(M.cursorStops(pending, {}), ["env"], "no mode stop while a switch is staged")
   assert.deepStrictEqual(M.cursorStops(pending, { canSetUp: true }), ["setup", "env"], "setup and env stay")
   assert.deepStrictEqual(M.cursorStops(null, null), ["env"], "the env dropdown is a stop in every mode")
+  // Shut down now on the lock line sits between the modes and the dropdown.
+  assert.deepStrictEqual(M.cursorStops(pending, { canSetUp: true, canShutDown: true }), ["setup", "shutdown", "env"])
+  assert.deepStrictEqual(M.cursorStops(rows, { canShutDown: true }), ["mode|mshybrid", "mode|integrated", "shutdown", "env"],
+    "a leftover firmware flag: Switch buttons and Shut down now")
+  assert.deepStrictEqual(M.cursorStops(pending, { canShutDown: "yes" }), ["env"])
 })
 
 test("cursor: stepping, falling back, and the action under it", () => {
@@ -669,6 +712,7 @@ test("cursor: stepping, falling back, and the action under it", () => {
   assert.deepStrictEqual(M.cursorAction("mode|integrated"), { kind: "mode", arg: "integrated" })
   assert.deepStrictEqual(M.cursorAction("setup"), { kind: "setup", arg: "" })
   assert.deepStrictEqual(M.cursorAction("env"), { kind: "env", arg: "" })
+  assert.deepStrictEqual(M.cursorAction("shutdown"), { kind: "shutdown", arg: "" })
   for (const bad of ["mode|bogus", "", null, "switch|x"]) assert.deepStrictEqual(M.cursorAction(bad), { kind: "", arg: "" })
 })
 
@@ -924,8 +968,8 @@ test("panel: keyboard cursor, the staged lock line, per-row reasons, stale resul
   const bar = qmlCode("BarWidget.qml")
   assert.ok(/PanelKeyCatcher \{\s*id: keyCatcher/.test(bar))
   assert.ok(/focusTarget: keyCatcher/.test(bar))
-  assert.ok(/Model\.cursorStops\(root\.rows, \{ canSetUp: MuxState\.canSetUp \}\)/.test(bar))
-  for (const k of ['"setup"', '"env"', "modeButton.key"])
+  assert.ok(/Model\.cursorStops\(root\.rows, \{ canSetUp: MuxState\.canSetUp, canShutDown: root\.lockNotice\.kind !== "" \}\)/.test(bar))
+  for (const k of ['"setup"', '"env"', '"shutdown"', "modeButton.key"])
     assert.ok(new RegExp("hasCursor: root\\.cursorActive && root\\.cursorAt === " + k.replace(/\./g, "\\.")).test(bar), k)
   // No cancel path: the confirmation is a plain Switch, and the staged lock
   // is one line under the modes, shown only while a switch is staged.
@@ -937,13 +981,22 @@ test("panel: keyboard cursor, the staged lock line, per-row reasons, stale resul
   const confirmBody = confirm.slice(0, confirm.indexOf("\n  }\n"))
   assert.ok(/if \(!row \|\| row\.action !== "switch" \|\| !row\.enabled\) return/.test(confirmBody))
   assert.ok(confirmBody.indexOf("root.rows.find(") < confirmBody.indexOf("MuxState.requestSwitch("))
-  const lock = bar.indexOf("text: Model.STAGED_LOCK_TEXT")
+  assert.ok(/readonly property var lockNotice: Model\.lockNotice\(\{ debug: MuxState\.debug, outcome: MuxState\.outcome, busy: MuxState\.busy \}\)/.test(bar))
+  const lock = bar.indexOf("text: root.lockNotice.text")
   assert.ok(lock > bar.indexOf("model: root.rows"), "the lock line follows the mode rows")
-  const lockText = bar.slice(bar.lastIndexOf("Text {", lock), bar.indexOf("}", lock))
-  assert.ok(/visible: MuxState\.debug\.ok && MuxState\.debug\.pending/.test(lockText))
-  // Not repeated under a refused switch whose result is the same sentence.
-  assert.ok(/!\(!MuxState\.busy && MuxState\.outcome !== null && MuxState\.outcome\.message === Model\.STAGED_LOCK_TEXT\)/.test(lockText))
-  assert.ok(/color: root\.dim/.test(lockText) && /font\.pixelSize: Style\.font\.caption/.test(lockText))
+  const lockRow = bar.slice(bar.lastIndexOf("RowLayout {", lock), bar.indexOf("onClicked:", lock) + 80)
+  assert.ok(/visible: root\.lockNotice\.kind !== ""/.test(lockRow))
+  assert.ok(/color: root\.lockNotice\.urgent \? root\.urgent : root\.dim/.test(lockRow))
+  // Shut down now on it: the one shutdown dialog, never the command itself.
+  assert.ok(/text: "Shut down now"/.test(lockRow) && /onClicked: root\.offerShutdown\(root\.lockNotice\.kind\)/.test(lockRow))
+  assert.ok(!/execDetached/.test(lockRow))
+  assert.ok(/else if \(a\.kind === "shutdown"\) root\.offerShutdown\(root\.lockNotice\.kind\)/.test(bar), "the cursor opens the same dialog")
+  assert.ok(/message: Model\.shutdownMessage\(root\.shutdownKind\)/.test(bar))
+  assert.ok(/if \(outcome && outcome\.offerShutdown\) root\.offerShutdown\("staged"\)/.test(bar))
+  assert.strictEqual((bar.match(/ConfirmDialog \{/g) || []).length, 2, "the switch and the shutdown dialogs only")
+  assert.strictEqual((bar.match(/Quickshell\.execDetached\(Model\.SHUTDOWN_ARGV\)/g) || []).length, 1, "one shutdown path")
+  // The refusal is said once: on the lock line, not repeated as the result.
+  assert.ok(/visible: MuxState\.busy \|\| !\(MuxState\.outcome && MuxState\.outcome\.lock === true\)/.test(bar))
   assert.ok(/text: modeRow\.row \? modeRow\.row\.reason : ""/.test(bar))
   assert.ok(!/root\.blocker/.test(bar), "no separate blocker line repeating AC or busy")
   assert.ok(/if \(root\.reopenForOutcome\) root\.reopenForOutcome = false\s*else if \(!MuxState\.busy\) MuxState\.clearOutcome\(\)/.test(bar))
@@ -962,7 +1015,7 @@ test("manifest: identity, version and the settings schema", () => {
   assert.strictEqual(m.id, "io.github.rsd.msi-mux")
   assert.strictEqual(m.id, M.PLUGIN_ID)
   assert.strictEqual(m.name, "MSI GPU MUX")
-  assert.strictEqual(m.version, "0.2.1")
+  assert.strictEqual(m.version, "0.2.2")
   assert.strictEqual(m.license, "MIT")
   assert.deepStrictEqual(m.kinds, ["bar-widget"])
   assert.deepStrictEqual(m.entryPoints, { barWidget: "BarWidget.qml" })
