@@ -12,9 +12,10 @@ waiting for a full shutdown. Click it for the panel:
 - the current mode, and the staged one ("Discrete → MSHybrid after shutdown");
 - whether AC power is connected (the firmware switch requires it);
 - the three modes, each with a one-line description and a **Switch** button
-  (when a button is disabled, the row says why); while a switch is staged, the
-  current mode offers **Cancel pending**;
-- in MSHybrid, a **Hyprland base GPU** dropdown (see
+  (when a button is disabled, the row says why); while a switch is staged, no
+  mode has a button;
+- a **Hyprland base GPU** dropdown, shown in every mode and in effect only in
+  MSHybrid (see
   [What this does to your Hyprland config](#what-this-does-to-your-hyprland-config)).
 
 | Mode | What it is |
@@ -27,7 +28,9 @@ Every switch asks for confirmation first, then for your password through
 Omarchy's own polkit prompt. A switch only **stages** the new mode: it takes
 effect after a **full shutdown** and power-on. A reboot is not enough. After a
 successful switch the panel offers **Shut down now** (Omarchy's
-`omarchy-system shutdown`) or **Later**.
+`omarchy-system shutdown`) or **Later**. Once staged, the switch can't be
+changed or cancelled until after a full shutdown: the firmware keeps it armed
+and msi-mux-switch refuses any further mode change until then.
 
 The panel works from the keyboard too: the first key press shows a cursor,
 the arrow keys (or `j`/`k`) move it between the enabled buttons and the
@@ -58,6 +61,22 @@ omarchy plugin add https://github.com/rsd/omarchy-msi-mux-plugin.git --enable
 Or copy (or clone) this repository to
 `~/.config/omarchy/plugins/io.github.rsd.msi-mux` yourself and run
 `omarchy plugin enable io.github.rsd.msi-mux`.
+
+After changing the plugin's files (an edit or a `git pull` in a working copy),
+the running shell may keep the old code. Omarchy reloads a plugin when files
+under `~/.config/omarchy/plugins/` change, but that watch does not follow
+symlinks, so a working copy linked into that folder is not reloaded. Force a
+reload with:
+
+```bash
+omarchy-shell shell rescanPlugins
+```
+
+If the panel still behaves like the old code, disable and re-enable it:
+
+```bash
+omarchy plugin disable io.github.rsd.msi-mux && omarchy-shell shell rescanPlugins && omarchy plugin enable io.github.rsd.msi-mux
+```
 
 Then set up the backend (next section). Until then the icon is greyed and the
 panel says why.

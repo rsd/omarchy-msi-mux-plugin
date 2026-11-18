@@ -37,7 +37,8 @@ import "Model.js" as Model
 //     (Model.envReadArgv); written only from setEnvChoice
 //     (Model.envWriteArgv: mkdir -p of env.d, the text of Model.envFileText
 //     to the dot-prefixed temporary file Model.ENV_TEMP_NAME beside it,
-//     renamed over it with `mv -T`, the temporary file removed on failure),
+//     renamed over it with `mv -T`, the temporary file removed on failure;
+//     a previous build's leftover Model.ENV_LEGACY_TEMP_NAME removed too),
 //     removed with `rm -f` (never recursive; also the two temporary names,
 //     Model.envRemoveArgv) only on Auto. Staging a mode never touches it:
 //     the choice survives a mode round trip (the file acts only in
@@ -85,7 +86,6 @@ Singleton {
   // The switch: "" idle, "checking" (fresh stat and AC), "running".
   property string phase: ""
   property string switchMode: ""
-  property bool switchCancel: false
   property var switchOwner: null
   property var switchRun: Model.newSwitchRun()
   // The last finished switch (Model.switchOutcome) and whose it was.
@@ -329,13 +329,12 @@ Singleton {
   // (startSwitch).
   property bool pgrepWaiting: false
 
-  function requestSwitch(owner, mode, isCancel) {
+  function requestSwitch(owner, mode) {
     if (root.busy || !Model.isMode(mode)) return false
     if (Model.switchBlocker({ unavailableReason: root.unavailableReason, debug: root.debug, busy: false, ac: root.ac }) !== "")
       return false
     root.phase = "checking"
     root.switchMode = mode
-    root.switchCancel = isCancel === true
     root.switchOwner = owner
     root.switchRun = Model.newSwitchRun()
     root.outcome = null
@@ -440,7 +439,7 @@ Singleton {
   // still buffered at its exit are folded in first.
   function switchExited() {
     if (root.phase !== "running") return
-    var outcome = Model.switchOutcome(root.switchRun, switchProc.exitCode, root.switchMode, root.switchCancel)
+    var outcome = Model.switchOutcome(root.switchRun, switchProc.exitCode, root.switchMode)
     root.finish(outcome)
     root.readDebug()
   }
@@ -490,7 +489,9 @@ Singleton {
   }
 
   // Auto removes the file; Intel or RTX writes it. While a change runs, the
-  // latest choice waits and is applied after it.
+  // latest choice waits and is applied after it. envError is cleared only by
+  // a choice that starts at once; a queued one leaves the earlier error
+  // shown, and replaces it only if it fails too.
   function setEnvChoice(value) {
     if (!Model.isEnvChoice(value) || root.envFilePath === "") return
     if (root.envBusy) {
@@ -499,6 +500,7 @@ Singleton {
       return
     }
     if (value === root.envChoice) return
+    root.envError = ""
     root.startEnv(value)
   }
 
@@ -506,7 +508,6 @@ Singleton {
     var argv = value === "auto" ? Model.envRemoveArgv(root.home) : Model.envWriteArgv(root.home, value)
     if (argv.length === 0) return
     root.envChanged = true
-    root.envError = ""
     root.envBusy = true
     envProc.value = value
     envProc.command = argv

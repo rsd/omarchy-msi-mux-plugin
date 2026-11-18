@@ -394,7 +394,7 @@ test("events: a full run ends in success and offers the shutdown", () => {
   const run = fold(SUCCESS_RUN)
   assert.strictEqual(run.success, true)
   assert.deepStrictEqual(run.warnings, [], "the BitLocker reminder is not shown")
-  const o = M.switchOutcome(run, 0, "mshybrid", false)
+  const o = M.switchOutcome(run, 0, "mshybrid")
   assert.deepStrictEqual(o, { kind: "success", message: "MSHybrid is staged. It takes effect after a full shutdown.", warning: "", offerShutdown: true })
   // Folding appends to the run it was given (no copy per line).
   const before = M.newSwitchRun()
@@ -423,29 +423,36 @@ test("events: a run stays bounded (500 events, 20 messages, long lines unparsed)
   assert.ok(msg.errors[0].length <= 501 && msg.errors[0].endsWith("…"))
 })
 
-test("events: cancelling a pending switch says so and offers no shutdown", () => {
-  const o = M.switchOutcome(fold(SUCCESS_RUN), 0, "discrete", true)
-  assert.strictEqual(o.kind, "cancelled")
-  assert.ok(o.message.startsWith("Pending switch cancelled"))
-  assert.strictEqual(o.offerShutdown, false)
+test("events: the refusal while a switch is staged is the plain sentence; other errors stay raw", () => {
+  assert.strictEqual(M.STAGED_LOCK_TEXT, "A switch is staged. It can't be changed or cancelled until after a full shutdown.")
+  // The real tool's refusal, after the events it prints before Get_AP.
+  const refusal = SUCCESS_RUN.slice(0, 6).concat([errLine("apply-ready is already set before any write; refusing an ambiguous transition")])
+  const o = M.switchOutcome(fold(refusal), 1, "integrated")
+  assert.deepStrictEqual(o, { kind: "error", message: M.STAGED_LOCK_TEXT, warning: "", offerShutdown: false })
+  // Only that error: a neighbour stays raw.
+  const other = M.switchOutcome(fold([errLine("apply-ready never asserted after the trigger")]), 1, "integrated")
+  assert.strictEqual(other.message, "apply-ready never asserted after the trigger")
+  // No "cancelled" kind is left.
+  assert.ok(!/"cancelled"/.test(source))
+  assert.strictEqual(M.switchOutcome.length, 3, "no isCancel parameter")
 })
 
 test("events: unchanged is a no-op", () => {
   const run = fold([SUCCESS_RUN[0], SUCCESS_RUN[1], ev("unchanged", "The machine is already in discrete mode. No state was changed.", { mode: "discrete", value: 1 })])
-  const o = M.switchOutcome(run, 0, "discrete", false)
+  const o = M.switchOutcome(run, 0, "discrete")
   assert.strictEqual(o.kind, "unchanged")
   assert.strictEqual(o.offerShutdown, false)
 })
 
 test("events: an error event is shown; exit 1", () => {
   const run = fold([SUCCESS_RUN[0], SUCCESS_RUN[1], SUCCESS_RUN[2], SUCCESS_RUN[3], errLine("AC power is required for a GPU mode transition")])
-  const o = M.switchOutcome(run, 1, "mshybrid", false)
+  const o = M.switchOutcome(run, 1, "mshybrid")
   assert.deepStrictEqual(o, { kind: "error", message: "AC power is required for a GPU mode transition", warning: "", offerShutdown: false })
 })
 
 test("events: cli_error (usage, exit 2) is shown", () => {
   const run = fold([JSON.stringify({ event: "cli_error", level: "error", message: "error: unexpected argument '--x'" })])
-  const o = M.switchOutcome(run, 2, "discrete", false)
+  const o = M.switchOutcome(run, 2, "discrete")
   assert.strictEqual(o.kind, "error")
   assert.strictEqual(o.message, "error: unexpected argument '--x'")
 })
@@ -455,49 +462,49 @@ test("events: trigger_sent_before_failure is a prominent warning", () => {
     warn("trigger_sent_before_failure", "the EC apply trigger was sent before failure; save work and perform a manual full shutdown"),
     errLine("acknowledgement timed out")]))
   assert.strictEqual(run.triggerSent, true)
-  const o = M.switchOutcome(run, 1, "mshybrid", false)
+  const o = M.switchOutcome(run, 1, "mshybrid")
   assert.strictEqual(o.kind, "error")
   assert.strictEqual(o.message, "acknowledgement timed out")
   assert.strictEqual(o.warning, M.TRIGGER_WARNING)
   assert.ok(/save your work/i.test(o.warning) && /full shutdown/.test(o.warning))
   // Also kept when pkexec reports 126/127 afterwards (it cannot, but the
   // warning must never be dropped).
-  assert.strictEqual(M.switchOutcome(run, 126, "mshybrid", false).warning, M.TRIGGER_WARNING)
+  assert.strictEqual(M.switchOutcome(run, 126, "mshybrid").warning, M.TRIGGER_WARNING)
 })
 
 test("events: other warnings are appended; non-JSON lines are ignored", () => {
   const run = fold(["Sourcing something", "", "   "].concat(SUCCESS_RUN.slice(0, 9), [
     warn("target_restored", "the previous target was restored"), errLine("trigger failed")]))
   assert.strictEqual(run.other, 1)
-  const o = M.switchOutcome(run, 1, "mshybrid", false)
+  const o = M.switchOutcome(run, 1, "mshybrid")
   assert.strictEqual(o.message, "trigger failed the previous target was restored")
   // Garbage around a full run changes nothing.
   const noisy = fold(["garbage", "{not json"].concat(SUCCESS_RUN, ["trailing text"]))
-  assert.strictEqual(M.switchOutcome(noisy, 0, "mshybrid", false).kind, "success")
+  assert.strictEqual(M.switchOutcome(noisy, 0, "mshybrid").kind, "success")
 })
 
 test("events: success needs both the success event and exit 0", () => {
-  assert.strictEqual(M.switchOutcome(fold(SUCCESS_RUN), 1, "mshybrid", false).kind, "error")
-  const noSuccess = M.switchOutcome(fold(SUCCESS_RUN.slice(0, -1)), 0, "mshybrid", false)
+  assert.strictEqual(M.switchOutcome(fold(SUCCESS_RUN), 1, "mshybrid").kind, "error")
+  const noSuccess = M.switchOutcome(fold(SUCCESS_RUN.slice(0, -1)), 0, "mshybrid")
   assert.strictEqual(noSuccess.kind, "error")
   assert.strictEqual(noSuccess.message, "msi-mux-switch did not report success.")
-  assert.strictEqual(M.switchOutcome(fold(SUCCESS_RUN.concat([errLine("late")])), 0, "mshybrid", false).kind, "error")
-  assert.strictEqual(M.switchOutcome(M.newSwitchRun(), 0, "mshybrid", false).offerShutdown, false)
+  assert.strictEqual(M.switchOutcome(fold(SUCCESS_RUN.concat([errLine("late")])), 0, "mshybrid").kind, "error")
+  assert.strictEqual(M.switchOutcome(M.newSwitchRun(), 0, "mshybrid").offerShutdown, false)
 })
 
 test("events: pkexec 126 is authentication cancelled, 127 not authorized", () => {
-  let o = M.switchOutcome(M.newSwitchRun(), 126, "discrete", false)
+  let o = M.switchOutcome(M.newSwitchRun(), 126, "discrete")
   assert.strictEqual(o.kind, "auth-cancelled")
   assert.ok(/authentication cancelled/i.test(o.message))
-  o = M.switchOutcome(M.newSwitchRun(), 127, "discrete", false)
+  o = M.switchOutcome(M.newSwitchRun(), 127, "discrete")
   assert.strictEqual(o.kind, "not-authorized")
   assert.strictEqual(o.message, "Not authorized to switch the GPU mode. Nothing was changed.")
   // pkexec's own reason (its first non-JSON line) is shown with it.
   const run = fold(["Error executing command as another user: No authentication agent found.", "second line"])
-  o = M.switchOutcome(run, 127, "discrete", false)
+  o = M.switchOutcome(run, 127, "discrete")
   assert.strictEqual(o.kind, "not-authorized")
   assert.strictEqual(o.message, "Not authorized to switch the GPU mode. Nothing was changed. pkexec said: Error executing command as another user: No authentication agent found.")
-  o = M.switchOutcome(M.newSwitchRun(), -1, "discrete", false)
+  o = M.switchOutcome(M.newSwitchRun(), -1, "discrete")
   assert.strictEqual(o.message, "pkexec could not be started. Nothing was changed.")
 })
 
@@ -533,14 +540,22 @@ test("rows: three modes with descriptions; the current one has no button", () =>
   assert.strictEqual(M.switchBlocker(view()), "")
 })
 
-test("rows: pending offers Cancel pending on the current mode", () => {
-  const d = M.parseDebug(withFirmware({ selected_target_mode: "ms-hybrid" }), "", 0)
-  const rows = M.modeRows(view({ debug: d }))
-  assert.deepStrictEqual([rowOf(rows, "discrete").action, rowOf(rows, "discrete").buttonText, rowOf(rows, "discrete").enabled],
-    ["cancel", "Cancel pending", true])
-  assert.strictEqual(rowOf(rows, "mshybrid").action, "")
-  assert.ok(rowOf(rows, "mshybrid").status.includes("full shutdown"))
-  assert.strictEqual(rowOf(rows, "integrated").action, "switch")
+test("rows: while a switch is staged no row has a button, and none gives a reason", () => {
+  for (const target of ["ms-hybrid", "integrated"]) {
+    const d = M.parseDebug(withFirmware({ selected_target_mode: target }), "", 0)
+    assert.strictEqual(d.pending, true)
+    for (const over of [{}, { ac: false }, { ac: null }]) {
+      const rows = M.modeRows(view(Object.assign({ debug: d }, over)))
+      for (const r of rows) {
+        assert.deepStrictEqual([r.action, r.enabled, r.reason], ["", false, ""], target + " " + JSON.stringify(over) + " " + r.mode)
+      }
+      assert.strictEqual(rowOf(rows, "discrete").status, "Current mode.")
+      assert.strictEqual(rowOf(rows, M.modeFromJson(target)).status, "Staged: takes effect after a full shutdown.")
+      const third = rows.find(r => r.mode !== "discrete" && r.mode !== M.modeFromJson(target))
+      assert.strictEqual(third.status, "")
+    }
+  }
+  assert.ok(!/"cancel"|Cancel pending/.test(source), "no cancel action kind left")
 })
 
 test("rows: on battery, unknown AC, busy, unavailable or unread: every button disabled, with the reason", () => {
@@ -572,13 +587,13 @@ test("rows: each disabled button carries its own short reason; enabled ones none
     if (over.debug === undefined) assert.strictEqual(rowOf(rows, "discrete").reason, "", "the current mode gives no reason")
   }
   for (const r of M.modeRows(view())) assert.strictEqual(r.reason, "")
-  // The staged target says so in its status, not as a reason.
+  // The staged target says so in its status, not as a reason; while staged,
+  // AC is no reason either (nothing can run until a full shutdown).
   const d = M.parseDebug(withFirmware({ selected_target_mode: "ms-hybrid" }), "", 0)
-  assert.strictEqual(rowOf(M.modeRows(view({ debug: d, ac: false })), "mshybrid").reason, "")
-  assert.strictEqual(rowOf(M.modeRows(view({ debug: d, ac: false })), "discrete").reason, "Needs AC power.")
+  for (const r of M.modeRows(view({ debug: d, ac: false }))) assert.strictEqual(r.reason, "", r.mode)
 })
 
-test("rows: descriptions are one short line each; the cancel label is short", () => {
+test("rows: descriptions are one short line each", () => {
   for (const m of M.MODES) assert.ok(M.MODE_DESCRIPTIONS[m].length <= 50, m + ": " + M.MODE_DESCRIPTIONS[m])
   assert.ok(M.MODE_DESCRIPTIONS.discrete.length <= 32 && M.MODE_DESCRIPTIONS.integrated.length <= 32)
 })
@@ -601,20 +616,16 @@ test("bar: greyed when unavailable or unread; badge only when pending", () => {
 
 test("dialogs: the mode and the full shutdown are named; Integrated warns unless turned off", () => {
   for (const m of M.MODES) {
-    const msg = M.confirmMessage(m, false, true)
-    assert.ok(msg.includes(M.modeLabel(m)) && msg.includes("takes effect after a full shutdown"), msg)
+    const msg = M.confirmMessage(m, true)
+    assert.ok(msg.startsWith("Switch to " + M.modeLabel(m) + "?") && msg.includes("takes effect after a full shutdown"), msg)
   }
-  assert.ok(/external screens/.test(M.confirmMessage("integrated", false, true)))
-  assert.ok(/external screens/.test(M.confirmMessage("integrated", false, undefined)))
-  assert.ok(!/external screens/.test(M.confirmMessage("integrated", false, false)))
-  assert.ok(!/external screens/.test(M.confirmMessage("discrete", false, true)))
-  assert.ok(M.confirmMessage("discrete", true, true).startsWith("Cancel the pending switch"))
-  // Replacing a staged switch says so; staging the same mode again or
-  // nothing staged does not.
-  assert.ok(/This replaces the switch to MSHybrid that is already staged\./.test(M.confirmMessage("integrated", false, true, "mshybrid")))
-  assert.ok(!/replaces/.test(M.confirmMessage("integrated", false, true, "")))
-  assert.ok(!/replaces/.test(M.confirmMessage("integrated", false, true, "integrated")))
-  assert.ok(!/replaces/.test(M.confirmMessage("discrete", true, true, "mshybrid")))
+  assert.ok(/external screens/.test(M.confirmMessage("integrated", true)))
+  assert.ok(/external screens/.test(M.confirmMessage("integrated", undefined)))
+  assert.ok(!/external screens/.test(M.confirmMessage("integrated", false)))
+  assert.ok(!/external screens/.test(M.confirmMessage("discrete", true)))
+  // No cancel and no replace wording: a staged switch can be neither.
+  assert.strictEqual(M.confirmMessage.length, 2, "no isCancel or staged-target parameter")
+  for (const m of M.MODES) assert.ok(!/cancel|replaces/i.test(M.confirmMessage(m, true)), m)
   assert.strictEqual(M.warnSetting(undefined), true)
   assert.strictEqual(M.warnSetting(false), false)
   assert.ok(/Shut down now/.test(M.SHUTDOWN_MESSAGE) && /full shutdown/.test(M.SHUTDOWN_MESSAGE))
@@ -638,7 +649,8 @@ test("cursor: stops in screen order, disabled buttons skipped", () => {
   assert.deepStrictEqual(M.cursorStops(rows, { canSetUp: true }), ["setup", "mode|mshybrid", "mode|integrated", "env"])
   assert.deepStrictEqual(M.cursorStops(M.modeRows(view({ ac: false })), { canSetUp: true }), ["setup", "env"], "the env dropdown needs no AC")
   const pending = M.modeRows(view({ debug: M.parseDebug(withFirmware({ selected_target_mode: "ms-hybrid" }), "", 0) }))
-  assert.deepStrictEqual(M.cursorStops(pending, {}), ["mode|discrete", "mode|integrated", "env"], "Cancel pending is a stop")
+  assert.deepStrictEqual(M.cursorStops(pending, {}), ["env"], "no mode stop while a switch is staged")
+  assert.deepStrictEqual(M.cursorStops(pending, { canSetUp: true }), ["setup", "env"], "setup and env stay")
   assert.deepStrictEqual(M.cursorStops(null, null), ["env"], "the env dropdown is a stop in every mode")
 })
 
@@ -673,7 +685,10 @@ test("env file: the one path, under ~/.config/uwsm/env.d", () => {
     "/home/u/.config/uwsm/env.d/.90-msi-mux-gpu.tmp", "/home/u/.config/uwsm/env.d/90-msi-mux-gpu.new"])
   assert.ok(M.ENV_WRITE_SCRIPT.includes('t="$1/.90-msi-mux-gpu.tmp"'), "the temporary file is dot-prefixed, in env.d")
   assert.ok(M.ENV_WRITE_SCRIPT.includes('mv -fT -- "$t" "$2" || { rm -f -- "$t"; exit 1; }'), "never moved into a directory; cleaned up on failure")
-  assert.ok(!/\.new/.test(M.ENV_WRITE_SCRIPT))
+  // The previous build's temporary name is removed by a write too: rm -f,
+  // never recursive, and its failure (a directory there) does not stop it.
+  assert.ok(M.ENV_WRITE_SCRIPT.includes('rm -f -- "$1/90-msi-mux-gpu.new" 2>/dev/null\n'))
+  assert.ok(!/rm -[a-z]*r|-r\b|-R\b/.test(M.ENV_WRITE_SCRIPT), "nothing recursive")
   for (const bad of ["", "relative", "/home/../x", "/home/u\n", null]) {
     assert.strictEqual(M.envFilePath(bad), "")
     assert.deepStrictEqual(M.envRemoveArgv(bad), [])
@@ -864,6 +879,14 @@ test("env choice: one change at a time; a choice made meanwhile is applied after
   const done = state.slice(state.indexOf("function envDone()"))
   assert.ok(/var next = root\.envQueued[\s\S]*root\.startEnv\(next\)/.test(done.slice(0, done.indexOf("\n  }\n"))))
   assert.strictEqual((state.match(/envProc\.running = true/g) || []).length, 1, "every env change starts in one place")
+  // envError is cleared only by a choice that starts at once (after the
+  // queue and "same as now" checks), never by a queued one started from
+  // envDone; the live flow in tests/run.sh checks the behaviour.
+  assert.ok(body.indexOf("value === root.envChoice") < body.indexOf('root.envError = ""'))
+  assert.ok(body.indexOf('root.envError = ""') < body.indexOf("root.startEnv(value)"))
+  const start = state.slice(state.indexOf("function startEnv("))
+  assert.ok(!/envError/.test(start.slice(0, start.indexOf("\n  }\n"))), "startEnv leaves envError alone")
+  assert.strictEqual((state.match(/root\.envError = ""/g) || []).length, 1, "cleared in setEnvChoice only")
   // After every read back, the dropdown follows the file on disk, even when
   // envChoice did not change (a failed pick does not stay shown).
   assert.ok(/root\.envChoice = Model\.parseEnvRead\(text\)\s*root\.envRead\(\)/.test(state))
@@ -897,14 +920,30 @@ test("switch: pgrep runs before pkexec, after this plugin's own debug read", () 
   assert.ok(/debugProc\.running \|\| root\.phase === "checking"/.test(state), "no debug read starts while a switch is checked")
 })
 
-test("panel: keyboard cursor, Keep pending, per-row reasons, stale results cleared", () => {
+test("panel: keyboard cursor, the staged lock line, per-row reasons, stale results cleared", () => {
   const bar = qmlCode("BarWidget.qml")
   assert.ok(/PanelKeyCatcher \{\s*id: keyCatcher/.test(bar))
   assert.ok(/focusTarget: keyCatcher/.test(bar))
   assert.ok(/Model\.cursorStops\(root\.rows, \{ canSetUp: MuxState\.canSetUp \}\)/.test(bar))
   for (const k of ['"setup"', '"env"', "modeButton.key"])
     assert.ok(new RegExp("hasCursor: root\\.cursorActive && root\\.cursorAt === " + k.replace(/\./g, "\\.")).test(bar), k)
-  assert.ok(/cancelText: root\.confirmCancel \? "Keep pending" : "Cancel"/.test(bar))
+  // No cancel path: the confirmation is a plain Switch, and the staged lock
+  // is one line under the modes, shown only while a switch is staged.
+  assert.ok(!/confirmCancel|isCancel|switchCancel|Keep pending|Cancel switch/.test(bar + qmlCode("MuxState.qml")))
+  assert.ok(/message: Model\.confirmMessage\(root\.confirmMode, root\.warnIntegrated\)/.test(bar))
+  assert.ok(/MuxState\.requestSwitch\(root, mode\)/.test(bar))
+  // Confirming re-checks the row: a mode no longer offered does not run.
+  const confirm = bar.slice(bar.indexOf("function confirmSwitch()"))
+  const confirmBody = confirm.slice(0, confirm.indexOf("\n  }\n"))
+  assert.ok(/if \(!row \|\| row\.action !== "switch" \|\| !row\.enabled\) return/.test(confirmBody))
+  assert.ok(confirmBody.indexOf("root.rows.find(") < confirmBody.indexOf("MuxState.requestSwitch("))
+  const lock = bar.indexOf("text: Model.STAGED_LOCK_TEXT")
+  assert.ok(lock > bar.indexOf("model: root.rows"), "the lock line follows the mode rows")
+  const lockText = bar.slice(bar.lastIndexOf("Text {", lock), bar.indexOf("}", lock))
+  assert.ok(/visible: MuxState\.debug\.ok && MuxState\.debug\.pending/.test(lockText))
+  // Not repeated under a refused switch whose result is the same sentence.
+  assert.ok(/!\(!MuxState\.busy && MuxState\.outcome !== null && MuxState\.outcome\.message === Model\.STAGED_LOCK_TEXT\)/.test(lockText))
+  assert.ok(/color: root\.dim/.test(lockText) && /font\.pixelSize: Style\.font\.caption/.test(lockText))
   assert.ok(/text: modeRow\.row \? modeRow\.row\.reason : ""/.test(bar))
   assert.ok(!/root\.blocker/.test(bar), "no separate blocker line repeating AC or busy")
   assert.ok(/if \(root\.reopenForOutcome\) root\.reopenForOutcome = false\s*else if \(!MuxState\.busy\) MuxState\.clearOutcome\(\)/.test(bar))
@@ -923,7 +962,7 @@ test("manifest: identity, version and the settings schema", () => {
   assert.strictEqual(m.id, "io.github.rsd.msi-mux")
   assert.strictEqual(m.id, M.PLUGIN_ID)
   assert.strictEqual(m.name, "MSI GPU MUX")
-  assert.strictEqual(m.version, "0.2.0")
+  assert.strictEqual(m.version, "0.2.1")
   assert.strictEqual(m.license, "MIT")
   assert.deepStrictEqual(m.kinds, ["bar-widget"])
   assert.deepStrictEqual(m.entryPoints, { barWidget: "BarWidget.qml" })

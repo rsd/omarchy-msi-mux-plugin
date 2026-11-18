@@ -413,16 +413,20 @@ EOF
 # The singleton is driven directly (no panel, so no window and no dialog):
 # Intel/RTX/Auto write and remove the env file under the temporary HOME;
 # the base GPU dropdown is shown with Discrete current and with MSHybrid or
-# Integrated pending; MSHybrid is staged (the re-read shows it pending, the
-# file stays), then the pending switch is cancelled (no shutdown offered;
-# staging Discrete leaves the file), Integrated is staged and cancelled too
-# (the RTX file is still there after the round trip);
-# a second request while one runs is refused; RTX then Auto while RTX is
-# written ends in Auto (no file); a write that fails (env.d made read-only)
-# shows the error and puts the widget's dropdown back on Auto, the state on
-# disk; a switch while a process named
-# msi-mux-switch runs (a copy of sleep) is refused before pkexec. Skipped on
-# hardware that is not available or on battery (the real AC is read).
+# Integrated pending; a second request while one runs is refused; MSHybrid
+# is staged (the re-read shows it pending, the file stays, the panel offers
+# no button and shows the lock line); a re-stage asked for directly while it
+# is pending is refused by the tool and shown as the plain sentence, once,
+# with nothing changed; the fake's state is reset (a full shutdown) and
+# Integrated is staged and reset the same way (the RTX file is still there
+# after the round trip); RTX then Auto while RTX is written ends in Auto (no
+# file); a write that fails (env.d made read-only) shows the error and puts
+# the widget's dropdown back on Auto, the state on disk; a write that fails
+# with Auto queued behind it keeps its error shown after Auto succeeds; a
+# removal that fails shows its error and puts the dropdown back on Intel; a
+# switch while a process named msi-mux-switch runs (a copy of sleep) is
+# refused before pkexec. Skipped on hardware that is not available or on
+# battery (the real AC is read).
 switch_flow_live() {
   local dir=${1:-$PLUGIN_DIR}
   if ! have_qs_load; then
@@ -504,53 +508,72 @@ ShellRoot {
         shell.log("ready ownership " + s.ownership.kind + " available " + s.available + " current " + s.debug.current
           + " pending " + s.debug.pending + " env " + s.envChoice)
         shell.logShown("discrete current")
+        shell.logPanel("discrete current")
         s.setEnvChoice("rtx")
         shell.step = 1
       } else if (shell.step === 1) {
         if (s.envChoice !== "rtx") return
         shell.log("env rtx " + s.envChanged)
-        var first = s.requestSwitch(holder, "mshybrid", false)
-        var second = s.requestSwitch(holder, "integrated", false)
+        var first = s.requestSwitch(holder, "mshybrid")
+        var second = s.requestSwitch(holder, "integrated")
         shell.log("request " + first + " second " + second)
         shell.step = 2
       } else if (shell.step === 2) {
         if (!shell.outcome || s.busy || !s.debug.pending) return
         shell.log("staged pending " + s.debug.pending + " target " + s.debug.target + " env " + s.envChoice)
         shell.logShown("mshybrid pending")
+        shell.logPanel("mshybrid pending")
+        // The staged switch locks the mode: a direct re-stage reaches the
+        // tool, which refuses it; the panel says so in plain words.
         shell.outcome = null
-        shell.log("cancel " + s.requestSwitch(holder, "discrete", true))
+        shell.log("restage " + s.requestSwitch(holder, "integrated"))
         shell.step = 3
       } else if (shell.step === 3) {
-        if (!shell.outcome || s.busy || s.debug.pending) return
-        // Read the file back: staging Discrete (the cancel) left it.
-        shell.reads = 0
-        s.rereadEnv()
+        if (!shell.outcome || s.busy) return
+        shell.log("restage refused pending " + s.debug.pending + " target " + s.debug.target)
+        shell.logPanel("restage refused")
+        // A full shutdown (the fake's staged target cleared): nothing pending.
+        stateReset.running = true
         shell.step = 31
       } else if (shell.step === 31) {
-        if (shell.reads === 0) return
-        shell.log("cancelled pending " + s.debug.pending + " env " + s.envChoice)
-        // Integrated staged with RTX chosen: the file stays too.
-        shell.outcome = null
-        shell.log("integrated request " + s.requestSwitch(holder, "integrated", false))
+        if (stateReset.running) return
+        s.readDebug()
         shell.step = 32
       } else if (shell.step === 32) {
-        if (!shell.outcome || s.busy || !s.debug.pending) return
+        if (s.debug.pending) return
+        // Read the file back: staging and the shutdown left it.
         shell.reads = 0
         s.rereadEnv()
         shell.step = 33
       } else if (shell.step === 33) {
         if (shell.reads === 0) return
-        shell.log("integrated pending " + s.debug.pending + " target " + s.debug.target + " env " + s.envChoice)
-        shell.logShown("integrated pending")
+        shell.log("after shutdown pending " + s.debug.pending + " env " + s.envChoice)
+        // Integrated staged with RTX chosen: the file stays too.
         shell.outcome = null
-        shell.log("cancel integrated " + s.requestSwitch(holder, "discrete", true))
+        shell.log("integrated request " + s.requestSwitch(holder, "integrated"))
         shell.step = 34
       } else if (shell.step === 34) {
-        if (!shell.outcome || s.busy || s.debug.pending) return
+        if (!shell.outcome || s.busy || !s.debug.pending) return
         shell.reads = 0
         s.rereadEnv()
         shell.step = 35
       } else if (shell.step === 35) {
+        if (shell.reads === 0) return
+        shell.log("integrated pending " + s.debug.pending + " target " + s.debug.target + " env " + s.envChoice)
+        shell.logShown("integrated pending")
+        shell.logPanel("integrated pending")
+        stateReset.running = true
+        shell.step = 36
+      } else if (shell.step === 36) {
+        if (stateReset.running) return
+        s.readDebug()
+        shell.step = 37
+      } else if (shell.step === 37) {
+        if (s.debug.pending) return
+        shell.reads = 0
+        s.rereadEnv()
+        shell.step = 38
+      } else if (shell.step === 38) {
         if (shell.reads === 0) return
         shell.log("round trip pending " + s.debug.pending + " env " + s.envChoice)
         s.setEnvChoice("intel")
@@ -590,11 +613,53 @@ ShellRoot {
         if (s.envBusy || shell.reads === 0) return
         var d8 = shell.findDropdown(shell.widget, 0)
         shell.log("failed write env " + s.envChoice + " dropdown " + d8.value + " error " + (s.envError !== ""))
+        // A failed write with a choice queued behind it: Intel fails (env.d
+        // still read-only), the queued Auto then succeeds (nothing to
+        // remove), and the Intel error is still shown after it.
+        shell.reads = 0
+        s.setEnvChoice("intel")
+        s.setEnvChoice("auto")
+        shell.log("failed with queue busy " + s.envBusy + " next " + s.envQueued + " error " + (s.envError !== ""))
+        shell.step = 81
+      } else if (shell.step === 81) {
+        if (s.envBusy || s.envQueued !== "" || shell.reads === 0) return
+        shell.log("queued after failure env " + s.envChoice + " :: " + s.envError)
         envDirMode.command = ["chmod", "755", "--", "$home/.config/uwsm/env.d"]
         envDirMode.running = true
         shell.step = 9
       } else if (shell.step === 9) {
         if (envDirMode.running) return
+        // A failed removal: Intel on disk, env.d read-only, Auto picked. The
+        // error is shown and the dropdown goes back to the file (Intel).
+        s.setEnvChoice("intel")
+        shell.step = 91
+      } else if (shell.step === 91) {
+        if (s.envBusy || s.envChoice !== "intel") return
+        envDirMode.command = ["chmod", "555", "--", "$home/.config/uwsm/env.d"]
+        envDirMode.running = true
+        shell.step = 92
+      } else if (shell.step === 92) {
+        if (envDirMode.running) return
+        var d92 = shell.findDropdown(shell.widget, 0)
+        shell.reads = 0
+        d92.value = "auto"
+        s.setEnvChoice("auto")
+        shell.step = 93
+      } else if (shell.step === 93) {
+        if (s.envBusy || shell.reads === 0) return
+        var d93 = shell.findDropdown(shell.widget, 0)
+        shell.log("failed remove env " + s.envChoice + " dropdown " + d93.value + " error " + (s.envError !== "")
+          + " :: " + s.envError)
+        envDirMode.command = ["chmod", "755", "--", "$home/.config/uwsm/env.d"]
+        envDirMode.running = true
+        shell.step = 94
+      } else if (shell.step === 94) {
+        if (envDirMode.running) return
+        s.setEnvChoice("auto")
+        shell.step = 95
+      } else if (shell.step === 95) {
+        if (s.envBusy || s.envChoice !== "auto" || s.envError !== "") return
+        shell.log("removed after failure env auto")
         // An msi-mux-switch already running (a copy of sleep by that name):
         // the switch is refused before pkexec.
         blocker.running = true
@@ -602,7 +667,7 @@ ShellRoot {
       } else if (shell.step === 10) {
         if (!blocker.running) return
         shell.outcome = null
-        shell.log("blocked request " + s.requestSwitch(holder, "integrated", false))
+        shell.log("blocked request " + s.requestSwitch(holder, "integrated"))
         shell.step = 11
       } else if (shell.step === 11) {
         if (!shell.outcome || s.busy) return
@@ -614,6 +679,7 @@ ShellRoot {
   }
   Process { id: blocker; command: ["$cfg/run/msi-mux-switch", "30"] }
   Process { id: envDirMode }
+  Process { id: stateReset; command: ["rm", "-f", "--", "$cfg/state"] }
   // The widget's env dropdown, found by its label (it has no id outside).
   property int reads: 0
   // Whether the dropdown and every item above it up to the widget are
@@ -624,6 +690,31 @@ ShellRoot {
     for (var it = dd; shown && it && it !== shell.widget; it = it.parent)
       if (it.visible === false && it.parent && it.parent.visible !== false) shown = false
     shell.log("dropdown " + when + " shown " + shown)
+  }
+  // The mode buttons shown, and whether the staged-lock sentence is shown
+  // exactly once (same visibility rule as logShown).
+  function shownSelf(item) {
+    for (var it = item; it && it !== shell.widget; it = it.parent)
+      if (it.visible === false && it.parent && it.parent.visible !== false) return false
+    return true
+  }
+  function findAll(item, pred, depth, out) {
+    if (!item || depth > 40) return out
+    if (out.indexOf(item) === -1 && pred(item)) out.push(item)
+    var kids = [].concat(item.children ? Array.from(item.children) : [], item.data ? Array.from(item.data) : [],
+      item.contentItem ? [item.contentItem] : [])
+    for (var i = 0; i < kids.length; i++)
+      if (kids[i] !== item) shell.findAll(kids[i], pred, depth + 1, out)
+    return out
+  }
+  function logPanel(when) {
+    var buttons = shell.findAll(shell.widget, function(it) {
+      return typeof it.key === "string" && it.key.indexOf("mode|") === 0 && it.text !== undefined }, 0, [])
+    var shownButtons = buttons.filter(function(b) { return shell.shownSelf(b) })
+    var lock = shell.findAll(shell.widget, function(it) {
+      return it.text === "A switch is staged. It can't be changed or cancelled until after a full shutdown." }, 0, [])
+    shell.log("panel " + when + " rows " + buttons.length + " buttons " + shownButtons.length
+      + " [" + shownButtons.map(function(b) { return b.text }).join(",") + "] lock " + (lock.filter(function(t) { return shell.shownSelf(t) }).length === 1))
   }
   function findDropdown(item, depth) {
     if (!item || depth > 40) return null
@@ -660,30 +751,38 @@ EOF
   expect_flow "request true second false" "a second switch while one runs is refused"
   expect_flow "finished owner true kind success offer true warning false" "MSHybrid: success, the shutdown is offered"
   expect_flow "staged pending true target mshybrid env rtx" "the re-read shows MSHybrid pending; the env file stays"
-  expect_flow "cancel true" "cancel asked"
-  expect_flow "finished owner true kind cancelled offer false warning false :: Pending switch cancelled" "cancelled: no shutdown offered"
+  expect_flow "panel discrete current rows 3 buttons 2 [Switch,Switch] lock false" "nothing staged: two Switch buttons, no lock line"
+  expect_flow "panel mshybrid pending rows 3 buttons 0 [] lock true" "MSHybrid staged: no switch or cancel button; the lock line is shown"
+  expect_flow "restage true" "a re-stage is asked for directly while MSHybrid is staged"
+  expect_flow "finished owner true kind error offer false warning false :: A switch is staged. It can't be changed or cancelled until after a full shutdown." "the tool's refusal is shown as the plain sentence"
+  expect_flow "restage refused pending true target mshybrid" "the refusal changed nothing: MSHybrid stays staged"
+  expect_flow "panel restage refused rows 3 buttons 0 [] lock true" "the refusal's sentence is shown once (the lock line steps aside)"
   expect_flow "dropdown discrete current shown true" "the base GPU dropdown is shown in Discrete (current, nothing pending)"
   expect_flow "dropdown mshybrid pending shown true" "the dropdown is shown with MSHybrid pending"
-  expect_flow "cancelled pending false env rtx" "nothing pending; staging Discrete left the env file (RTX)"
+  expect_flow "after shutdown pending false env rtx" "after the shutdown nothing is pending; the env file (RTX) stays"
   expect_flow "integrated request true" "Integrated asked for with RTX chosen"
   expect_flow "integrated pending true target integrated env rtx" "Integrated staged: the env file stays"
   expect_flow "dropdown integrated pending shown true" "the dropdown is shown with Integrated pending"
-  expect_flow "cancel integrated true" "the pending Integrated is cancelled"
+  expect_flow "panel integrated pending rows 3 buttons 0 [] lock true" "Integrated staged: no button; the lock line is shown"
   expect_flow "round trip pending false env rtx" "after the round trip the RTX choice is still on disk"
   expect_flow "env intel" "Intel writes the plugin's exact text"
   expect_flow "env auto" "Auto removes it"
   expect_flow "queued busy true next auto" "Auto picked while RTX is written waits in the queue"
   expect_flow "queue applied env auto" "the queued Auto is applied after the write: no file"
   expect_flow "failed write env auto dropdown auto error true" "a failed write shows the error; the dropdown reverts to the file on disk (Auto)"
+  expect_flow "failed with queue busy true next auto error false" "a fresh choice clears the earlier error; Auto picked while Intel is written waits"
+  expect_flow "queued after failure env auto :: Could not write $home/.config/uwsm/env.d/90-msi-mux-gpu." "the failed write's error is still shown after the queued Auto finishes"
+  expect_flow "failed remove env intel dropdown intel error true :: Could not remove $home/.config/uwsm/env.d/90-msi-mux-gpu." "a failed removal shows the error; the dropdown reverts to the file on disk (Intel)"
+  expect_flow "removed after failure env auto" "Auto then removes it once env.d is writable again"
   expect_flow "blocked request true" "a switch is asked for while an msi-mux-switch runs"
   expect_flow "finished owner true kind error offer false warning false :: msi-mux-switch is already running" "it is refused before pkexec"
   # The flags are the ones the debug read got (the hardware's).
   local flags want_pk
   flags=$(sed -n '1s/^--debug --json//p' "$cfg/fake.log" 2>/dev/null)
-  want_pk=$(printf '%s\n' "--disable-internal-agent $bin mshybrid --json$flags" "--disable-internal-agent $bin discrete --json$flags" \
-    "--disable-internal-agent $bin integrated --json$flags" "--disable-internal-agent $bin discrete --json$flags")
+  want_pk=$(printf '%s\n' "--disable-internal-agent $bin mshybrid --json$flags" "--disable-internal-agent $bin integrated --json$flags" \
+    "--disable-internal-agent $bin integrated --json$flags")
   if [[ $(cat "$cfg/pkexec.log" 2>/dev/null) == "$want_pk" ]]; then
-    echo "ok   pkexec ran four times, with exactly the argv arrays expected"
+    echo "ok   pkexec ran three times (the refused re-stage included), with exactly the argv arrays expected"
   else
     echo "FAIL pkexec log: $(tr '\n' '|' <"$cfg/pkexec.log" 2>/dev/null)"
     ok=1

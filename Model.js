@@ -485,14 +485,20 @@ function applySwitchLine(run, line) {
 
 var TRIGGER_WARNING = "The firmware may already have received the switch. Save your work and do a full shutdown (not a reboot)."
 
+// Once a switch is staged, the firmware's apply-ready flag stays set until a
+// full shutdown, and the tool refuses every further mode run with
+// STAGED_LOCK_ERROR: a staged switch can be neither replaced nor cancelled.
+var STAGED_LOCK_TEXT = "A switch is staged. It can't be changed or cancelled until after a full shutdown."
+var STAGED_LOCK_ERROR = "apply-ready is already set before any write"
+
 // What a finished run means: { kind, message, warning, offerShutdown }.
-// kind: "success" | "cancelled" (a pending switch undone) | "unchanged" |
-// "auth-cancelled" | "not-authorized" | "error". Success needs both the
-// success event and exit status 0. pkexec's own 126 and 127 are the dialog
-// dismissed and authorization refused; pkexec's own explanation (the first
-// line that is not a JSON event, e.g. "No authentication agent found.") is
-// added to the 127 message.
-function switchOutcome(run, exitCode, mode, isCancel) {
+// kind: "success" | "unchanged" | "auth-cancelled" | "not-authorized" |
+// "error". Success needs both the success event and exit status 0. pkexec's
+// own 126 and 127 are the dialog dismissed and authorization refused;
+// pkexec's own explanation (the first line that is not a JSON event, e.g.
+// "No authentication agent found.") is added to the 127 message. The tool's
+// refusal while a switch is staged (STAGED_LOCK_ERROR) is STAGED_LOCK_TEXT.
+function switchOutcome(run, exitCode, mode) {
   var r = run || newSwitchRun()
   var warning = r.triggerSent ? TRIGGER_WARNING : ""
   var notes = r.warnings.length ? " " + r.warnings.join(" ") : ""
@@ -502,15 +508,14 @@ function switchOutcome(run, exitCode, mode, isCancel) {
     var said = r.firstOther ? " pkexec said: " + r.firstOther : ""
     return { kind: "not-authorized", message: "Not authorized to switch the GPU mode. Nothing was changed." + said, warning: warning, offerShutdown: false }
   }
-  if (exitCode === 0 && r.success && r.errors.length === 0) {
-    if (isCancel)
-      return { kind: "cancelled", message: "Pending switch cancelled. " + modeLabel(mode) + " stays." + notes, warning: warning, offerShutdown: false }
+  if (exitCode === 0 && r.success && r.errors.length === 0)
     return { kind: "success", message: modeLabel(mode) + " is staged. It takes effect after a full shutdown." + notes, warning: warning, offerShutdown: true }
-  }
   if (exitCode === 0 && r.unchanged && r.errors.length === 0)
     return { kind: "unchanged", message: "Already in " + modeLabel(mode) + ". Nothing was changed.", warning: warning, offerShutdown: false }
   if (exitCode < 0 && r.events.length === 0)
     return { kind: "error", message: "pkexec could not be started. Nothing was changed.", warning: warning, offerShutdown: false }
+  if (r.errors.length && r.errors[0].indexOf(STAGED_LOCK_ERROR) !== -1)
+    return { kind: "error", message: STAGED_LOCK_TEXT, warning: warning, offerShutdown: false }
   var why = r.errors.length ? r.errors[0] : exitCode === 0
     ? "msi-mux-switch did not report success."
     : "msi-mux-switch failed (exit status " + exitCode + ")."
@@ -640,10 +645,14 @@ function parseEnvRead(text) {
 // The write: env.d created, the text written to ENV_TEMP_NAME beside the
 // target, then renamed over it with `mv -T` (a symbolic link there is
 // replaced, never followed; a directory there is never moved into: the
-// rename fails). The temporary file is removed on any failure. "$1" is
-// env.d, "$2" the file, "$3" the text.
+// rename fails). The temporary file is removed on any failure. The previous
+// build's temporary name (sourced by uwsm, having no dot) is removed first
+// when an old build left it: `rm -f`, never recursive, so a symbolic link
+// there is removed, not followed, and a directory there stays (the write
+// goes on). "$1" is env.d, "$2" the file, "$3" the text.
 var ENV_WRITE_SCRIPT = [
   "mkdir -p -- \"$1\" || exit 1",
+  "rm -f -- \"$1/" + ENV_LEGACY_TEMP_NAME + "\" 2>/dev/null",
   "t=\"$1/" + ENV_TEMP_NAME + "\"",
   "rm -f -- \"$t\" || exit 1",
   "( umask 022 && printf '%s' \"$3\" >\"$t\" ) || { rm -f -- \"$t\"; exit 1; }",
@@ -791,10 +800,11 @@ function rowReason(st) {
 }
 
 // One row per mode: { mode, label, description, icon, status, action:
-// "switch" | "cancel" | "", buttonText, enabled, reason }. reason is set
-// whenever the row has no enabled button for a reason the user can act on
-// or should know (not for the current or the staged mode, which say so in
-// status).
+// "switch" | "", buttonText, enabled, reason }. reason is set whenever the
+// row has no enabled button for a reason the user can act on or should know
+// (not for the current or the staged mode, which say so in status). While a
+// switch is staged no row has a button: the tool refuses any further mode
+// run until a full shutdown (STAGED_LOCK_TEXT, shown once by the panel).
 function modeRows(s) {
   var st = s || {}
   var d = st.debug || emptyDebug()
@@ -809,10 +819,6 @@ function modeRows(s) {
       row.action = ""
       row.enabled = false
       row.reason = ROW_REASON.notOffered
-    } else if (d.ok && m === d.current && d.pending) {
-      row.status = "Current mode."
-      row.action = "cancel"
-      row.buttonText = "Cancel pending"
     } else if (d.ok && m === d.current) {
       row.status = "Current mode."
       row.action = ""
@@ -823,20 +829,18 @@ function modeRows(s) {
       row.action = ""
       row.enabled = false
       row.reason = ""
+    } else if (d.ok && d.pending) {
+      row.action = ""
+      row.enabled = false
+      row.reason = ""
     }
     rows.push(row)
   }
   return rows
 }
 
-// stagedTarget: the mode already staged ("" when none); a new switch
-// replaces it, and the message says so.
-function confirmMessage(mode, isCancel, warnIntegrated, stagedTarget) {
-  if (isCancel)
-    return "Cancel the pending switch and stay in " + modeLabel(mode) + "? You will be asked to authenticate."
+function confirmMessage(mode, warnIntegrated) {
   var msg = "Switch to " + modeLabel(mode) + "? It takes effect after a full shutdown (a reboot is not enough). You will be asked to authenticate."
-  if (isMode(stagedTarget) && stagedTarget !== mode)
-    msg += "\n\nThis replaces the switch to " + modeLabel(stagedTarget) + " that is already staged."
   if (mode === "integrated" && warnIntegrated !== false)
     msg += "\n\nIntegrated uses the Intel GPU only: external screens wired to the RTX will probably stay dark."
   return msg
@@ -854,8 +858,9 @@ function warnSetting(value) {
 // The panel's keyboard cursor stands on one control, named by a key:
 //   setup  mode|<mode>  env
 // in screen order: Set up backend (when offered), each mode row's enabled
-// button, the Hyprland base GPU dropdown (always shown). Disabled controls
-// are not stops. Up/Down (and Left/Right) step through them.
+// button (none while a switch is staged), the Hyprland base GPU dropdown
+// (always shown). Disabled controls are not stops. Up/Down (and Left/Right)
+// step through them.
 function cursorStops(rows, o) {
   var opt = o || {}
   var stops = []

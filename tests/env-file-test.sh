@@ -9,7 +9,8 @@
 # when present, and bash --posix. Then `sh -n` (and `dash -n`) and
 # `shellcheck -s sh` on the text itself. Then the plugin's own read and
 # write commands against a temporary HOME: absent, its own file, a symbolic
-# link, a FIFO, a directory and an oversized file.
+# link, a FIFO, a directory, an oversized file, and the previous build's
+# temporary name left behind (a file, a symbolic link, a directory).
 #
 # Nothing under ~/.config is read or written: every file is in a temporary
 # directory.
@@ -283,6 +284,50 @@ if "${ARGV[@]}"; then ok "remove: succeeds"; else fail "remove failed"; fi
 left=$(find "${F%/*}" -mindepth 1 -printf '%f ')
 if [[ $left == "90-other " ]]; then ok "remove: the file and both temporary names are gone; other files stay"; else fail "remove left: $left"; fi
 rm -f "${F%/*}/90-other"
+
+# A write removes the previous build's temporary name too (uwsm would source
+# it): a regular file there is gone; a symbolic link there is removed, never
+# followed; a directory there is left in place and the write still succeeds.
+N=${F%/*}/90-msi-mux-gpu.new
+printf 'x\n' >"$N"
+argv_of --write-argv "$H" rtx
+if "${ARGV[@]}" && cmp -s "$F" "$T/env-rtx" && [[ ! -e $N && ! -L $N ]]; then
+  ok "write: a stale 90-msi-mux-gpu.new is removed"
+else
+  fail "write with a stale .new: $(find "${F%/*}" -mindepth 1 -printf '%f ')"
+fi
+printf 'keep\n' >"$T/new-target"
+ln -s "$T/new-target" "$N"
+argv_of --write-argv "$H" intel
+if "${ARGV[@]}" && cmp -s "$F" "$T/env-intel" && [[ ! -e $N && ! -L $N && $(cat "$T/new-target") == keep ]]; then
+  ok "write: a .new symbolic link is removed; its target is untouched"
+else
+  fail "write with a .new symbolic link: $(find "${F%/*}" -mindepth 1 -printf '%f ')"
+fi
+mkdir "$T/new-pointed"
+printf 'keep\n' >"$T/new-pointed/inside"
+ln -s "$T/new-pointed" "$N"
+argv_of --write-argv "$H" rtx
+if "${ARGV[@]}" && [[ ! -L $N && $(find "$T/new-pointed" -mindepth 1 -printf '%f ') == "inside " && $(cat "$T/new-pointed/inside") == keep ]]; then
+  ok "write: a .new link to a directory is removed; nothing in that directory is touched"
+else
+  fail "write with a .new link to a directory: $(find "$T/new-pointed" -mindepth 1 -printf '%f ')"
+fi
+mkdir "$N"
+printf 'keep\n' >"$N/inside"
+argv_of --write-argv "$H" intel
+if "${ARGV[@]}" 2>/dev/null && cmp -s "$F" "$T/env-intel"; then
+  ok "write: a .new directory does not stop the write"
+else
+  fail "write with a .new directory failed"
+fi
+if [[ -d $N && $(cat "$N/inside") == keep ]]; then
+  ok "write: a .new directory and its content are left in place"
+else
+  fail "write: the .new directory was removed or emptied"
+fi
+rm -rf "$N"
+rm -f "$F"
 
 # A FIFO (a read would block) and a directory: modified, without reading.
 rm -f "$F"

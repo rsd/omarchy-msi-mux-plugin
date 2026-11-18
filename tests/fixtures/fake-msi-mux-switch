@@ -9,7 +9,12 @@
 # A mode argument is refused unless MM_FAKE_SWITCH=1 (set only by the switch
 # flow test, which reaches this through a fake pkexec): then it prints the
 # real tool's event sequence for a successful switch (or `unchanged`) and
-# records the staged target in $MM_FAKE_STATE.
+# records the staged target in $MM_FAKE_STATE. With a target already staged
+# there (one that differs from the current mode), it fails as the real tool
+# does: the firmware's apply-ready flag stays set until a full shutdown, so
+# after the events printed before its Get_AP preflight it prints the
+# "apply-ready is already set" error on stderr, exits 1 and stages nothing.
+# Removing $MM_FAKE_STATE stands for that shutdown.
 
 printf '%s\n' "$*" >>"${MM_FAKE_LOG:-/dev/null}"
 
@@ -67,6 +72,10 @@ event selected_mode "Selected mode: $mode" "{\"mode\":\"$mode\",\"value\":$value
 event shutdown_required "A full shutdown is required" '{"automatic_shutdown":false}'
 event confirmation_skipped "JSON mode" '{"json_mode":true}'
 printf '{"event":"bitlocker_reminder","level":"warning","message":"fake reminder","data":null}\n' >&2
+if [[ $selected != "$current" ]]; then
+  printf '{"event":"error","level":"error","message":"apply-ready is already set before any write; refusing an ambiguous transition"}\n' >&2
+  exit 1
+fi
 event target_staged "staged" '{"byte5_before":"0x35","byte5_after":"0x34"}'
 event apply_ready "ready" '{"data_byte1":"0x01","apply_ready":true}'
 [[ -n $state ]] && printf '%s' "$mode" >"$state"

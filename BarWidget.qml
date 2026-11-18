@@ -15,14 +15,13 @@ import "Model.js" as Model
 // user's actions; every string, verdict and argv is in Model.js.
 //
 // Actions:
-//   - Switch / Cancel pending: a confirmation dialog first (naming the mode
-//     and the full shutdown, the staged switch it replaces, plus the
-//     external-screen warning for Integrated unless the setting turns it
-//     off), then
-//     MuxState.requestSwitch, which checks ownership and AC again and runs
-//     pkexec. On success, a second dialog offers Shut down now
-//     (`omarchy-system shutdown`) or Later. A cancelled pending switch offers
-//     no shutdown.
+//   - Switch: a confirmation dialog first (naming the mode and the full
+//     shutdown, plus the external-screen warning for Integrated unless the
+//     setting turns it off), then MuxState.requestSwitch, which checks
+//     ownership and AC again and runs pkexec. On success, a second dialog
+//     offers Shut down now (`omarchy-system shutdown`) or Later. While a
+//     switch is staged no mode has a button: it can be neither replaced nor
+//     cancelled before a full shutdown (Model.STAGED_LOCK_TEXT says so).
 //   - Hyprland base GPU (shown in every mode; acts only in MSHybrid):
 //     MuxState.setEnvChoice, which writes or removes
 //     ~/.config/uwsm/env.d/90-msi-mux-gpu only.
@@ -66,7 +65,6 @@ Panel {
 
   // The dialogs: which mode is being confirmed, and the shutdown offer.
   property string confirmMode: ""
-  property bool confirmCancel: false
   property bool shutdownOffered: false
 
   // The panel reopening itself to show a finished switch keeps the result;
@@ -93,16 +91,18 @@ Panel {
 
   function askSwitch(row) {
     if (!row || row.action === "" || !row.enabled) return
-    root.confirmCancel = row.action === "cancel"
     root.confirmMode = row.mode
     confirmDialog.selectedIndex = 0
   }
 
+  // The row is checked again: the state may have changed while the dialog
+  // was open (a switch staged, AC unplugged); then nothing runs.
   function confirmSwitch() {
     var mode = root.confirmMode
-    var isCancel = root.confirmCancel
     root.confirmMode = ""
-    MuxState.requestSwitch(root, mode, isCancel)
+    var row = root.rows.find(function(r) { return r.mode === mode })
+    if (!row || row.action !== "switch" || !row.enabled) return
+    MuxState.requestSwitch(root, mode)
   }
 
   function shutDownNow() {
@@ -410,6 +410,20 @@ Panel {
             }
           }
 
+          // A staged switch locks the mode until a full shutdown. Hidden while
+          // the result below already says the same sentence (a refused switch).
+          Text {
+            visible: MuxState.debug.ok && MuxState.debug.pending
+              && !(!MuxState.busy && MuxState.outcome !== null && MuxState.outcome.message === Model.STAGED_LOCK_TEXT)
+            width: parent.width
+            text: Model.STAGED_LOCK_TEXT
+            textFormat: Text.PlainText
+            wrapMode: Text.Wrap
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
           // The last switch's result; the trigger warning stands out.
           Column {
             visible: MuxState.outcome !== null || MuxState.busy
@@ -506,10 +520,9 @@ Panel {
         anchors.fill: parent
         z: 10
         opened: root.confirmMode !== ""
-        message: Model.confirmMessage(root.confirmMode, root.confirmCancel, root.warnIntegrated,
-          MuxState.debug.pending ? MuxState.debug.target : "")
-        cancelText: root.confirmCancel ? "Keep pending" : "Cancel"
-        confirmText: root.confirmCancel ? "Cancel switch" : "Switch"
+        message: Model.confirmMessage(root.confirmMode, root.warnIntegrated)
+        cancelText: "Cancel"
+        confirmText: "Switch"
         fontFamily: root.fontFamily
         onCanceled: root.confirmMode = ""
         onConfirmed: root.confirmSwitch()
