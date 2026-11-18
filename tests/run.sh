@@ -412,8 +412,11 @@ EOF
 # the real stat the temporary binary fails the gate before any pkexec runs.
 # The singleton is driven directly (no panel, so no window and no dialog):
 # Intel/RTX/Auto write and remove the env file under the temporary HOME;
-# MSHybrid is staged (the re-read shows it pending, the file stays), then the
-# pending switch is cancelled (no shutdown offered; the file is removed);
+# the base GPU dropdown is shown with Discrete current and with MSHybrid or
+# Integrated pending; MSHybrid is staged (the re-read shows it pending, the
+# file stays), then the pending switch is cancelled (no shutdown offered;
+# staging Discrete leaves the file), Integrated is staged and cancelled too
+# (the RTX file is still there after the round trip);
 # a second request while one runs is refused; RTX then Auto while RTX is
 # written ends in Auto (no file); a write that fails (env.d made read-only)
 # shows the error and puts the widget's dropdown back on Auto, the state on
@@ -500,6 +503,7 @@ ShellRoot {
         if (s.ac !== true) { shell.log("skip ac " + s.ac); shell.done(); return }
         shell.log("ready ownership " + s.ownership.kind + " available " + s.available + " current " + s.debug.current
           + " pending " + s.debug.pending + " env " + s.envChoice)
+        shell.logShown("discrete current")
         s.setEnvChoice("rtx")
         shell.step = 1
       } else if (shell.step === 1) {
@@ -512,12 +516,43 @@ ShellRoot {
       } else if (shell.step === 2) {
         if (!shell.outcome || s.busy || !s.debug.pending) return
         shell.log("staged pending " + s.debug.pending + " target " + s.debug.target + " env " + s.envChoice)
+        shell.logShown("mshybrid pending")
         shell.outcome = null
         shell.log("cancel " + s.requestSwitch(holder, "discrete", true))
         shell.step = 3
       } else if (shell.step === 3) {
-        if (!shell.outcome || s.busy || s.debug.pending || s.envChoice !== "auto") return
+        if (!shell.outcome || s.busy || s.debug.pending) return
+        // Read the file back: staging Discrete (the cancel) left it.
+        shell.reads = 0
+        s.rereadEnv()
+        shell.step = 31
+      } else if (shell.step === 31) {
+        if (shell.reads === 0) return
         shell.log("cancelled pending " + s.debug.pending + " env " + s.envChoice)
+        // Integrated staged with RTX chosen: the file stays too.
+        shell.outcome = null
+        shell.log("integrated request " + s.requestSwitch(holder, "integrated", false))
+        shell.step = 32
+      } else if (shell.step === 32) {
+        if (!shell.outcome || s.busy || !s.debug.pending) return
+        shell.reads = 0
+        s.rereadEnv()
+        shell.step = 33
+      } else if (shell.step === 33) {
+        if (shell.reads === 0) return
+        shell.log("integrated pending " + s.debug.pending + " target " + s.debug.target + " env " + s.envChoice)
+        shell.logShown("integrated pending")
+        shell.outcome = null
+        shell.log("cancel integrated " + s.requestSwitch(holder, "discrete", true))
+        shell.step = 34
+      } else if (shell.step === 34) {
+        if (!shell.outcome || s.busy || s.debug.pending) return
+        shell.reads = 0
+        s.rereadEnv()
+        shell.step = 35
+      } else if (shell.step === 35) {
+        if (shell.reads === 0) return
+        shell.log("round trip pending " + s.debug.pending + " env " + s.envChoice)
         s.setEnvChoice("intel")
         shell.step = 4
       } else if (shell.step === 4) {
@@ -581,6 +616,15 @@ ShellRoot {
   Process { id: envDirMode }
   // The widget's env dropdown, found by its label (it has no id outside).
   property int reads: 0
+  // Whether the dropdown and every item above it up to the widget are
+  // visible (the widget's own window is never shown here).
+  function logShown(when) {
+    var dd = shell.findDropdown(shell.widget, 0)
+    var shown = dd !== null
+    for (var it = dd; shown && it && it !== shell.widget; it = it.parent)
+      if (it.visible === false && it.parent && it.parent.visible !== false) shown = false
+    shell.log("dropdown " + when + " shown " + shown)
+  }
   function findDropdown(item, depth) {
     if (!item || depth > 40) return null
     if (item.label === "Hyprland base GPU (MSHybrid)" && item.options !== undefined) return item
@@ -618,7 +662,14 @@ EOF
   expect_flow "staged pending true target mshybrid env rtx" "the re-read shows MSHybrid pending; the env file stays"
   expect_flow "cancel true" "cancel asked"
   expect_flow "finished owner true kind cancelled offer false warning false :: Pending switch cancelled" "cancelled: no shutdown offered"
-  expect_flow "cancelled pending false env auto" "nothing pending; staging Discrete removed the env file"
+  expect_flow "dropdown discrete current shown true" "the base GPU dropdown is shown in Discrete (current, nothing pending)"
+  expect_flow "dropdown mshybrid pending shown true" "the dropdown is shown with MSHybrid pending"
+  expect_flow "cancelled pending false env rtx" "nothing pending; staging Discrete left the env file (RTX)"
+  expect_flow "integrated request true" "Integrated asked for with RTX chosen"
+  expect_flow "integrated pending true target integrated env rtx" "Integrated staged: the env file stays"
+  expect_flow "dropdown integrated pending shown true" "the dropdown is shown with Integrated pending"
+  expect_flow "cancel integrated true" "the pending Integrated is cancelled"
+  expect_flow "round trip pending false env rtx" "after the round trip the RTX choice is still on disk"
   expect_flow "env intel" "Intel writes the plugin's exact text"
   expect_flow "env auto" "Auto removes it"
   expect_flow "queued busy true next auto" "Auto picked while RTX is written waits in the queue"
@@ -629,9 +680,10 @@ EOF
   # The flags are the ones the debug read got (the hardware's).
   local flags want_pk
   flags=$(sed -n '1s/^--debug --json//p' "$cfg/fake.log" 2>/dev/null)
-  want_pk=$(printf '%s\n' "--disable-internal-agent $bin mshybrid --json$flags" "--disable-internal-agent $bin discrete --json$flags")
+  want_pk=$(printf '%s\n' "--disable-internal-agent $bin mshybrid --json$flags" "--disable-internal-agent $bin discrete --json$flags" \
+    "--disable-internal-agent $bin integrated --json$flags" "--disable-internal-agent $bin discrete --json$flags")
   if [[ $(cat "$cfg/pkexec.log" 2>/dev/null) == "$want_pk" ]]; then
-    echo "ok   pkexec ran twice, with exactly the argv arrays expected"
+    echo "ok   pkexec ran four times, with exactly the argv arrays expected"
   else
     echo "FAIL pkexec log: $(tr '\n' '|' <"$cfg/pkexec.log" 2>/dev/null)"
     ok=1

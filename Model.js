@@ -575,6 +575,8 @@ var ENV_OPTIONS = [
 ]
 var ENV_MARKER = "# msi-mux-base: "
 var LOGOUT_TEXT = "Log out to apply."
+var ENV_PENDING_TEXT = "Applies after the shutdown into MSHybrid."
+var ENV_INERT_TEXT = "Saved. Takes effect only in MSHybrid."
 
 function cleanHome(home) {
   var h = home === undefined || home === null ? "" : String(home)
@@ -712,10 +714,13 @@ function isEnvChoice(value) {
   return ENV_CHOICES.indexOf(value) !== -1
 }
 
-// Shown for MSHybrid as the staged target, and whenever the file exists, so
-// it can always be removed.
-function showEnvChoice(target, choice) {
-  return target === "mshybrid" || (choice !== "auto" && choice !== "")
+// The status after an env pick, from the MUX state (Model.parseDebug's
+// current, pending and target): the file acts only in MSHybrid.
+function envStatusText(debug) {
+  var d = debug || {}
+  if (d.current === "mshybrid") return LOGOUT_TEXT
+  if (d.pending === true && d.target === "mshybrid") return ENV_PENDING_TEXT
+  return ENV_INERT_TEXT
 }
 
 var ENV_MODIFIED_TEXT = "~/.config/uwsm/env.d/" + ENV_FILE_NAME + " was changed outside the plugin. Picking an option replaces or removes it."
@@ -849,8 +854,8 @@ function warnSetting(value) {
 // The panel's keyboard cursor stands on one control, named by a key:
 //   setup  mode|<mode>  env
 // in screen order: Set up backend (when offered), each mode row's enabled
-// button, the Hyprland base GPU dropdown (when shown). Disabled controls are
-// not stops. Up/Down (and Left/Right) step through them.
+// button, the Hyprland base GPU dropdown (always shown). Disabled controls
+// are not stops. Up/Down (and Left/Right) step through them.
 function cursorStops(rows, o) {
   var opt = o || {}
   var stops = []
@@ -860,7 +865,7 @@ function cursorStops(rows, o) {
     var r = list[i]
     if (r && r.action !== "" && r.enabled) stops.push("mode|" + r.mode)
   }
-  if (opt.showEnv === true) stops.push("env")
+  stops.push("env")
   return stops
 }
 

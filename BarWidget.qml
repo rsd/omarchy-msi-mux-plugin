@@ -23,8 +23,9 @@ import "Model.js" as Model
 //     pkexec. On success, a second dialog offers Shut down now
 //     (`omarchy-system shutdown`) or Later. A cancelled pending switch offers
 //     no shutdown.
-//   - Hyprland base GPU (shown for MSHybrid): MuxState.setEnvChoice, which
-//     writes or removes ~/.config/uwsm/env.d/90-msi-mux-gpu only.
+//   - Hyprland base GPU (shown in every mode; acts only in MSHybrid):
+//     MuxState.setEnvChoice, which writes or removes
+//     ~/.config/uwsm/env.d/90-msi-mux-gpu only.
 //   - Set up backend: the plugin's setup.sh in a floating terminal
 //     (Model.setupArgv), with the binary path as an argument.
 //
@@ -56,7 +57,6 @@ Panel {
   })
   readonly property var glyph: Model.barState(root.view)
   readonly property var rows: Model.modeRows(root.view)
-  readonly property bool showEnv: Model.showEnvChoice(MuxState.debug.target, MuxState.envChoice)
 
   // The badge's size follows the bar glyph (12 when the shell has none).
   readonly property real barIconSize: {
@@ -78,7 +78,7 @@ Panel {
   // a time.
   property bool cursorActive: false
   property string cursorKey: ""
-  readonly property var cursorStops: Model.cursorStops(root.rows, { canSetUp: MuxState.canSetUp, showEnv: root.showEnv })
+  readonly property var cursorStops: Model.cursorStops(root.rows, { canSetUp: MuxState.canSetUp })
   readonly property string cursorAt: Model.cursorKeyIn(root.cursorStops, root.cursorKey)
   readonly property bool dialogOpen: confirmDialog.opened || shutdownDialog.opened
 
@@ -441,10 +441,9 @@ Panel {
             }
           }
 
-          // Hyprland's base GPU, for MSHybrid (and whenever the file exists,
-          // so it can be removed).
+          // Hyprland's base GPU: shown and usable in every mode, current or
+          // pending; the file it writes acts only in MSHybrid.
           Column {
-            visible: root.showEnv
             width: parent.width
             spacing: Style.space(6)
 
@@ -469,7 +468,7 @@ Panel {
             Text {
               width: parent.width
               text: "Auto leaves Hyprland's config untouched. Intel or RTX writes ~/.config/uwsm/env.d/" + Model.ENV_FILE_NAME
-                + ", which sets AQ_DRM_DEVICES at login only while both GPUs are present."
+                + ". It takes effect only in MSHybrid, after you log out and back in; in Discrete or Integrated the file is inert."
               textFormat: Text.PlainText
               wrapMode: Text.Wrap
               color: root.dim
@@ -491,7 +490,7 @@ Panel {
             Text {
               visible: MuxState.envChanged || MuxState.envError !== ""
               width: parent.width
-              text: MuxState.envError !== "" ? MuxState.envError : Model.LOGOUT_TEXT
+              text: MuxState.envError !== "" ? MuxState.envError : Model.envStatusText(MuxState.debug)
               textFormat: Text.PlainText
               wrapMode: Text.Wrap
               color: MuxState.envError !== "" ? root.urgent : root.foreground

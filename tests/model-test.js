@@ -634,12 +634,12 @@ test("wording: shut down, never an instruction to reboot", () => {
 
 test("cursor: stops in screen order, disabled buttons skipped", () => {
   const rows = M.modeRows(view())
-  assert.deepStrictEqual(M.cursorStops(rows, {}), ["mode|mshybrid", "mode|integrated"])
-  assert.deepStrictEqual(M.cursorStops(rows, { canSetUp: true, showEnv: true }), ["setup", "mode|mshybrid", "mode|integrated", "env"])
-  assert.deepStrictEqual(M.cursorStops(M.modeRows(view({ ac: false })), { canSetUp: true }), ["setup"])
+  assert.deepStrictEqual(M.cursorStops(rows, {}), ["mode|mshybrid", "mode|integrated", "env"])
+  assert.deepStrictEqual(M.cursorStops(rows, { canSetUp: true }), ["setup", "mode|mshybrid", "mode|integrated", "env"])
+  assert.deepStrictEqual(M.cursorStops(M.modeRows(view({ ac: false })), { canSetUp: true }), ["setup", "env"], "the env dropdown needs no AC")
   const pending = M.modeRows(view({ debug: M.parseDebug(withFirmware({ selected_target_mode: "ms-hybrid" }), "", 0) }))
-  assert.deepStrictEqual(M.cursorStops(pending, { showEnv: true }), ["mode|discrete", "mode|integrated", "env"], "Cancel pending is a stop")
-  assert.deepStrictEqual(M.cursorStops(null, null), [])
+  assert.deepStrictEqual(M.cursorStops(pending, {}), ["mode|discrete", "mode|integrated", "env"], "Cancel pending is a stop")
+  assert.deepStrictEqual(M.cursorStops(null, null), ["env"], "the env dropdown is a stop in every mode")
 })
 
 test("cursor: stepping, falling back, and the action under it", () => {
@@ -734,12 +734,19 @@ test("env file: the dropdown's value comes from the file", () => {
   assert.strictEqual(M.envChoiceFromFile("export AQ_DRM_DEVICES=/dev/dri/card1\n"), "modified")
   assert.deepStrictEqual(M.ENV_OPTIONS.map(o => o.value), M.ENV_CHOICES)
   assert.deepStrictEqual(M.ENV_OPTIONS.map(o => o.label), ["Auto", "Intel", "RTX (experimental)"])
-  assert.ok(M.showEnvChoice("mshybrid", "auto"))
-  assert.ok(!M.showEnvChoice("discrete", "auto"))
-  assert.ok(!M.showEnvChoice("", "auto"))
-  assert.ok(M.showEnvChoice("discrete", "rtx"), "an existing file can always be removed")
-  assert.ok(M.showEnvChoice("integrated", "modified"))
+  assert.strictEqual(M.showEnvChoice, undefined, "the dropdown is not gated on the mode")
   assert.strictEqual(M.LOGOUT_TEXT, "Log out to apply.")
+})
+
+test("env file: the status after a pick follows the MUX state", () => {
+  assert.strictEqual(M.envStatusText({ current: "mshybrid", pending: false, target: "" }), "Log out to apply.")
+  assert.strictEqual(M.envStatusText({ current: "mshybrid", pending: true, target: "discrete" }), "Log out to apply.")
+  assert.strictEqual(M.envStatusText({ current: "discrete", pending: true, target: "mshybrid" }), "Applies after the shutdown into MSHybrid.")
+  assert.strictEqual(M.envStatusText({ current: "integrated", pending: true, target: "mshybrid" }), "Applies after the shutdown into MSHybrid.")
+  for (const d of [{ current: "discrete", pending: false, target: "" }, { current: "discrete", pending: true, target: "integrated" },
+    { current: "integrated", pending: false, target: "" }, {}, null, undefined])
+    assert.strictEqual(M.envStatusText(d), "Saved. Takes effect only in MSHybrid.", JSON.stringify(d))
+  assert.ok(/text: MuxState\.envError !== "" \? MuxState\.envError : Model\.envStatusText\(MuxState\.debug\)/.test(read("BarWidget.qml")))
 })
 
 // ------------------------------------------------------------- the QML
@@ -855,12 +862,28 @@ test("env choice: one change at a time; a choice made meanwhile is applied after
   assert.ok(body.indexOf("root.envQueued = value") !== -1)
   assert.ok(body.indexOf("if (root.envBusy)") < body.indexOf("value === root.envChoice"))
   const done = state.slice(state.indexOf("function envDone()"))
-  assert.ok(/var next = root\.envQueued[\s\S]*root\.startEnv\(next, true\)/.test(done.slice(0, done.indexOf("\n  }\n"))))
+  assert.ok(/var next = root\.envQueued[\s\S]*root\.startEnv\(next\)/.test(done.slice(0, done.indexOf("\n  }\n"))))
   assert.strictEqual((state.match(/envProc\.running = true/g) || []).length, 1, "every env change starts in one place")
   // After every read back, the dropdown follows the file on disk, even when
   // envChoice did not change (a failed pick does not stay shown).
   assert.ok(/root\.envChoice = Model\.parseEnvRead\(text\)\s*root\.envRead\(\)/.test(state))
   assert.ok(/function onEnvRead\(\) \{ root\.syncEnvDropdown\(\) \}/.test(qmlCode("BarWidget.qml")))
+})
+
+test("env choice: the dropdown is shown in every mode; staging a mode never touches the file", () => {
+  const bar = qmlCode("BarWidget.qml")
+  const at = bar.indexOf("id: envDropdown")
+  const col = bar.lastIndexOf("Column {", at)
+  assert.ok(col !== -1 && !/\bvisible:/.test(ownBody(bar, col + "Column ".length)), "the dropdown's Column has no visible: gate")
+  assert.ok(!/showEnv/.test(bar))
+  assert.ok(/takes effect only in MSHybrid, after you log out and back in; in Discrete or Integrated the file is inert/.test(read("BarWidget.qml")))
+  const state = qmlCode("MuxState.qml")
+  const exited = state.slice(state.indexOf("function switchExited()"))
+  assert.ok(!/Env|env/.test(exited.slice(0, exited.indexOf("\n  }\n"))), "the switch's end leaves the env file alone")
+  assert.ok(!/removeEnvFile/.test(state))
+  // The file is removed only for Auto, through the one start.
+  assert.strictEqual((state.match(/Model\.envRemoveArgv\(/g) || []).length, 1)
+  assert.ok(/value === "auto" \? Model\.envRemoveArgv\(root\.home\)/.test(state))
 })
 
 test("switch: pgrep runs before pkexec, after this plugin's own debug read", () => {
@@ -878,7 +901,7 @@ test("panel: keyboard cursor, Keep pending, per-row reasons, stale results clear
   const bar = qmlCode("BarWidget.qml")
   assert.ok(/PanelKeyCatcher \{\s*id: keyCatcher/.test(bar))
   assert.ok(/focusTarget: keyCatcher/.test(bar))
-  assert.ok(/Model\.cursorStops\(root\.rows, \{ canSetUp: MuxState\.canSetUp, showEnv: root\.showEnv \}\)/.test(bar))
+  assert.ok(/Model\.cursorStops\(root\.rows, \{ canSetUp: MuxState\.canSetUp \}\)/.test(bar))
   for (const k of ['"setup"', '"env"', "modeButton.key"])
     assert.ok(new RegExp("hasCursor: root\\.cursorActive && root\\.cursorAt === " + k.replace(/\./g, "\\.")).test(bar), k)
   assert.ok(/cancelText: root\.confirmCancel \? "Keep pending" : "Cancel"/.test(bar))
@@ -900,7 +923,7 @@ test("manifest: identity, version and the settings schema", () => {
   assert.strictEqual(m.id, "io.github.rsd.msi-mux")
   assert.strictEqual(m.id, M.PLUGIN_ID)
   assert.strictEqual(m.name, "MSI GPU MUX")
-  assert.strictEqual(m.version, "0.1.0")
+  assert.strictEqual(m.version, "0.2.0")
   assert.strictEqual(m.license, "MIT")
   assert.deepStrictEqual(m.kinds, ["bar-widget"])
   assert.deepStrictEqual(m.entryPoints, { barWidget: "BarWidget.qml" })

@@ -39,8 +39,9 @@ import "Model.js" as Model
 //     to the dot-prefixed temporary file Model.ENV_TEMP_NAME beside it,
 //     renamed over it with `mv -T`, the temporary file removed on failure),
 //     removed with `rm -f` (never recursive; also the two temporary names,
-//     Model.envRemoveArgv) on Auto and after Discrete or Integrated is
-//     staged. One change at a time; a choice made while one runs is
+//     Model.envRemoveArgv) only on Auto. Staging a mode never touches it:
+//     the choice survives a mode round trip (the file acts only in
+//     MSHybrid). One change at a time; a choice made while one runs is
 //     applied after it (the latest wins); after each, the file is read back
 //     and the dropdown follows what is on disk. No other file is read for writing, renamed or touched.
 Singleton {
@@ -440,9 +441,6 @@ Singleton {
   function switchExited() {
     if (root.phase !== "running") return
     var outcome = Model.switchOutcome(root.switchRun, switchProc.exitCode, root.switchMode, root.switchCancel)
-    if ((outcome.kind === "success" || outcome.kind === "cancelled")
-        && (root.switchMode === "discrete" || root.switchMode === "integrated"))
-      root.removeEnvFile()
     root.finish(outcome)
     root.readDebug()
   }
@@ -501,20 +499,13 @@ Singleton {
       return
     }
     if (value === root.envChoice) return
-    root.startEnv(value, true)
+    root.startEnv(value)
   }
 
-  // After Discrete or Integrated is staged.
-  function removeEnvFile() {
-    if (root.envFilePath === "") return
-    if (root.envBusy) { root.envQueued = "auto"; return }
-    root.startEnv("auto", false)
-  }
-
-  function startEnv(value, byUser) {
+  function startEnv(value) {
     var argv = value === "auto" ? Model.envRemoveArgv(root.home) : Model.envWriteArgv(root.home, value)
     if (argv.length === 0) return
-    if (byUser) root.envChanged = true
+    root.envChanged = true
     root.envError = ""
     root.envBusy = true
     envProc.value = value
@@ -529,7 +520,7 @@ Singleton {
     var next = root.envQueued
     root.envQueued = ""
     if (next !== "" && next !== done) {
-      root.startEnv(next, true)
+      root.startEnv(next)
       return
     }
     root.rereadEnv()

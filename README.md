@@ -179,8 +179,8 @@ In the bar's widget settings:
 ## What this does to your Hyprland config
 
 Nothing, unless you pick **Intel** or **RTX** in the panel's **Hyprland base
-GPU** dropdown (shown for MSHybrid). The default, **Auto**, means the plugin
-owns no file and leaves Hyprland alone.
+GPU** dropdown (shown in every mode, current or pending). The default,
+**Auto**, means the plugin owns no file and leaves Hyprland alone.
 
 In MSHybrid, both GPUs are present and Hyprland composites on one of them
 (usually the Intel GPU), copying frames to the screens wired to the other.
@@ -242,9 +242,12 @@ What it changes:
   `/dev/dri/card1:/dev/dri/card0`. In Discrete or Integrated one GPU is gone,
   so it exports nothing and Hyprland starts as usual.
 - It prints nothing, never exits early and leaves no variable behind.
-- The plugin also deletes the file when you pick **Auto** again, and after it
-  stages Discrete or Integrated.
-- It takes effect at the next login: **log out to apply**.
+- It takes effect only in MSHybrid, at the next login: **log out to apply**.
+- Switching to Discrete or Integrated does not delete it: your Intel or RTX
+  choice is kept for the next time you are in MSHybrid. Outside MSHybrid the
+  file is inert, because of the both-GPUs check above.
+- The file stays until you pick **Auto** again (the plugin then deletes it) or
+  remove it by hand.
 
 RTX as the base GPU is labelled experimental: it is untested.
 
