@@ -354,6 +354,16 @@ What the plugin runs and writes, and when:
   `pgrep -x msi-mux-switch`, the env file above, and `msi-mux-switch --debug
   --json`, under a 10 s timeout with each output stream capped at 1 MiB as it
   is read.
+- **Switch output**: the switch's stdout and stderr are read in raw chunks
+  and split into lines by the plugin, and no line it holds grows past
+  65,537 characters: the rest of a longer line is dropped up to its next
+  newline, and the line is then ignored as overlong. The switch itself has no
+  timeout, because pkexec waits for you in its dialog. Two known differences
+  from reading whole lines: a multibyte character split across a chunk
+  boundary shows as U+FFFD in message text, with the JSON structure
+  unaffected (the replacement can push a line right at the cap over it); and
+  a line with more than about 65,000 leading whitespace characters changes
+  the text quoted after "pkexec said".
 - **Network**: none. The plugin makes no network request, and builds,
   bundles and downloads nothing.
 

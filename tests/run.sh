@@ -430,9 +430,12 @@ EOF
 # is pending is refused by the tool and shown as the plain sentence, once,
 # with nothing changed; the fake's state is reset (a full shutdown) and
 # Integrated is staged and reset the same way (the RTX file is still there
-# after the round trip); RTX then Auto while RTX is written ends in Auto (no
-# file); a write that fails (env.d made read-only) shows the error and puts
-# the widget's dropdown back on Auto, the state on disk; a write that fails
+# after the round trip); MSHybrid is staged with the fake printing a line of
+# about 300 KB first and its success line without a "\n" (the long line is
+# counted as unread, the events are all read, success; then reset); RTX
+# then Auto while RTX is written ends in Auto (no file); a write that fails
+# (env.d made read-only) shows the error and puts the widget's dropdown
+# back on Auto, the state on disk; a write that fails
 # with Auto queued behind it keeps its error shown after Auto succeeds; a
 # removal that fails shows its error and puts the dropdown back on Intel; a
 # switch while a process named msi-mux-switch runs (a copy of sleep) is
@@ -622,6 +625,29 @@ ShellRoot {
       } else if (shell.step === 38) {
         if (shell.reads === 0) return
         shell.log("round trip pending " + s.debug.pending + " env " + s.envChoice)
+        // A switch whose output holds one line far over the reader's cap and
+        // ends without a "\n": the long line is not read, the rest is.
+        floodSet.running = true
+        shell.step = 71
+      } else if (shell.step === 71) {
+        if (floodSet.running) return
+        shell.outcome = null
+        shell.log("flood request " + s.requestSwitch(holder, "mshybrid"))
+        shell.step = 72
+      } else if (shell.step === 72) {
+        if (!shell.outcome || s.busy || !s.debug.pending) return
+        var fr = s.switchRun
+        shell.log("flood run other " + fr.other + " events " + fr.events.length + " last " + fr.events[fr.events.length - 1]
+          + " errors " + fr.errors.length + " pending " + s.debug.pending + " target " + s.debug.target)
+        floodReset.running = true
+        shell.step = 73
+      } else if (shell.step === 73) {
+        if (floodReset.running) return
+        s.readDebug()
+        shell.step = 74
+      } else if (shell.step === 74) {
+        if (s.debug.pending) return
+        shell.log("flood reset pending " + s.debug.pending)
         // A leftover firmware flag (a failed switch rolled back): nothing
         // staged, Switch buttons shown, but the tool refuses.
         flagSet.running = true
@@ -749,6 +775,8 @@ ShellRoot {
   Process { id: envDirMode }
   Process { id: stateReset; command: ["rm", "-f", "--", "$cfg/state"] }
   Process { id: flagSet; command: ["touch", "--", "$cfg/state.apply-ready"] }
+  Process { id: floodSet; command: ["touch", "--", "$cfg/state.flood"] }
+  Process { id: floodReset; command: ["rm", "-f", "--", "$cfg/state", "$cfg/state.flood"] }
   Process { id: flagClear; command: ["rm", "-f", "--", "$cfg/state.apply-ready"] }
   // The lock line (its text, shown or not), its Shut down now button and
   // cursor stop; then the button is pressed through the cursor: the shutdown
@@ -1027,6 +1055,10 @@ EOF
   expect_flow "dropdown integrated pending shown true" "the dropdown is shown with Integrated pending"
   expect_flow "panel integrated pending rows 3 buttons 0 [] lock true" "Integrated staged: no button; the lock line is shown"
   expect_flow "round trip pending false env rtx" "after the round trip the RTX choice is still on disk"
+  expect_flow "flood request true" "MSHybrid asked for with the fake printing a 300 KB line first"
+  expect_flow "finished owner holder kind success offer true warning false :: MSHybrid is staged. It takes effect after a full shutdown." "the overlong line does not break the run: success, its last line (no newline) read at exit"
+  expect_flow "flood run other 1 events 9 last success errors 0 pending true target mshybrid" "the 300 KB line is counted as one unread line, not an error event; the nine events are read, the unterminated success last"
+  expect_flow "flood reset pending false" "after the flood run's shutdown nothing is pending"
   expect_flow "lockline mshybrid pending kind staged text true button true stop true offered true dialog staged open true :: The switch is staged. Shut down now to apply it?" "staged: Shut down now on the lock line, a cursor stop, opening the shutdown dialog"
   expect_flow "shutdown keys mshybrid pending hover rest 0 jitter 0 moved 0 keyed 1 kept 1 back 0 again 0 start 0 stray 13 moved 0 swallowed 13 open true toggles 1,0,1,0 enter-cancel closed true" "shutdown dialog: opens on Later; a hover never selects Shut down now (resting, jittering or after a real move); its keys select it and a hover over it keeps it; h, l, Space and other text keys change nothing and confirm nothing; arrows and Tab toggle; Enter on Later closes it"
   expect_flow "shutdown keys flag refused hover rest 0 jitter 0 moved 0 keyed 1 kept 1 back 0 again 0 start 0 stray 13 moved 0 swallowed 13 open true toggles 1,0,1,0 enter-cancel closed true" "the same for the leftover-flag shutdown dialog"
@@ -1055,7 +1087,8 @@ EOF
   local flags want_pk
   flags=$(sed -n '1s/^--debug --json//p' "$cfg/fake.log" 2>/dev/null)
   want_pk=$(printf '%s\n' "--disable-internal-agent $bin mshybrid --json$flags" "--disable-internal-agent $bin integrated --json$flags" \
-    "--disable-internal-agent $bin integrated --json$flags" "--disable-internal-agent $bin integrated --json$flags")
+    "--disable-internal-agent $bin integrated --json$flags" "--disable-internal-agent $bin mshybrid --json$flags" \
+    "--disable-internal-agent $bin integrated --json$flags")
   if [[ -e $cfg/shutdown.log ]]; then
     echo "FAIL the shutdown command was run: $(tr '\n' '|' <"$cfg/shutdown.log")"
     ok=1
@@ -1063,7 +1096,7 @@ EOF
     echo "ok   the shutdown command never ran"
   fi
   if [[ $(cat "$cfg/pkexec.log" 2>/dev/null) == "$want_pk" ]]; then
-    echo "ok   pkexec ran four times (the refused re-stage and the leftover-flag refusal included), with exactly the argv arrays expected"
+    echo "ok   pkexec ran five times (the refused re-stage, the flood run and the leftover-flag refusal included), with exactly the argv arrays expected"
   else
     echo "FAIL pkexec log: $(tr '\n' '|' <"$cfg/pkexec.log" 2>/dev/null)"
     ok=1

@@ -475,6 +475,126 @@ test("events: a run stays bounded (500 events, 20 messages, long lines unparsed)
   assert.ok(msg.errors[0].length <= 501 && msg.errors[0].endsWith("…"))
 })
 
+// Cuts a text into chunks of n characters, as the raw SplitParser does.
+const chunks = (text, n) => {
+  const out = []
+  for (let i = 0; i < text.length; i += n) out.push(text.slice(i, i + n))
+  return out
+}
+// Every line a stream's chunks produce, the tail included.
+const splitAll = (parts) => {
+  const buf = M.newLineBuffer()
+  const lines = []
+  for (const p of parts) lines.push(...M.splitChunk(buf, p))
+  const tail = M.flushLine(buf)
+  if (tail !== null) lines.push(tail)
+  return lines
+}
+
+test("lines: a line split over several chunks comes out whole", () => {
+  const buf = M.newLineBuffer()
+  assert.deepStrictEqual(buf, { text: "", over: false })
+  const line = ev("success", "ok")
+  assert.deepStrictEqual(M.splitChunk(buf, line.slice(0, 5)), [])
+  assert.deepStrictEqual(M.splitChunk(buf, line.slice(5, 12)), [])
+  assert.deepStrictEqual(M.splitChunk(buf, line.slice(12) + "\n" + "next"), [line])
+  assert.deepStrictEqual(M.splitChunk(buf, "\n"), ["next"])
+  assert.strictEqual(M.flushLine(buf), null, "the output ended with \\n")
+  for (const n of [1, 7, 100, 65536])
+    assert.deepStrictEqual(splitAll(chunks(SUCCESS_RUN.join("\n") + "\n", n)), SUCCESS_RUN, "chunks of " + n)
+})
+
+test("lines: empty lines are kept; only \\n separates", () => {
+  const buf = M.newLineBuffer()
+  assert.deepStrictEqual(M.splitChunk(buf, "a\n\n\nb\r\nc\rd\n"), ["a", "", "", "b\r", "c\rd"])
+  assert.deepStrictEqual(M.splitChunk(buf, "\n"), [""])
+  assert.deepStrictEqual(M.splitChunk(buf, ""), [])
+  assert.strictEqual(M.flushLine(buf), null)
+})
+
+test("lines: the unterminated tail is flushed; a trailing \\n leaves nothing", () => {
+  const buf = M.newLineBuffer()
+  assert.strictEqual(M.flushLine(buf), null, "nothing came")
+  assert.deepStrictEqual(M.splitChunk(buf, "one\ntwo"), ["one"])
+  assert.strictEqual(M.flushLine(buf), "two")
+  assert.deepStrictEqual(buf, { text: "", over: false }, "the flush resets the buffer")
+  assert.strictEqual(M.flushLine(buf), null)
+  M.splitChunk(buf, "three\n")
+  assert.strictEqual(M.flushLine(buf), null)
+})
+
+test("lines: an overlong line is capped at MAX_LINE_CHARS + 1 and rejected; the next line is intact", () => {
+  const CAP = M.MAX_LINE_CHARS + 1
+  assert.strictEqual(M.MAX_LINE_CHARS, 65536)
+  const huge = "{" + "x".repeat(5 * 65536)
+  // The next event in the same chunk as the end of the huge line.
+  const parts = chunks(huge, 65536)
+  parts[parts.length - 1] += "\n" + ev("success", "ok") + "\n"
+  const buf = M.newLineBuffer()
+  const lines = []
+  for (const p of parts) {
+    lines.push(...M.splitChunk(buf, p))
+    assert.ok(buf.text.length <= CAP, "the buffer stays bounded: " + buf.text.length)
+  }
+  assert.strictEqual(M.flushLine(buf), null)
+  assert.strictEqual(lines.length, 2)
+  assert.strictEqual(lines[0], huge.slice(0, CAP))
+  assert.strictEqual(lines[0].length, CAP)
+  const run = fold(lines)
+  assert.deepStrictEqual([run.other, run.events], [1, ["success"]], "the capped line is not an event")
+  // The next event in the following chunk; the huge line is a JSON event
+  // that would parse if it were not too long.
+  const event = ev("error", "y".repeat(3 * 65536))
+  assert.ok(M.parseEventLine(event))
+  const lines2 = splitAll(chunks(event, 65536).concat(["\n" + ev("unchanged", "same")]))
+  assert.deepStrictEqual(lines2.map(l => l.length), [CAP, ev("unchanged", "same").length])
+  const run2 = fold(lines2)
+  assert.deepStrictEqual([run2.other, run2.errors, run2.events], [1, [], ["unchanged"]])
+  // A line of exactly MAX_LINE_CHARS stays whole and is parsed.
+  const exact = ev("success", "z".repeat(M.MAX_LINE_CHARS - ev("success", "").length))
+  assert.strictEqual(exact.length, M.MAX_LINE_CHARS)
+  assert.deepStrictEqual(splitAll(chunks(exact + "\n", 4096)), [exact])
+  assert.strictEqual(fold([exact]).success, true)
+})
+
+test("lines: an overlong unterminated tail is flushed capped; many chunks stay bounded", () => {
+  const CAP = M.MAX_LINE_CHARS + 1
+  const buf = M.newLineBuffer()
+  const piece = "a".repeat(65536)
+  for (let i = 0; i < 200; i++) {
+    assert.deepStrictEqual(M.splitChunk(buf, piece), [])
+    assert.strictEqual(buf.text.length, Math.min(CAP, 65536 * (i + 1)))
+  }
+  assert.strictEqual(buf.over, true)
+  assert.strictEqual(M.flushLine(buf), piece + "a")
+  assert.deepStrictEqual(buf, { text: "", over: false })
+  // A "\n" ends the dropped part; what follows starts fresh.
+  M.splitChunk(buf, piece + piece)
+  assert.deepStrictEqual(M.splitChunk(buf, piece + "\nok"), [piece + "a"])
+  assert.strictEqual(M.flushLine(buf), "ok")
+})
+
+test("lines: chunked output gives the same outcome as whole lines", () => {
+  const runs = [
+    [SUCCESS_RUN, 0, "mshybrid"],
+    [["No authentication agent found."], 127, "discrete"],
+    [[], 126, "discrete"],
+    [[], -1, "discrete"],
+    [SUCCESS_RUN.slice(0, 4), 9, "mshybrid"],
+    [SUCCESS_RUN.slice(0, 4).concat([errLine("apply-ready is already set before any write; refusing")]), 1, "integrated"],
+    [["noise", "", ev("unchanged", "same")], 0, "discrete"]
+  ]
+  for (const [lines, code, mode] of runs) {
+    const whole = M.switchOutcome(fold(lines), code, mode, true)
+    for (const n of [1, 3, 64, 65536]) {
+      for (const end of ["\n", ""]) {
+        const out = splitAll(chunks(lines.join("\n") + (lines.length ? end : ""), n))
+        assert.deepStrictEqual(M.switchOutcome(fold(out), code, mode, true), whole, code + " in chunks of " + n + " end " + JSON.stringify(end))
+      }
+    }
+  }
+})
+
 test("events: the refusal while a switch is staged is the plain sentence; other errors stay raw", () => {
   assert.strictEqual(M.STAGED_LOCK_TEXT, "A switch is staged. It can't be changed or cancelled until after a full shutdown.")
   // The real tool's refusal, after the events it prints before Get_AP.
@@ -939,6 +1059,22 @@ test("processes: every command and execDetached argv comes from the model; no sh
   assert.ok(body.indexOf("Model.ownershipVerdict") < body.indexOf("switchProc.running = true"))
   assert.ok(body.indexOf("checkAc.result !== true") < body.indexOf("switchProc.running = true"))
   assert.ok(/stdout: SplitParser/.test(state) && /stderr: SplitParser/.test(state))
+  // Raw chunks, cut into lines by the model; the tails flushed before the outcome.
+  const proc = state.slice(state.indexOf("id: switchProc"))
+  for (const [stream, buf] of [["stdout", "stdoutBuf"], ["stderr", "stderrBuf"]]) {
+    const parser = proc.slice(proc.indexOf(stream + ": SplitParser {"))
+    const block = parser.slice(0, parser.indexOf("\n    }\n"))
+    assert.ok(/splitMarker: ""/.test(block), stream + " is read in raw chunks")
+    assert.ok(block.indexOf("Model.splitChunk(switchProc." + buf + ", data)") !== -1, stream + " goes through Model.splitChunk")
+    assert.ok(body.indexOf("switchProc." + buf + " = Model.newLineBuffer()") < body.indexOf("switchProc.running = true")
+      && body.indexOf("switchProc." + buf + " = Model.newLineBuffer()") !== -1, stream + " buffer reset at start")
+  }
+  const exited = state.slice(state.indexOf("function switchExited()"))
+  const exitBody = exited.slice(0, exited.indexOf("\n  }\n"))
+  const flushOut = exitBody.indexOf("Model.flushLine(switchProc.stdoutBuf)")
+  const flushErr = exitBody.indexOf("Model.flushLine(switchProc.stderrBuf)")
+  assert.ok(exitBody.indexOf('root.phase !== "running"') < flushOut && flushOut < flushErr
+    && flushErr < exitBody.indexOf("Model.switchOutcome"), "switchExited flushes stdout, then stderr, before the outcome")
   assert.ok(/if \(root\.busy \|\| !Model\.isMode\(mode\)\) return false/.test(state), "one switch at a time")
   const bar = qmlCode("BarWidget.qml")
   assert.ok(/Quickshell\.execDetached\(Model\.SHUTDOWN_ARGV\)/.test(bar))
@@ -1335,7 +1471,7 @@ test("manifest: identity, version and the settings schema", () => {
   assert.strictEqual(m.id, "io.github.rsd.msi-mux")
   assert.strictEqual(m.id, M.PLUGIN_ID)
   assert.strictEqual(m.name, "MSI GPU MUX")
-  assert.strictEqual(m.version, "0.2.6")
+  assert.strictEqual(m.version, "0.2.7")
   assert.strictEqual(m.license, "MIT")
   assert.deepStrictEqual(m.kinds, ["bar-widget"])
   assert.deepStrictEqual(m.entryPoints, { barWidget: "BarWidget.qml" })

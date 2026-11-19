@@ -565,6 +565,47 @@ function newSwitchRun() {
     other: 0, firstOther: "" }
 }
 
+// The switch's output arrives in raw chunks and is cut into lines here, not
+// by a line-mode parser, so a line that never ends cannot grow without
+// bound. A per-stream buffer holds at most MAX_LINE_CHARS + 1 characters:
+// past that, the rest of the line is dropped up to the next "\n", and the
+// (MAX_LINE_CHARS + 1)-character prefix stands for the line, so
+// applySwitchLine still rejects it as too long.
+function newLineBuffer() {
+  return { text: "", over: false }
+}
+
+function addToLine(buf, part) {
+  if (buf.over) return
+  var room = MAX_LINE_CHARS + 1 - buf.text.length
+  buf.text += part.length > room ? part.slice(0, room) : part
+  if (buf.text.length > MAX_LINE_CHARS) buf.over = true
+}
+
+// Folds a chunk into buf, in place, and returns the lines it completed
+// (split on "\n" only; empty lines included).
+function splitChunk(buf, chunk) {
+  var parts = String(chunk === undefined || chunk === null ? "" : chunk).split("\n")
+  var lines = []
+  for (var i = 0; i < parts.length; i++) {
+    addToLine(buf, parts[i])
+    if (i === parts.length - 1) break
+    lines.push(buf.text)
+    buf.text = ""
+    buf.over = false
+  }
+  return lines
+}
+
+// The unterminated tail, or null when the output ended with "\n" (or
+// nothing came). Resets buf.
+function flushLine(buf) {
+  var tail = buf.text === "" ? null : buf.text
+  buf.text = ""
+  buf.over = false
+  return tail
+}
+
 function clip(text) {
   var t = String(text)
   return t.length > MAX_MESSAGE_CHARS ? t.slice(0, MAX_MESSAGE_CHARS) + "…" : t

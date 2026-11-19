@@ -32,8 +32,9 @@ import "Model.js" as Model
 //     [flags]` (Model.switchArgv): only from requestSwitch, after the user
 //     confirmed, and only when the fresh stat, AC read and pgrep all pass.
 //     Those checks get Model.CHECK_TIMEOUT_MS (checkWatchdog); then the
-//     switch is refused and nothing runs. One at a time. stdout and stderr are read line by line
-//     (Model.applySwitchLine).
+//     switch is refused and nothing runs. One at a time. stdout and stderr
+//     are read in raw chunks, cut into capped lines (Model.splitChunk) and
+//     folded in by Model.applySwitchLine.
 //   - the env file (~/.config/uwsm/env.d/90-msi-mux-gpu): read with a
 //     bounded read that refuses anything but a regular file
 //     (Model.envReadArgv); written only from setEnvChoice
@@ -429,6 +430,8 @@ Singleton {
     root.phase = "running"
     switchProc.exitCode = -1
     switchProc.command = argv
+    switchProc.stdoutBuf = Model.newLineBuffer()
+    switchProc.stderrBuf = Model.newLineBuffer()
     switchProc.running = true
   }
 
@@ -480,6 +483,11 @@ Singleton {
   // still buffered at its exit are folded in first.
   function switchExited() {
     if (root.phase !== "running") return
+    // A last line without "\n" is still in its buffer.
+    var tail = Model.flushLine(switchProc.stdoutBuf)
+    if (tail !== null) root.ingest(tail)
+    tail = Model.flushLine(switchProc.stderrBuf)
+    if (tail !== null) root.ingest(tail)
     var outcome = Model.switchOutcome(root.switchRun, switchProc.exitCode, root.switchMode,
       root.debug.ok && root.debug.pending)
     root.finish(outcome)
@@ -489,11 +497,21 @@ Singleton {
   Process {
     id: switchProc
     property int exitCode: -1
+    property var stdoutBuf: Model.newLineBuffer()
+    property var stderrBuf: Model.newLineBuffer()
+    // Raw chunks, cut into lines by the model, so a line that never ends
+    // stays bounded (Model.splitChunk).
     stdout: SplitParser {
-      onRead: function(data) { root.ingest(data) }
+      splitMarker: ""
+      onRead: function(data) {
+        Model.splitChunk(switchProc.stdoutBuf, data).forEach(function(line) { root.ingest(line) })
+      }
     }
     stderr: SplitParser {
-      onRead: function(data) { root.ingest(data) }
+      splitMarker: ""
+      onRead: function(data) {
+        Model.splitChunk(switchProc.stderrBuf, data).forEach(function(line) { root.ingest(line) })
+      }
     }
     onExited: function(exitCode, exitStatus) { switchProc.exitCode = exitCode }
     // Also reached when pkexec could not be started (exit status stays -1).

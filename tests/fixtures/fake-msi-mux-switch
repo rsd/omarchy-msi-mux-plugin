@@ -17,7 +17,10 @@
 # Removing $MM_FAKE_STATE stands for that shutdown. A file named
 # $MM_FAKE_STATE.apply-ready stands for the flag left set by a failed switch
 # that rolled back, with nothing staged: every mode run is refused the same
-# way.
+# way. A file named $MM_FAKE_STATE.flood makes a mode run first print one
+# line of about 300 KB on stdout (a JSON error event too long to be read; no
+# "\n" until its end), and print its success event, the last line, without
+# a "\n", so the reader's line cap and its flush at exit are both exercised.
 
 printf '%s\n' "$*" >>"${MM_FAKE_LOG:-/dev/null}"
 
@@ -64,6 +67,14 @@ current=discrete
 selected=$current
 [[ -n $state && -s $state ]] && selected=$(<"$state")
 
+end=$'\n'
+if [[ -n $state && -e $state.flood ]]; then
+  printf '{"event":"error","level":"error","message":"'
+  head -c 300000 /dev/zero | tr '\0' x
+  printf '"}\n'
+  end=
+fi
+
 event() { printf '{"event":"%s","message":"%s","data":%s}\n' "$1" "$2" "$3"; }
 event current_mode "Current mode: $current" "{\"mode\":\"$current\",\"value\":1}"
 event available_modes "Available modes" '{"modes":["ms-hybrid","discrete","integrated"]}'
@@ -82,5 +93,6 @@ fi
 event target_staged "staged" '{"byte5_before":"0x35","byte5_after":"0x34"}'
 event apply_ready "ready" '{"data_byte1":"0x01","apply_ready":true}'
 [[ -n $state ]] && printf '%s' "$mode" >"$state"
-event success "Mode '$mode' is staged and the firmware apply handshake succeeded." "{\"mode\":\"$mode\",\"value\":$value,\"manual_shutdown_required\":true,\"verification_command\":\"x\"}"
+printf '{"event":"success","message":"%s","data":%s}%s' "Mode '$mode' is staged and the firmware apply handshake succeeded." \
+  "{\"mode\":\"$mode\",\"value\":$value,\"manual_shutdown_required\":true,\"verification_command\":\"x\"}" "$end"
 exit 0
