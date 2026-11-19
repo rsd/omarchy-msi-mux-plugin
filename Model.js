@@ -582,7 +582,7 @@ var ENV_CHOICES = ["auto", "intel", "rtx"]
 var ENV_OPTIONS = [
   { value: "auto", label: "Auto" },
   { value: "intel", label: "Intel" },
-  { value: "rtx", label: "RTX (experimental)" }
+  { value: "rtx", label: "RTX" }
 ]
 var ENV_MARKER = "# msi-mux-base: "
 var LOGOUT_TEXT = "Log out to apply."
@@ -852,8 +852,8 @@ function confirmMessage(mode, warnIntegrated) {
   return msg
 }
 
-var SHUTDOWN_MESSAGE = "The switch is staged. Shut down now to apply it? Save your work first. A reboot does not apply it; it needs a full shutdown and power-on."
-var SHUTDOWN_FLAG_MESSAGE = "The firmware still has a switch in progress. Shut down now to clear it? Save your work first. A reboot is not enough; it needs a full shutdown and power-on."
+var SHUTDOWN_MESSAGE = "The switch is staged. Shut down now to apply it? Save your work first. A reboot does not apply it; it needs a full shutdown and power-on. The laptop may power itself back on afterwards; that's normal."
+var SHUTDOWN_FLAG_MESSAGE = "The firmware still has a switch in progress. Shut down now to clear it? Save your work first. A reboot is not enough; it needs a full shutdown and power-on. The laptop may power itself back on afterwards; that's normal."
 
 // The shutdown dialog's text for a lockNotice kind ("flag", else staged).
 function shutdownMessage(kind) {

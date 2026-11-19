@@ -1,186 +1,176 @@
 # MSI GPU MUX
 
-A bar widget for [Omarchy](https://omarchy.org) that switches the hardware GPU
-MUX of supported MSI laptops between **Discrete**, **MSHybrid** and
-**Integrated**, from the top bar instead of a terminal.
+A bar widget for [Omarchy](https://omarchy.org) that shows and switches the
+hardware GPU MUX of supported MSI laptops from the top bar, and sets which GPU
+Hyprland renders on.
 
 ![The MSI GPU MUX panel](preview.png)
 
-The icon shows the current mode, with a small badge while a switch is staged and
-waiting for a full shutdown. Click it for the panel:
+The bar icon shows the current mode, with a badge while a switch is staged.
+Click it for the panel: current and staged mode, AC state, the three modes with
+a **Switch** button each, and the **Hyprland base GPU** dropdown. A disabled
+button says why on its row. The panel is keyboard-driven too: any key shows a
+cursor, arrows (or `j`/`k`) move it, Enter or Space activates, Esc closes.
 
-- the current mode, and the staged one ("Discrete → MSHybrid after shutdown");
-- whether AC power is connected (the firmware switch requires it);
-- the three modes, each with a one-line description and a **Switch** button
-  (when a button is disabled, the row says why); while a switch is staged, no
-  mode has a button;
-- a **Hyprland base GPU** dropdown, shown in every mode and in effect only in
-  MSHybrid (see
-  [What this does to your Hyprland config](#what-this-does-to-your-hyprland-config)).
+The widget is hidden on non-MSI machines. On an MSI machine it is greyed, with
+the reason and the fix, when the backend is missing or unsafe or the model is
+not supported.
 
-| Mode | What it is |
+## Modes
+
+| Mode | What it does |
 |---|---|
-| **Discrete** | RTX GPU only. Fastest, highest battery use. External screens are driven directly. |
-| **MSHybrid** | Intel + RTX. Hyprland composites on one GPU and copies frames to the screens on the other. |
-| **Integrated** | Intel only. Best battery; external screens wired to the RTX probably stay dark. |
+| **Discrete** | RTX only. Fastest, highest battery use. |
+| **MSHybrid** | The laptop panel runs on the Intel GPU; every external output (DP, HDMI) runs on the RTX. Verified on an MS-15M3. |
+| **Integrated** | Intel only. Best battery. External outputs are wired to the RTX, so they are likely dark. Not tested. |
 
-Every switch asks for confirmation first, then for your password through
-Omarchy's own polkit prompt. A switch only **stages** the new mode: it takes
-effect after a **full shutdown** and power-on. A reboot is not enough. After a
-successful switch the panel offers **Shut down now** (Omarchy's
-`omarchy-system shutdown`) or **Later**. Once staged, the switch can't be
-changed or cancelled until after a full shutdown: the firmware keeps it armed
-and msi-mux-switch refuses any further mode change until then. While it waits,
-the panel says so and offers **Shut down now** on that line, through the same
-confirmation.
+Two separate settings are involved:
 
-A failed switch that rolled back can leave the firmware's flag set with nothing
-staged. The panel then still shows the Switch buttons, but msi-mux-switch
-refuses them; the panel says "The firmware still has a switch in progress. A
-full shutdown clears it." and offers **Shut down now** there too.
+| | Changes | Applied |
+|---|---|---|
+| **MUX mode** (the Switch buttons) | Which GPU the laptop panel is wired to, in firmware. | At power-on, after a full shutdown. |
+| **Hyprland base GPU** (the dropdown) | Which GPU Hyprland renders on. | At your next login. |
 
-The panel works from the keyboard too: the first key press shows a cursor,
-the arrow keys (or `j`/`k`) move it between the enabled buttons (Shut down now included) and the
-dropdown, Enter or Space activates, Esc closes.
+## Switching
 
-The widget is hidden on machines that are not MSI. On an MSI machine it is
-shown but greyed, with the reason and how to fix it, when the backend is
-missing, not set up safely, or the model is not one the plugin knows.
+1. Click **Switch** on a mode, confirm, and authenticate in Omarchy's polkit
+   prompt. This only **stages** the switch.
+2. Do a **full shutdown** (the panel offers **Shut down now**, which runs
+   `omarchy-system shutdown`, or **Later**). A reboot does not apply it.
+3. Power on. The new mode is active.
 
-## What you need
+Notes:
 
-- An Omarchy desktop.
-- A supported MSI laptop (see [Supported machines](#supported-machines-and-the-override-flags)).
-- **msi-mux-switch**, the command-line tool that does the actual firmware
-  switch: [github.com/steelbrain/msi-gpu-mux-switch](https://github.com/steelbrain/msi-gpu-mux-switch).
-  It is MIT licensed, by its own author. This plugin only calls it; it never
-  bundles, builds, downloads or updates it.
+- The laptop may power itself back on shortly after the power-off. That is
+  firmware applying the switch; it is normal and is not a reboot.
+- Once staged, the switch can't be changed or cancelled until that shutdown:
+  the firmware's apply-ready flag stays set and msi-mux-switch refuses every
+  further mode change. While staged, no mode has a Switch button, and the line
+  "A switch is staged. It can't be changed or cancelled until after a full
+  shutdown." carries a **Shut down now** button.
+- AC power is required. On battery the buttons are disabled.
+- Integrated asks for an extra confirmation about external screens (setting
+  `warnBeforeIntegrated`).
 
-## Install
+## Requirements
 
-Add the plugin to Omarchy. It is installed as a local plugin folder named by
-its id, `~/.config/omarchy/plugins/io.github.rsd.msi-mux`:
+- An Omarchy desktop and a supported MSI laptop (see
+  [Supported machines](#supported-machines-and-the-override-flags)).
+- **msi-mux-switch**, the command-line tool that does the firmware switch:
+  [github.com/steelbrain/msi-gpu-mux-switch](https://github.com/steelbrain/msi-gpu-mux-switch)
+  (MIT, by its own author; the plugin was written against commit `223ca06`).
+  The plugin only calls it; it never builds, bundles, downloads or updates it.
+
+## Install, update, remove
+
+Install (the plugin folder must be named by its id):
 
 ```bash
 omarchy plugin add https://github.com/rsd/omarchy-msi-mux-plugin.git --enable
 ```
 
-Or copy (or clone) this repository to
-`~/.config/omarchy/plugins/io.github.rsd.msi-mux` yourself and run
-`omarchy plugin enable io.github.rsd.msi-mux`.
+Or copy or clone this repository to
+`~/.config/omarchy/plugins/io.github.rsd.msi-mux` and run
+`omarchy plugin enable io.github.rsd.msi-mux`. Then set up the backend (next
+section); until then the icon is greyed and the panel says why.
 
-After changing the plugin's files (an edit or a `git pull` in a working copy),
-the running shell may keep the old code. Omarchy reloads a plugin when files
-under `~/.config/omarchy/plugins/` change, but that watch does not follow
-symlinks, so a working copy linked into that folder is not reloaded. Force a
-reload with:
+**Update or develop:** after changing the plugin's files (an edit, a
+`git pull`), run
 
 ```bash
-omarchy-shell shell rescanPlugins
+omarchy-restart-shell
 ```
 
-If the panel still behaves like the old code, disable and re-enable it:
+This is the only thing that reloads the plugin's code. `omarchy-shell shell
+rescanPlugins` and disabling and re-enabling the plugin do not: the shell keeps
+running the old code. Do not use `omarchy-refresh-shell`; it resets your
+`shell.json`.
 
-```bash
-omarchy plugin disable io.github.rsd.msi-mux && omarchy-shell shell rescanPlugins && omarchy plugin enable io.github.rsd.msi-mux
-```
+**Remove:**
 
-Then set up the backend (next section). Until then the icon is greyed and the
-panel says why.
+1. `omarchy plugin disable io.github.rsd.msi-mux`, and `omarchy plugin remove
+   io.github.rsd.msi-mux` to delete the folder too.
+2. If you ever picked Intel or RTX as the base GPU, delete the one file the
+   plugin writes, then log out and in:
+   `rm ~/.config/uwsm/env.d/90-msi-mux-gpu`
+
+The plugin writes nothing else. msi-mux-switch and its folder are yours to keep
+or delete.
 
 ## Backend setup
 
-### 1. Build and install msi-mux-switch
+### 1. Install msi-mux-switch
 
-Building msi-mux-switch is outside this plugin. Follow its README at
-[github.com/steelbrain/msi-gpu-mux-switch](https://github.com/steelbrain/msi-gpu-mux-switch)
-(it is a Rust program; the plugin was written against commit `223ca06`), and
-put the binary in a folder of its own. The plugin looks for it at
-`/opt/msi-mux-switch/msi-mux-switch` by default; the **msi-mux-switch path**
-setting of the widget changes that.
+Build it by following its own README (it is a Rust program) and put the binary
+in a folder of its own. The plugin looks for
+`/opt/msi-mux-switch/msi-mux-switch`; the **msi-mux-switch path** setting
+changes that.
 
 ### 2. Make it root-owned
 
-The plugin runs the switch as root, through `pkexec`. Running a file as root
-is only safe if nobody but root can change it, so the plugin refuses to switch
-unless:
+The switch runs as root through `pkexec`, which is only safe if nobody but root
+can change the binary. The plugin refuses to switch unless:
 
-- the binary is a regular file (not a symbolic link), owned by root, and not
-  writable by group or others; and
-- **every directory above it**, up to `/`, is owned by root and not writable
-  by group or others; and
+- the binary is a regular file (not a symlink), owned by root, not writable by
+  group or others;
+- **every directory above it**, up to `/`, is owned by root and not writable by
+  group or others (a folder you can write lets you swap the binary for
+  something that then runs as root);
 - it is not under `/media`, `/mnt`, `/run/media` or `/run/user`, where a user
   can mount a disk or owns the files.
 
-The second rule is stricter than checking the file alone on purpose: if you
-can write the folder the binary sits in, you can replace the binary with
-another file, and the next switch would run that as root. The same goes for
-any folder further up.
-
 When the check fails, the panel shows the reason (for example
 "/opt/msi-mux-switch/msi-mux-switch is owned by alice, not root.") and a
-**Set up backend** button. It opens a terminal running the plugin's
-`setup.sh`, which:
+**Set up backend** button. It opens a terminal running the plugin's `setup.sh`,
+which checks the binary, shows these commands (only for the binary and its own
+folder), asks, runs them, and checks again:
 
-1. checks that the binary exists and is a regular file;
-2. shows the exact commands it will run, for the binary and its own folder
-   only:
+```bash
+sudo chown -h root:root -- /opt/msi-mux-switch
+sudo chmod 755 -- /opt/msi-mux-switch
+sudo install -o root -g root -m 755 -- /opt/msi-mux-switch/msi-mux-switch /opt/msi-mux-switch/.msi-mux-switch.new
+sudo mv -f -- /opt/msi-mux-switch/.msi-mux-switch.new /opt/msi-mux-switch/msi-mux-switch
+```
 
-   ```bash
-   sudo chown -h root:root -- /opt/msi-mux-switch
-   sudo chmod 755 -- /opt/msi-mux-switch
-   sudo install -o root -g root -m 755 -- /opt/msi-mux-switch/msi-mux-switch /opt/msi-mux-switch/.msi-mux-switch.new
-   sudo mv -f -- /opt/msi-mux-switch/.msi-mux-switch.new /opt/msi-mux-switch/msi-mux-switch
-   ```
+The folder is made root-owned first so nothing in it can be swapped; the binary
+is replaced by a fresh root-owned copy, never chowned in place (a process that
+still had it open for writing could otherwise change it afterwards).
 
-3. asks before running them, then checks again.
+`setup.sh` refuses, and changes nothing, when:
 
-The folder is made root-owned first, so nothing in it can be swapped any more;
-then the binary is checked again (still a regular file, still alone in the
-folder) and replaced by a fresh root-owned copy. The binary is never chowned
-in place: a program that still had it open for writing could otherwise change
-it after it became root's.
-
-It refuses, and changes nothing, when:
-
-- the binary's folder is your home, `/`, or a folder directly under `/` or
-  `/home`, or the binary is under `/media`, `/mnt`, `/run/media` or
-  `/run/user`;
-- the folder is owned by someone other than you or root, has the sticky bit
-  (a shared folder such as `/var/tmp`), is writable by group or others, or
-  holds anything besides the binary (dotfiles included);
+- the binary's folder is your home, `/`, or directly under `/` or `/home`, or
+  the binary is under `/media`, `/mnt`, `/run/media` or `/run/user`;
+- the folder is owned by someone other than you or root, has the sticky bit,
+  is writable by group or others, or holds anything besides the binary
+  (dotfiles included);
 - a folder further up fails the check.
 
-Move the binary to a folder of its own (such as `/opt/msi-mux-switch`)
-instead. You can run it by hand too:
+Move the binary to a folder of its own instead. To run it by hand:
 
 ```bash
 bash ~/.config/omarchy/plugins/io.github.rsd.msi-mux/setup.sh /opt/msi-mux-switch/msi-mux-switch
 ```
 
-After that, open the panel again: the buttons are enabled (on AC power).
-
-msi-mux-switch keeps a rollback record of each switch. Because it runs under
-`pkexec`, as root, those records land in root's state directory
-(`/root/.local/state/msi-gpu-mux/backups`), not yours.
+msi-mux-switch keeps a rollback record per switch; run under `pkexec`, it
+lands in root's state directory (`/root/.local/state/msi-gpu-mux/backups`).
 
 ## Supported machines and the override flags
 
-msi-mux-switch has its own table of characterized machines (model, board and
-BIOS version, all exact). At commit `223ca06` it lists:
+msi-mux-switch has its own table of characterized machines (exact model, board
+and BIOS). At commit `223ca06`:
 
 | Model | Board | BIOS |
 |---|---|---|
 | Vector 16 HX AI A2XWIG | MS-15M3 | E15M3IMS.116 |
 | Stealth 16Studio A13VG | MS-15F2 | E15F2IMS.10F |
 
-On any other machine the tool refuses, even for its read-only state read,
-unless it is given `--allow-unsupported-hardware` (and, for a switch on a known
-model with another BIOS, `--allow-unvalidated-bios`).
+On any other machine the tool refuses, even to read state, unless given
+`--allow-unsupported-hardware` (and, for a known model with another BIOS,
+`--allow-unvalidated-bios`).
 
-The plugin never passes those flags on its own judgment. It keeps a small
-**allowlist** of exact model / board / BIOS combinations it has been used on,
-and passes both flags, for reads and switches, only there:
+The plugin never passes those flags on its own judgment. It has a fixed
+**allowlist** of exact combinations it has been used on, and passes both flags,
+for reads and switches, only there:
 
 | Model | Board | BIOS |
 |---|---|---|
@@ -188,10 +178,9 @@ and passes both flags, for reads and switches, only there:
 
 That entry is reported upstream as
 [steelbrain/msi-gpu-mux-switch#2](https://github.com/steelbrain/msi-gpu-mux-switch/issues/2).
-A machine in the tool's own table gets no flags. Any other MSI machine shows the
-widget greyed, naming its model, board and BIOS. Both tables are fixed in the
-plugin; no setting widens them. The plugin reads the values from
-`/sys/class/dmi/id/`.
+A machine in the tool's own table gets no flags; any other MSI machine is
+greyed, naming its model, board and BIOS. No setting widens either table. The
+values come from `/sys/class/dmi/id/`.
 
 ## Settings
 
@@ -200,29 +189,31 @@ In the bar's widget settings:
 | Setting | Default | Meaning |
 |---|---|---|
 | **msi-mux-switch path** (`binaryPath`) | `/opt/msi-mux-switch/msi-mux-switch` | Absolute path to the binary. Must not contain `..`. |
-| **Warn about external screens before Integrated** (`warnBeforeIntegrated`) | on | Adds the external-screen warning to the confirmation before staging Integrated. |
+| **Warn about external screens before Integrated** (`warnBeforeIntegrated`) | on | Adds the external-screen warning to the Integrated confirmation. |
 
 ## What this does to your Hyprland config
 
-Nothing, unless you pick **Intel** or **RTX** in the panel's **Hyprland base
-GPU** dropdown (shown in every mode, current or pending). The default,
-**Auto**, means the plugin owns no file and leaves Hyprland alone.
+The **Hyprland base GPU** dropdown is shown in every mode:
 
-In MSHybrid, both GPUs are present and Hyprland composites on one of them
-(usually the Intel GPU), copying frames to the screens wired to the other.
-Picking a base GPU writes exactly one file:
+| Choice | Effect |
+|---|---|
+| **Auto** (default) | The plugin owns no file and leaves Hyprland alone. |
+| **Intel** | Hyprland renders on the Intel GPU. |
+| **RTX** | Hyprland renders on the RTX. Verified: aquamarine logs "gpu /dev/dri/card1 becomes primary drm", and Hyprland starts with all outputs up. |
+
+Intel or RTX writes exactly one file, creating `~/.config/uwsm/env.d` if needed:
 
 ```
 ~/.config/uwsm/env.d/90-msi-mux-gpu
 ```
 
-(creating `~/.config/uwsm/env.d` if it does not exist). uwsm sources the files
-in that folder with `sh` when you log in, before Hyprland starts; this one sets
-`AQ_DRM_DEVICES`, which tells Hyprland's backend (aquamarine) which GPU to use
-first. No existing file is edited: nothing else in `~/.config/uwsm` or
-`~/.config/hypr` is read, changed, renamed or touched.
+uwsm sources every file in that folder with `sh` at login, before Hyprland
+starts. This one sets `AQ_DRM_DEVICES`, which tells Hyprland's backend
+(aquamarine) which GPU to use first. The plugin edits no other file: nothing
+else in `~/.config/uwsm` or `~/.config/hypr` is read, changed, renamed or
+touched.
 
-For the **RTX (experimental)** choice the file is exactly:
+For the **RTX** choice the file is exactly:
 
 ```sh
 # Written by the MSI GPU MUX Omarchy plugin (io.github.rsd.msi-mux).
@@ -257,25 +248,22 @@ unset msi_mux_intel msi_mux_nvidia msi_mux_card msi_mux_vendor
 For **Intel** it is the same, with `intel` in the marker line, "the Intel GPU"
 in the comment and the two devices the other way round.
 
-What it changes:
+How it behaves:
 
-- At login, it finds the GPUs under `/sys/class/drm/card*` (skipping the
-  connector entries such as `card1-eDP-2`) by their PCI vendor: `0x8086` is
-  Intel, `0x10de` is NVIDIA. It does not hard-code card numbers, which change
-  across boots and modes.
-- Only when **both** are present (MSHybrid) does it export
+- At login it finds the GPUs under `/sys/class/drm/card*` (skipping connector
+  entries such as `card1-eDP-2`) by PCI vendor: `0x8086` is Intel, `0x10de` is
+  NVIDIA. Card numbers change across boots and modes, so none are hard-coded.
+- Only when **both** GPUs are present (MSHybrid) does it export
   `AQ_DRM_DEVICES=<base>:<other>`, for example
-  `/dev/dri/card1:/dev/dri/card0`. In Discrete or Integrated one GPU is gone,
-  so it exports nothing and Hyprland starts as usual.
+  `/dev/dri/card1:/dev/dri/card0`. In Discrete or Integrated one GPU is gone, so
+  it exports nothing and Hyprland starts as usual.
 - It prints nothing, never exits early and leaves no variable behind.
-- It takes effect only in MSHybrid, at the next login: **log out to apply**.
-- Switching to Discrete or Integrated does not delete it: your Intel or RTX
-  choice is kept for the next time you are in MSHybrid. Outside MSHybrid the
-  file is inert, because of the both-GPUs check above.
-- The file stays until you pick **Auto** again (the plugin then deletes it) or
-  remove it by hand.
-
-RTX as the base GPU is labelled experimental: it is untested.
+- It takes effect at the next login: **log out to apply**.
+- Changing the MUX mode never touches it. Your choice is kept for the next time
+  you are in MSHybrid and is inert in the other modes. Only picking **Auto**
+  (or deleting the file) removes it.
+- If the file was edited outside the plugin, the panel says so; picking an
+  option replaces or removes it.
 
 To remove it by hand:
 
@@ -283,28 +271,31 @@ To remove it by hand:
 rm ~/.config/uwsm/env.d/90-msi-mux-gpu
 ```
 
-then log out and in. If a graphical login ever fails because of it, switch to a
-text console (Ctrl+Alt+F3), log in there and run the same `rm`.
+then log out and in. If a graphical login ever fails because of it, press
+Ctrl+Alt+F2, log in on the text console and run the same `rm`.
 
-## Removing the plugin
+## Troubleshooting
 
-1. Disable it: `omarchy plugin disable io.github.rsd.msi-mux` (and, to
-   delete its folder too, `omarchy plugin remove io.github.rsd.msi-mux`).
-2. If you ever picked **Intel** or **RTX** as the Hyprland base GPU, remove
-   the one file the plugin writes, then log out and in:
-
-   ```bash
-   rm ~/.config/uwsm/env.d/90-msi-mux-gpu
-   ```
-
-The plugin writes nothing else. msi-mux-switch itself, and the folder you set
-up for it, are yours to keep or delete.
+| What the panel shows | Meaning and fix |
+|---|---|
+| Greyed, "...is owned by ..., not root", "...writable by group or others", "...is a symbolic link" | The root-ownership check failed. Use **Set up backend**. |
+| Greyed, "msi-mux-switch was not found at ..." | Install the binary, or fix the path setting. |
+| "Not an MSI machine": widget hidden | Expected. |
+| Greyed, "...have not been tested on this machine (model, board, BIOS)" | Not in either table; switching stays off. |
+| "Under /mnt" (or `/media`, `/run/media`, `/run/user`) | Move the binary to a folder like `/opt/msi-mux-switch`. |
+| "Connect AC power" / "On battery" | The firmware switch requires AC. Plug in; the buttons enable by themselves. |
+| "Needs AC power (state unknown)" | The plugin could not find an AC supply under `/sys/class/power_supply`. |
+| "Not offered by this firmware" | That mode is not available on this laptop. |
+| "A switch is staged..." | A switch is waiting for a full shutdown (see [Switching](#switching)). Use **Shut down now**. |
+| "The firmware still has a switch in progress. A full shutdown clears it." | The firmware's apply-ready flag is set with nothing staged, usually after a switch that failed and rolled back. msi-mux-switch refuses ("apply-ready is already set before any write") until a full shutdown. Use **Shut down now**. |
+| "Authentication cancelled" / "Not authorized" | The polkit prompt was dismissed or refused. Nothing changed. |
+| "msi-mux-switch is already running" | Another switch is in progress; wait for it. |
+| The panel looks like an older version after an update | Run `omarchy-restart-shell`. |
 
 ## Opening the panel from the Omarchy menu
 
-The plugin adds nothing to the Omarchy menu. If you want an entry, you can add
-one yourself to `~/.config/omarchy/extensions/omarchy-menu.jsonc`; this is an
-example only, adjust it to taste:
+The plugin adds no menu entry. To add one, put this in
+`~/.config/omarchy/extensions/omarchy-menu.jsonc` (an example; adjust it):
 
 ```jsonc
 {
@@ -318,10 +309,10 @@ example only, adjust it to taste:
 bash tests/run.sh
 ```
 
-runs the manifest validation, the QML lint and load checks, the model tests,
-the env file sourced by `sh` against fixture trees, `setup.sh` against a fake
-`sudo`, and shellcheck. The tests never run the real msi-mux-switch, `pkexec`,
-`sudo` or a shutdown, and never write under `~/.config`.
+runs the manifest validation, QML lint and load checks, the model tests, the
+env file sourced by `sh` against fixture trees, `setup.sh` against a fake
+`sudo`, and shellcheck. It never runs the real msi-mux-switch, `pkexec`, `sudo`
+or a shutdown, and never writes under `~/.config`.
 
 ## Licence
 

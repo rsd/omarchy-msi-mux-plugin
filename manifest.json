@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.rsd.msi-mux",
   "name": "MSI GPU MUX",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "author": "Raul Dias",
   "license": "MIT",
   "description": "Switch the hardware GPU MUX of supported MSI laptops (Discrete, MSHybrid, Integrated) from the Omarchy bar, through msi-mux-switch and the shell's polkit prompt. Shows the current and the staged mode, and in MSHybrid can choose the GPU Hyprland composites on.",
