@@ -10,7 +10,11 @@ The bar icon shows the current mode, with a badge while a switch is staged.
 Click it for the panel: current and staged mode, AC state, the three modes with
 a **Switch** button each, and the **Hyprland base GPU** dropdown. A disabled
 button says why on its row. The panel is keyboard-driven too: any key shows a
-cursor, arrows (or `j`/`k`) move it, Enter or Space activates, Esc closes.
+cursor, arrows (or `j`/`k`) move it, Enter or Space activates, Esc closes. In a
+confirmation dialog only the arrows, Tab, Enter and Esc act (letters and Space
+do nothing), and it always opens on **Cancel** or **Later**. A panel that
+reopened by itself to show a finished switch ignores every key but Esc until you
+move the pointer over it, click it, or open the panel yourself.
 
 The widget is hidden on non-MSI machines. On an MSI machine it is greyed, with
 the reason and the fix, when the backend is missing or unsafe or the model is
@@ -36,7 +40,9 @@ Two separate settings are involved:
 1. Click **Switch** on a mode, confirm, and authenticate in Omarchy's polkit
    prompt. This only **stages** the switch.
 2. Do a **full shutdown** (the panel offers **Shut down now**, which runs
-   `omarchy-system shutdown`, or **Later**). A reboot does not apply it.
+   `omarchy-system shutdown`, or **Later**). A reboot does not apply it. If
+   the panel closed during authentication, it reopens to show the result
+   without that dialog: use the **Shut down now** button under the modes.
 3. Power on. The new mode is active.
 
 Notes:
@@ -123,7 +129,9 @@ When the check fails, the panel shows the reason (for example
 "/opt/msi-mux-switch/msi-mux-switch is owned by alice, not root.") and a
 **Set up backend** button. It opens a terminal running the plugin's `setup.sh`,
 which checks the binary, shows these commands (only for the binary and its own
-folder), asks, runs them, and checks again:
+folder), asks, runs them, and checks again. Use it only for a binary you built
+yourself from source you trust: from then on, that binary runs as root whenever
+you confirm a switch.
 
 ```bash
 sudo chown -h root:root -- /opt/msi-mux-switch
@@ -290,6 +298,8 @@ Ctrl+Alt+F2, log in on the text console and run the same `rm`.
 | "The firmware still has a switch in progress. A full shutdown clears it." | The firmware's apply-ready flag is set with nothing staged, usually after a switch that failed and rolled back. msi-mux-switch refuses ("apply-ready is already set before any write") until a full shutdown. Use **Shut down now**. |
 | "Authentication cancelled" / "Not authorized" | The polkit prompt was dismissed or refused. Nothing changed. |
 | "msi-mux-switch is already running" | Another switch is in progress; wait for it. |
+| "msi-mux-switch --debug did not answer within 10 s." / "...printed more than 1 MiB; not read." | The state read was stopped (it is limited to 10 s and 1 MiB). Check the binary path setting and run `msi-mux-switch --debug --json` by hand. |
+| "The checks before the switch did not finish in time. Nothing was run." | The ownership, AC or running-process check did not end within 15 s. Try again. |
 | The panel looks like an older version after an update | Run `omarchy-restart-shell`. |
 
 ## Opening the panel from the Omarchy menu
@@ -303,16 +313,46 @@ The plugin adds no menu entry. To add one, put this in
 }
 ```
 
+## For reviewers
+
+What the plugin runs and writes, and when:
+
+- **As root**, only `pkexec --disable-internal-agent <binary> <mode> --json
+  [flags]`, an argv array with no shell, after you confirm the mode in the
+  switch dialog. Right before it, the binary and every folder above it are
+  checked again: root-owned, not writable by group or others, not a symlink,
+  not under a user mount (see [Make it root-owned](#2-make-it-root-owned)).
+- **With sudo**, only `setup.sh`, opened in a visible terminal when you click
+  **Set up backend**. It shows its commands and asks before running any of
+  them.
+- **Shutdown**: `omarchy-system shutdown` runs only from **Shut down now** in
+  the shutdown confirmation dialog.
+- **Files**: the one file it writes is `~/.config/uwsm/env.d/90-msi-mux-gpu`,
+  only when you pick Intel or RTX in the dropdown. That write creates `env.d`
+  if it is missing (`mkdir -p`), goes through a dot-prefixed temporary file
+  beside the file, renamed over it, and removes `90-msi-mux-gpu.new`, a
+  temporary file an earlier version could leave there. Auto removes the file
+  (and both temporary names, with `rm -f`).
+- **As you**, read-only: the DMI strings under `/sys/class/dmi/id/`, `stat` of
+  the binary and its folders, the AC state under `/sys/class/power_supply`,
+  `pgrep -x msi-mux-switch`, the env file above, and `msi-mux-switch --debug
+  --json`, under a 10 s timeout with each output stream capped at 1 MiB as it
+  is read.
+- **Network**: none. The plugin makes no network request, and builds,
+  bundles and downloads nothing.
+
 ## Tests
 
 ```bash
 bash tests/run.sh
 ```
 
-runs the manifest validation, QML lint and load checks, the model tests, the
-env file sourced by `sh` against fixture trees, `setup.sh` against a fake
-`sudo`, and shellcheck. It never runs the real msi-mux-switch, `pkexec`, `sudo`
-or a shutdown, and never writes under `~/.config`.
+runs the manifest validation, QML lint and load checks, the widget live
+against fake binaries (including the dialogs' keys and those of a panel that
+reopened by itself, and a flooding and a hanging binary), the model tests, the env file sourced by `sh` against fixture
+trees, `setup.sh` against a fake `sudo`, and shellcheck. It never runs the real
+msi-mux-switch, `pkexec`, `sudo` or a shutdown, and never writes under
+`~/.config`.
 
 ## Licence
 

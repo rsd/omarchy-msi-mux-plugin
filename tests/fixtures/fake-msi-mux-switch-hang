@@ -1,0 +1,12 @@
+#!/bin/bash
+
+# A stand-in for msi-mux-switch in the tests that never ends: it logs its
+# arguments (one line per run) to $MM_FAKE_LOG, prints nothing, ignores
+# SIGTERM and sleeps until it is killed. The debug read's timeout must end
+# it (TERM, then KILL).
+
+printf '%s\n' "$*" >>"${MM_FAKE_LOG:-/dev/null}"
+trap '' TERM
+while :; do
+  sleep 1
+done

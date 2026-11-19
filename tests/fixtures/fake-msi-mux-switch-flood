@@ -1,0 +1,18 @@
+#!/bin/bash
+
+# A stand-in for msi-mux-switch in the tests that floods: it logs its
+# arguments (one line per run) to $MM_FAKE_LOG, then writes JSON-looking
+# lines without end to stdout, stderr or both ($MM_FAKE_FLOOD: stdout,
+# stderr, or anything else for both). Only the reader's cap stops it (it
+# dies of SIGPIPE), or a timeout.
+
+printf '%s\n' "$*" >>"${MM_FAKE_LOG:-/dev/null}"
+line='{"event":"flood","level":"info","message":"more"}'
+case ${MM_FAKE_FLOOD:-both} in
+  stdout) exec yes "$line" ;;
+  stderr) exec yes "$line" >&2 ;;
+  *)
+    yes "$line" >&2 &
+    exec yes "$line"
+    ;;
+esac

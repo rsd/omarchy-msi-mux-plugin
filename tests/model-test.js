@@ -252,9 +252,20 @@ test("argv: pgrep for a running msi-mux-switch before a switch; only 'none runni
   for (const code of [2, 3, -1, undefined]) assert.ok(/Could not check/.test(M.runningProblem(code)), String(code))
 })
 
-test("argv: the debug read, as the user, with the hardware's flags", () => {
-  assert.deepStrictEqual(M.debugArgv(BIN, FLAGS), [BIN, "--debug", "--json", "--allow-unsupported-hardware", "--allow-unvalidated-bios"])
-  assert.deepStrictEqual(M.debugArgv(BIN, []), [BIN, "--debug", "--json"])
+test("argv: the debug read, as the user, with the hardware's flags, under a timeout and the byte cap", () => {
+  const command = ["timeout", "-k", "2", "10", BIN, "--debug", "--json"]
+  assert.deepStrictEqual(M.debugCommand(BIN, FLAGS), command.concat(FLAGS))
+  assert.deepStrictEqual(M.debugCommand(BIN, []), command)
+  assert.deepStrictEqual(M.debugArgv(BIN, FLAGS), ["bash", "-c", M.DEBUG_SCRIPT, "msi-mux-debug"].concat(command, FLAGS))
+  assert.deepStrictEqual(M.debugArgv(BIN, []), ["bash", "-c", M.DEBUG_SCRIPT, "msi-mux-debug"].concat(command))
+  assert.deepStrictEqual(M.debugArgv("relative/msi-mux-switch", FLAGS), [])
+  // The script's only spliced text is the cap; the command is "$@".
+  assert.strictEqual(M.DEBUG_MAX_BYTES, 1048576)
+  const spliced = M.DEBUG_SCRIPT.replace(/head -c 1048577/g, "").replace(/-gt 1048576/g, "")
+  assert.ok(!/\d{4,}/.test(spliced), "no other number in the script")
+  assert.strictEqual((M.DEBUG_SCRIPT.match(/head -c 1048577 \| tr '\\000' '\\032'/g) || []).length, 2, "both streams capped while read")
+  assert.ok(/out=\$\("\$@" 3>&- \| head -c/.test(M.DEBUG_SCRIPT), "the command is \"$@\", read through head")
+  assert.ok(!/\beval\b|\$\*/.test(M.DEBUG_SCRIPT))
 })
 
 test("argv: pkexec switch, exact array, no shell", () => {
@@ -347,6 +358,47 @@ test("debug: firmware unavailable, malformed JSON, and a failed run", () => {
   assert.ok(d.error.includes("exit status 1"))
   assert.strictEqual(M.parseDebug("", "", -1).ok, false)
   assert.strictEqual(M.summary(M.emptyDebug()), "Reading the GPU mode…")
+})
+
+// What DEBUG_SCRIPT prints for a command's stdout, stderr and status.
+const framed = (out, err, status) => [out + "\nstatus " + status + "\n", err + "\nend\n"]
+
+test("debug read: the script's framing is unwrapped, then parseDebug", () => {
+  const [out, err] = framed(CAPTURE, "", 0)
+  assert.deepStrictEqual(M.parseDebugRead(out, err, 0), M.parseDebug(CAPTURE, "", 0))
+  assert.strictEqual(M.parseDebugRead(out, err, 0).ok, true)
+  // The tool's own status and error line come through.
+  const e = "{\"event\":\"error\",\"level\":\"error\",\"message\":\"boom\"}\n"
+  assert.strictEqual(M.parseDebugRead(...framed("", e, 1), 0).error, "boom")
+  assert.strictEqual(M.parseDebugRead(...framed(CAPTURE, "", 3), 0).error, "msi-mux-switch --debug failed (exit status 3).")
+  // A body that holds a line like the script's: only the last line counts.
+  assert.strictEqual(M.parseDebugRead(...framed("status 0", "", 0), 0).error, "msi-mux-switch --debug gave no readable answer.")
+})
+
+test("debug read: over the cap on either stream is refused unread, whatever else is there", () => {
+  for (const [out, err] of [["\nover\n", "\nend\n"], [framed(CAPTURE, "", 0)[0], "\nover\n"], ["\nover\n", "\nover\n"],
+      ["\nover\n", ""]]) {
+    const d = M.parseDebugRead(out, err, 0)
+    assert.strictEqual(d.ok, false)
+    assert.strictEqual(d.error, "msi-mux-switch --debug printed more than 1 MiB; not read.")
+  }
+})
+
+test("debug read: the timeout's statuses read as no answer in time", () => {
+  for (const code of [124, 137]) {
+    const d = M.parseDebugRead(...framed("", "", code), 0)
+    assert.deepStrictEqual(d, Object.assign(M.emptyDebug(), { error: "msi-mux-switch --debug did not answer within 10 s." }))
+  }
+})
+
+test("debug read: an unfinished read (no trailer, a cut trailer, the script failing) is an error", () => {
+  const [out, err] = framed(CAPTURE, "", 0)
+  for (const [o, e, code] of [[CAPTURE, "", 0], [out, "", 0], ["", err, 0], [out.slice(0, -1), err, 0], [out, err.slice(0, -1), 0],
+      [out, err, -1], [out, err, 1], [CAPTURE + "\nstatus x\n", err, 0], [CAPTURE + "\nstatus 1234\n", err, 0], [undefined, null, 0]]) {
+    const d = M.parseDebugRead(o, e, code)
+    assert.strictEqual(d.ok, false, JSON.stringify([String(o).slice(-12), e, code]))
+    assert.ok(/did not finish \(exit status/.test(d.error), d.error)
+  }
 })
 
 test("debug: output over 1 MiB is refused unread", () => {
@@ -899,7 +951,7 @@ test("polling: AC every AC_POLL_MS only while a panel is open; no mode polling",
   assert.ok(/interval: Model\.AC_POLL_MS\s*\n\s*running: root\.openPanels\.length > 0/.test(state))
   assert.strictEqual(M.AC_POLL_MS, 2000)
   const timers = state.match(/\bTimer \{/g) || []
-  assert.strictEqual(timers.length, 2, "the start delay and the AC poll only")
+  assert.strictEqual(timers.length, 3, "the start delay, the AC poll and the check watchdog only")
   assert.ok(!/repeat: true[\s\S]{0,80}readDebug/.test(state))
 })
 
@@ -968,7 +1020,7 @@ test("switch: pgrep runs before pkexec, after this plugin's own debug read", () 
 test("panel: keyboard cursor, the staged lock line, per-row reasons, stale results cleared", () => {
   const bar = qmlCode("BarWidget.qml")
   assert.ok(/PanelKeyCatcher \{\s*id: keyCatcher/.test(bar))
-  assert.ok(/focusTarget: keyCatcher/.test(bar))
+  assert.ok(/focusTarget: root\.keyTarget === "inert" \? inertKeys : \(root\.keyTarget === "dialog" \? dialogKeys : keyCatcher\)/.test(bar))
   assert.ok(/Model\.cursorStops\(root\.rows, \{ canSetUp: MuxState\.canSetUp, canShutDown: root\.lockNotice\.kind !== "" \}\)/.test(bar))
   for (const k of ['"setup"', '"env"', '"shutdown"', "modeButton.key"])
     assert.ok(new RegExp("hasCursor: root\\.cursorActive && root\\.cursorAt === " + k.replace(/\./g, "\\.")).test(bar), k)
@@ -993,7 +1045,7 @@ test("panel: keyboard cursor, the staged lock line, per-row reasons, stale resul
   assert.ok(!/execDetached/.test(lockRow))
   assert.ok(/else if \(a\.kind === "shutdown"\) root\.offerShutdown\(root\.lockNotice\.kind\)/.test(bar), "the cursor opens the same dialog")
   assert.ok(/message: Model\.shutdownMessage\(root\.shutdownKind\)/.test(bar))
-  assert.ok(/if \(outcome && outcome\.offerShutdown\) root\.offerShutdown\("staged"\)/.test(bar))
+  assert.ok(/if \(Model\.offerShutdownAfterSwitch\(outcome, reopened\)\) root\.offerShutdown\("staged"\)/.test(bar))
   assert.strictEqual((bar.match(/ConfirmDialog \{/g) || []).length, 2, "the switch and the shutdown dialogs only")
   assert.strictEqual((bar.match(/Quickshell\.execDetached\(Model\.SHUTDOWN_ARGV\)/g) || []).length, 1, "one shutdown path")
   // The refusal is said once: on the lock line, not repeated as the result.
@@ -1008,6 +1060,198 @@ test("panel: keyboard cursor, the staged lock line, per-row reasons, stale resul
   assert.ok(/color: root\.foreground/.test(bar.slice(i, i + 200)))
 })
 
+// Qt::Key values (qnamespace.h); the live flow in tests/run.sh checks
+// Model.KEY against the engine's own Qt.Key_* too.
+const QT_KEY = { Escape: 0x01000000, Tab: 0x01000001, Backtab: 0x01000002, Return: 0x01000004, Enter: 0x01000005,
+  Left: 0x01000012, Right: 0x01000014, Up: 0x01000013, Down: 0x01000015, Space: 0x20, Delete: 0x01000007, Backspace: 0x01000003 }
+
+test("dialog keys: only ConfirmDialog's set acts; letters, h/l/j/k and Space do nothing", () => {
+  assert.deepStrictEqual(M.KEY, { Escape: QT_KEY.Escape, Tab: QT_KEY.Tab, Backtab: QT_KEY.Backtab, Return: QT_KEY.Return,
+    Enter: QT_KEY.Enter, Left: QT_KEY.Left, Right: QT_KEY.Right })
+  assert.strictEqual(M.dialogKeyAction(QT_KEY.Escape), "close")
+  for (const k of ["Left", "Right", "Tab", "Backtab"]) assert.strictEqual(M.dialogKeyAction(QT_KEY[k]), "toggle", k)
+  for (const k of ["Return", "Enter"]) assert.strictEqual(M.dialogKeyAction(QT_KEY[k]), "activate", k)
+  // Text keys: Qt::Key for a letter is its upper-case code point.
+  const text = "hello world, the quick brown fox jumps over the lazy dog 0123456789 ;'[]-=/"
+  for (const ch of text) assert.strictEqual(M.dialogKeyAction(ch.toUpperCase().codePointAt(0)), "", JSON.stringify(ch))
+  for (const k of ["Space", "Up", "Down", "Delete", "Backspace"]) assert.strictEqual(M.dialogKeyAction(QT_KEY[k]), "", k)
+  for (const v of [undefined, null, "", "h", "l", " ", "Return", 0, NaN]) assert.strictEqual(M.dialogKeyAction(v), "", String(v))
+})
+
+test("dialog keys: the widget routes every key of an open dialog through dialogKeyAction, by key code only", () => {
+  const bar = qmlCode("BarWidget.qml")
+  const fn = bar.slice(bar.indexOf("function dialogKeyPressed(event)"))
+  const body = fn.slice(0, fn.indexOf("\n  }\n"))
+  assert.ok(/event\.accepted = true/.test(body), "every key is swallowed")
+  assert.ok(/root\.dialogKey\(d, Model\.dialogKeyAction\(event\.key\)\)/.test(body))
+  assert.ok(!/event\.text/.test(body), "the key's text is never read")
+  // dialogKey is reached from there and nowhere else.
+  assert.strictEqual((bar.match(/root\.dialogKey\(/g) || []).length, 1)
+  // The catcher is blocked while a dialog is open and has no dialog branch.
+  const at = bar.indexOf("PanelKeyCatcher {")
+  const catcher = ownBody(bar, at + "PanelKeyCatcher ".length)
+  assert.ok(/blocked: envDropdown\.popupOpen \|\| root\.dialogOpen \|\| root\.keysInert/.test(catcher))
+  assert.ok(!/openDialog|dialogKey|selectedIndex|confirmed|canceled/.test(catcher), "no dialog key in the catcher")
+  // dialogKeys takes the keys, and the focus follows the dialogs.
+  assert.ok(/id: dialogKeys\s*Keys\.priority: Keys\.BeforeItem\s*Keys\.onPressed: function\(event\) \{ root\.dialogKeyPressed\(event\) \}/.test(bar))
+  assert.ok(/onKeyTargetChanged: if \(root\.opened\) root\.keyTargetItem\(\)\.forceActiveFocus\(\)/.test(bar))
+  assert.ok(/return root\.keyTarget === "inert" \? inertKeys : \(root\.keyTarget === "dialog" \? dialogKeys : keyCatcher\)/.test(bar))
+  assert.ok(/focusTarget: root\.keyTarget === "inert" \? inertKeys : \(root\.keyTarget === "dialog" \? dialogKeys : keyCatcher\)/.test(bar))
+  assert.ok(/readonly property bool dialogOpen: confirmDialog\.opened \|\| shutdownDialog\.opened/.test(bar))
+  // A dialog opening closes the dropdown's list, which would block the
+  // catcher after the dialog.
+  assert.ok(/onDialogOpenChanged: if \(root\.dialogOpen\) envDropdown\.close\(\)/.test(bar))
+  assert.strictEqual((bar.match(/forceActiveFocus\(\)/g) || []).length, 2, "the focus is only ever moved to keyTargetItem()")
+  // ConfirmDialog's own handleKey is not used (it is the same set, but the
+  // widget's filter is the tested one).
+  assert.ok(!/handleKey/.test(bar))
+})
+
+test("reopened panel: key-inert after reopening itself, until the pointer, a user opening or closing", () => {
+  assert.strictEqual(M.keysInert(false, "selfOpen"), true)
+  assert.strictEqual(M.keysInert(true, "selfOpen"), true)
+  for (const what of ["userOpen", "pointer", "close"])
+    for (const before of [true, false]) assert.strictEqual(M.keysInert(before, what), false, what)
+  for (const what of [undefined, null, "", "key", "Space", "Return", "tab", "hover", "SelfOpen"]) {
+    assert.strictEqual(M.keysInert(true, what), true, String(what))
+    assert.strictEqual(M.keysInert(false, what), false, String(what))
+  }
+  for (const before of [undefined, null, 1, "true"]) assert.strictEqual(M.keysInert(before, "key"), false, String(before))
+  // Only Esc does anything, and it closes.
+  assert.strictEqual(M.inertKeyAction(QT_KEY.Escape), "close")
+  for (const k of ["Space", "Return", "Enter", "Tab", "Backtab", "Left", "Right", "Up", "Down", "Delete", "Backspace"])
+    assert.strictEqual(M.inertKeyAction(QT_KEY[k]), "", k)
+  for (const ch of "git status git log hjkl x") assert.strictEqual(M.inertKeyAction(ch.toUpperCase().codePointAt(0)), "", JSON.stringify(ch))
+  for (const v of [undefined, null, "", "Escape", 0, NaN]) assert.strictEqual(M.inertKeyAction(v), "", String(v))
+  // The focus: inertKeys while inert (even with a dialog open), then the
+  // dialog's, then the catcher.
+  assert.strictEqual(M.keyTarget({ inert: true, dialogOpen: false }), "inert")
+  assert.strictEqual(M.keyTarget({ inert: true, dialogOpen: true }), "inert")
+  assert.strictEqual(M.keyTarget({ inert: false, dialogOpen: true }), "dialog")
+  assert.strictEqual(M.keyTarget({ inert: false, dialogOpen: false }), "panel")
+  for (const s of [undefined, null, {}, { inert: 1 }, { inert: "true" }]) assert.strictEqual(M.keyTarget(s), "panel", JSON.stringify(s))
+})
+
+test("reopened panel: only a real pointer move wakes it, never the first sample or jitter", () => {
+  assert.strictEqual(M.POINTER_MOVE_PX, 2)
+  let r = M.pointerMove(null, 100, 50)
+  assert.deepStrictEqual(r, { sample: { x: 100, y: 50 }, moved: false }, "the first position is a sample")
+  // Repeats and jitter within the threshold, against the first sample.
+  for (const [x, y] of [[100, 50], [101, 50], [102, 52], [98, 48], [100.5, 49.5]]) {
+    r = M.pointerMove({ x: 100, y: 50 }, x, y)
+    assert.deepStrictEqual(r, { sample: { x: 100, y: 50 }, moved: false }, JSON.stringify([x, y]))
+  }
+  for (const [x, y] of [[103, 50], [97, 50], [100, 53], [100, 47], [140, 90]])
+    assert.strictEqual(M.pointerMove({ x: 100, y: 50 }, x, y).moved, true, JSON.stringify([x, y]))
+  // Slow jitter accumulates against the first sample: it is kept, not moved.
+  let s = M.pointerMove(null, 0, 0).sample
+  let woke = false
+  for (let x = 0.5; x <= 4 && !woke; x += 0.5) { r = M.pointerMove(s, x, 0); s = r.sample; woke = r.moved }
+  assert.ok(woke, "small steps add up to a move")
+  for (const [x, y] of [[NaN, 1], [1, undefined], ["a", 1], [Infinity, 0]]) {
+    assert.deepStrictEqual(M.pointerMove(null, x, y), { sample: null, moved: false }, String([x, y]))
+    assert.deepStrictEqual(M.pointerMove({ x: 0, y: 0 }, x, y), { sample: { x: 0, y: 0 }, moved: false }, String([x, y]))
+  }
+})
+
+test("reopened panel: the widget wires the gate thinly, from opening to keys, cursor and pointer", () => {
+  const bar = qmlCode("BarWidget.qml")
+  const opened = bar.slice(bar.indexOf("onOpenedChanged: {"))
+  const openedBody = opened.slice(0, opened.indexOf("\n  }\n"))
+  // The state is decided before reopenForOutcome is reset.
+  assert.ok(/if \(root\.opened\) \{\s*root\.wakeKeys\(root\.reopenForOutcome \? "selfOpen" : "userOpen"\)\s*root\.pointerSample = null\s*root\.cursorActive = false/.test(openedBody))
+  assert.ok(openedBody.indexOf("root.wakeKeys(root.reopenForOutcome") < openedBody.indexOf("root.reopenForOutcome = false"))
+  assert.ok(/return\s*\}\s*root\.wakeKeys\("close"\)/.test(openedBody), "closing ends it")
+  assert.ok(/root\.keysInert = Model\.keysInert\(root\.keysInert, what\)/.test(bar))
+  assert.strictEqual((bar.match(/root\.keysInert = /g) || []).length, 1, "keysInert is set in wakeKeys only")
+  assert.ok(/readonly property string keyTarget: Model\.keyTarget\(\{ inert: root\.keysInert, dialogOpen: root\.dialogOpen \}\)/.test(bar))
+  // inertKeys swallows every key; only Esc, through the model, closes.
+  const fn = bar.slice(bar.indexOf("function inertKeyPressed(event)"))
+  const body = fn.slice(0, fn.indexOf("\n  }\n"))
+  assert.ok(/event\.accepted = true\s*if \(Model\.inertKeyAction\(event\.key\) === "close"\) root\.close\(\)/.test(body))
+  assert.ok(!/event\.text/.test(body))
+  assert.ok(/id: inertKeys\s*Keys\.priority: Keys\.BeforeItem\s*Keys\.onPressed: function\(event\) \{ root\.inertKeyPressed\(event\) \}/.test(bar))
+  // The catcher's own handlers check it too, and so does the cursor.
+  const at = bar.indexOf("PanelKeyCatcher {")
+  const catcher = bar.slice(at, bar.indexOf("id: dialogKeys", at))
+  assert.ok(/onMoveRequested: function\(dx, dy\) \{\s*if \(root\.keysInert\) return/.test(catcher))
+  assert.ok(/onActivateRequested: \{\s*if \(root\.keysInert\) return/.test(catcher))
+  assert.ok(/onTabRequested: function\(direction\) \{ if \(!root\.keysInert\) root\.switchPanel\(direction\) \}/.test(catcher))
+  assert.ok(/function pointAt\(key\) \{\s*if \(root\.keysInert\) return/.test(bar))
+  // The pointer: moves in window coordinates through pointerMove, and a
+  // press that goes on to the control under it.
+  assert.ok(/onPointChanged: root\.pointerAt\(panelHover\.point\.scenePosition\.x, panelHover\.point\.scenePosition\.y\)/.test(bar))
+  const ptr = bar.slice(bar.indexOf("function pointerAt(x, y)"))
+  assert.ok(/if \(!root\.keysInert\) return\s*var m = Model\.pointerMove\(root\.pointerSample, x, y\)\s*root\.pointerSample = m\.sample\s*if \(m\.moved\) root\.wakeKeys\("pointer"\)/.test(ptr.slice(0, ptr.indexOf("\n  }\n"))))
+  assert.ok(/enabled: root\.keysInert\s*acceptedButtons: Qt\.AllButtons\s*onPressed: function\(mouse\) \{\s*root\.wakeKeys\("pointer"\)\s*mouse\.accepted = false/.test(bar))
+})
+
+test("dialogs: each opens on its safe button (Cancel, Later), every time", () => {
+  const bar = qmlCode("BarWidget.qml")
+  assert.ok(/onOpenedChanged: if \(confirmDialog\.opened\) confirmDialog\.selectedIndex = 0/.test(bar))
+  assert.ok(/onOpenedChanged: if \(shutdownDialog\.opened\) shutdownDialog\.selectedIndex = 0/.test(bar))
+  // Index 0 is the cancel button in the shell's ConfirmDialog (handleKey:
+  // Enter on 0 is canceled()).
+  assert.ok(/cancelText: "Later"/.test(bar) && /cancelText: "Cancel"/.test(bar))
+  const offer = bar.slice(bar.indexOf("function offerShutdown(kind)"))
+  assert.ok(/shutdownDialog\.selectedIndex = 0/.test(offer.slice(0, offer.indexOf("\n  }\n"))))
+  const ask = bar.slice(bar.indexOf("function askSwitch(row)"))
+  assert.ok(/confirmDialog\.selectedIndex = 0/.test(ask.slice(0, ask.indexOf("\n  }\n"))))
+})
+
+test("shutdown offer: never opened by itself when the panel reopened to show the result", () => {
+  const staged = { kind: "success", message: "x", warning: "", offerShutdown: true }
+  assert.strictEqual(M.offerShutdownAfterSwitch(staged, true), false)
+  assert.strictEqual(M.offerShutdownAfterSwitch(staged, false), true)
+  for (const o of [null, undefined, {}, { offerShutdown: false }, { offerShutdown: "true" }, { offerShutdown: 1 }])
+    for (const r of [true, false]) assert.strictEqual(M.offerShutdownAfterSwitch(o, r), false, JSON.stringify([o, r]))
+  for (const r of [undefined, null, 0, "", "yes"]) assert.strictEqual(M.offerShutdownAfterSwitch(staged, r), true, String(r))
+  const bar = qmlCode("BarWidget.qml")
+  const fin = bar.slice(bar.indexOf("function onSwitchFinished(owner, outcome)"))
+  const body = fin.slice(0, fin.indexOf("\n    }\n"))
+  assert.ok(/var reopened = !root\.opened\s*if \(reopened\) \{\s*root\.reopenForOutcome = true\s*root\.open\(\)\s*\}/.test(body))
+  assert.ok(/if \(Model\.offerShutdownAfterSwitch\(outcome, reopened\)\) root\.offerShutdown\("staged"\)/.test(body))
+  assert.ok(!/shutdownOffered/.test(body), "onSwitchFinished never sets shutdownOffered itself")
+  assert.strictEqual((body.match(/offerShutdown\(/g) || []).length, 1, "one offer, behind offerShutdownAfterSwitch")
+  // The shutdown dialog opens only through offerShutdown.
+  assert.strictEqual((bar.match(/root\.shutdownOffered = true/g) || []).length, 1)
+  const offer = bar.slice(bar.indexOf("function offerShutdown(kind)"))
+  assert.ok(/root\.shutdownOffered = true/.test(offer.slice(0, offer.indexOf("\n  }\n"))))
+})
+
+test("switch checks: a watchdog refuses a switch still being checked after CHECK_TIMEOUT_MS", () => {
+  assert.strictEqual(M.CHECK_TIMEOUT_MS, 15000)
+  assert.ok(M.CHECK_TIMEOUT_MS > (M.DEBUG_TIMEOUT_S + M.DEBUG_KILL_AFTER_S) * 1000 + 2000, "longer than a debug read can last")
+  const state = qmlCode("MuxState.qml")
+  const at = state.indexOf("id: checkWatchdog")
+  const timer = state.slice(state.lastIndexOf("Timer {", at), state.indexOf("\n  }\n", at))
+  assert.ok(/interval: Model\.CHECK_TIMEOUT_MS\s*repeat: false/.test(timer))
+  assert.ok(/if \(root\.phase !== "checking"\) return/.test(timer))
+  // Refused before the checks are stopped: one ending as it stops finds the
+  // phase over.
+  assert.ok(/root\.refused\(Model\.CHECK_TIMEOUT_TEXT\)\s*checkStat\.running = false\s*checkAc\.running = false\s*checkRunning\.running = false/.test(timer))
+  const req = state.slice(state.indexOf("function requestSwitch("))
+  const reqBody = req.slice(0, req.indexOf("\n  }\n"))
+  assert.ok(/checkWatchdog\.restart\(\)\s*return true/.test(reqBody), "armed with every request")
+  assert.ok(/if \(checkStat\.running \|\| checkAc\.running \|\| checkRunning\.running\) return false/.test(reqBody))
+  const fin = state.slice(state.indexOf("function finish(outcome)"))
+  assert.ok(/checkWatchdog\.stop\(\)/.test(fin.slice(0, fin.indexOf("\n  }\n"))))
+  const start = state.slice(state.indexOf("function startSwitch()"))
+  const startBody = start.slice(0, start.indexOf("\n  }\n"))
+  assert.ok(startBody.indexOf("checkWatchdog.stop()") !== -1 && startBody.indexOf("checkWatchdog.stop()") < startBody.indexOf('root.phase = "running"'))
+  // finish() clears the pgrep wait, so a debug read ending later starts no pgrep.
+  assert.ok(/root\.pgrepWaiting = false/.test(fin.slice(0, fin.indexOf("\n  }\n"))))
+})
+
+test("debug read: parsed through parseDebugRead; one run's end is never taken for the next one's", () => {
+  const state = qmlCode("MuxState.qml")
+  assert.ok(/root\.debug = Model\.parseDebugRead\(debugProc\.out, debugProc\.err, debugProc\.exitCode\)/.test(state))
+  assert.ok(!/Model\.parseDebug\(/.test(state))
+  assert.ok(/var argv = Model\.debugArgv\(root\.binaryPath, root\.hardware\.flags\)/.test(state))
+  assert.ok(/debugProc\.run = \+\+root\.debugRuns/.test(state))
+  assert.ok(/var run = debugProc\.run\s*Qt\.callLater\(function\(\) \{\s*if \(debugProc\.run !== run \|\| debugProc\.running\) return\s*debugProc\.exited = true/.test(state))
+})
+
 // ---------------------------------------------------- manifest and layout
 
 test("manifest: identity, version and the settings schema", () => {
@@ -1016,7 +1260,7 @@ test("manifest: identity, version and the settings schema", () => {
   assert.strictEqual(m.id, "io.github.rsd.msi-mux")
   assert.strictEqual(m.id, M.PLUGIN_ID)
   assert.strictEqual(m.name, "MSI GPU MUX")
-  assert.strictEqual(m.version, "0.2.4")
+  assert.strictEqual(m.version, "0.2.5")
   assert.strictEqual(m.license, "MIT")
   assert.deepStrictEqual(m.kinds, ["bar-widget"])
   assert.deepStrictEqual(m.entryPoints, { barWidget: "BarWidget.qml" })
@@ -1029,13 +1273,17 @@ test("manifest: identity, version and the settings schema", () => {
   assert.strictEqual(schema.warnBeforeIntegrated.defaultValue, true)
   const bar = qmlCode("BarWidget.qml")
   assert.ok(/moduleName: "io\.github\.rsd\.msi-mux"/.test(bar))
+  // The widget's hardcoded ids are the manifest's.
+  assert.strictEqual(/moduleName: "([^"]*)"/.exec(bar)[1], m.id)
+  assert.strictEqual(/ipcTarget: "([^"]*)"/.exec(bar)[1], m.id)
   assert.ok(/root\.setting\("binaryPath", ""\)/.test(bar) && /root\.setting\("warnBeforeIntegrated", true\)/.test(bar))
 })
 
 // The files the plugin ships, listed one by one (tests/ included).
 const SHIPPED = ["BarWidget.qml", "LICENSE", "Model.js", "MuxState.qml", "README.md", "manifest.json", "preview.png",
-  "qmldir", "setup.sh", "tests/env-file-test.sh", "tests/env-file-text.js", "tests/fixtures/debug-discrete.json",
-  "tests/fixtures/fake-msi-mux-switch", "tests/model-test.js", "tests/qmllint-check.js", "tests/run.sh", "tests/setup-test.sh"]
+  "qmldir", "setup.sh", "tests/debug-read-test.sh", "tests/debug-read-text.js", "tests/env-file-test.sh",
+  "tests/env-file-text.js", "tests/fixtures/debug-discrete.json", "tests/fixtures/fake-msi-mux-switch",
+  "tests/fixtures/fake-msi-mux-switch-flood", "tests/fixtures/fake-msi-mux-switch-hang", "tests/model-test.js", "tests/qmllint-check.js", "tests/run.sh", "tests/setup-test.sh"]
 
 test("layout: every shipped file is there, none a symlink; tests/ holds only them", () => {
   for (const f of SHIPPED) {

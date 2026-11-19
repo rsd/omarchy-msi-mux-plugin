@@ -20,7 +20,8 @@ import "Model.js" as Model
 //   - the read-only state read, `<binary> --debug --json [flags]` as the
 //     user (Model.debugArgv): after each stat that finds the binary on
 //     available hardware, and after each switch. Never on a timer: only this
-//     tool changes the mode.
+//     tool changes the mode. Bounded: under a timeout, and at most
+//     Model.DEBUG_MAX_BYTES of each stream is read (Model.DEBUG_SCRIPT).
 //   - AC (Model.acArgv): at startup, on a panel opening, every
 //     Model.AC_POLL_MS only while a panel is open, and right before a switch.
 //   - `pgrep -x msi-mux-switch` (Model.pgrepArgv): right before a switch,
@@ -30,7 +31,8 @@ import "Model.js" as Model
 //   - the switch, `pkexec --disable-internal-agent <binary> <mode> --json
 //     [flags]` (Model.switchArgv): only from requestSwitch, after the user
 //     confirmed, and only when the fresh stat, AC read and pgrep all pass.
-//     One at a time. stdout and stderr are read line by line
+//     Those checks get Model.CHECK_TIMEOUT_MS (checkWatchdog); then the
+//     switch is refused and nothing runs. One at a time. stdout and stderr are read line by line
 //     (Model.applySwitchLine).
 //   - the env file (~/.config/uwsm/env.d/90-msi-mux-gpu): read with a
 //     bounded read that refuses anything but a regular file
@@ -228,6 +230,9 @@ Singleton {
   }
 
   property bool debugAgain: false
+  // Numbers each debug read, so the end of one cannot be taken for the end
+  // of the next one started meanwhile.
+  property int debugRuns: 0
 
   function readDebug() {
     if (!root.present || root.hardware.state !== "available") return
@@ -237,6 +242,7 @@ Singleton {
     var argv = Model.debugArgv(root.binaryPath, root.hardware.flags)
     if (argv.length === 0) return
     debugProc.path = root.binaryPath
+    debugProc.run = ++root.debugRuns
     debugProc.out = ""
     debugProc.err = ""
     debugProc.outDone = false
@@ -252,12 +258,13 @@ Singleton {
   function finishDebug() {
     if (!debugProc.outDone || !debugProc.errDone || !debugProc.exited) return
     if (debugProc.path !== root.binaryPath) return
-    root.debug = Model.parseDebug(debugProc.out, debugProc.err, debugProc.exitCode)
+    root.debug = Model.parseDebugRead(debugProc.out, debugProc.err, debugProc.exitCode)
   }
 
   Process {
     id: debugProc
     property string path: ""
+    property int run: 0
     property string out: ""
     property string err: ""
     property bool outDone: false
@@ -282,10 +289,14 @@ Singleton {
     }
     onExited: function(exitCode, exitStatus) { debugProc.exitCode = exitCode }
     // Also reached when the binary could not be started (no exited signal):
-    // the exit status is then -1, which reads as a failure.
+    // the exit status is then -1, which reads as a failure. Handled a turn
+    // later, and only if no other read started meanwhile (that one's own end
+    // is handled the same way).
     onRunningChanged: {
       if (debugProc.running) return
+      var run = debugProc.run
       Qt.callLater(function() {
+        if (debugProc.run !== run || debugProc.running) return
         debugProc.exited = true
         root.finishDebug()
         if (root.pgrepWaiting) {
@@ -331,6 +342,8 @@ Singleton {
 
   function requestSwitch(owner, mode) {
     if (root.busy || !Model.isMode(mode)) return false
+    // A check stopped by the watchdog may take a moment to end.
+    if (checkStat.running || checkAc.running || checkRunning.running) return false
     if (Model.switchBlocker({ unavailableReason: root.unavailableReason, debug: root.debug, busy: false, ac: root.ac }) !== "")
       return false
     root.phase = "checking"
@@ -349,11 +362,31 @@ Singleton {
     checkAc.running = true
     if (debugProc.running) root.pgrepWaiting = true
     else checkRunning.running = true
+    checkWatchdog.restart()
     return true
+  }
+
+  // A check that does not end (a hung stat or pgrep, or a debug read that
+  // outlives its timeout) refuses the switch instead of leaving it
+  // "checking"; the checks still running are stopped.
+  Timer {
+    id: checkWatchdog
+    interval: Model.CHECK_TIMEOUT_MS
+    repeat: false
+    onTriggered: {
+      if (root.phase !== "checking") return
+      // Refused first, so a check that ends as it is stopped finds the
+      // phase over and starts nothing.
+      root.refused(Model.CHECK_TIMEOUT_TEXT)
+      checkStat.running = false
+      checkAc.running = false
+      checkRunning.running = false
+    }
   }
 
   function finish(outcome) {
     var owner = root.switchOwner
+    checkWatchdog.stop()
     root.pgrepWaiting = false
     root.phase = ""
     root.switchOwner = null
@@ -385,6 +418,7 @@ Singleton {
     if (running !== "") return root.refused(running)
     var argv = Model.switchArgv(root.binaryPath, root.switchMode, root.hardware.flags)
     if (argv.length === 0 || root.hardware.state !== "available") return root.refused("The switch could not be prepared.")
+    checkWatchdog.stop()
     root.phase = "running"
     switchProc.exitCode = -1
     switchProc.command = argv

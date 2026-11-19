@@ -4,9 +4,11 @@
 # validation, QML syntax and type checks against the shell's own qs.Ui /
 # qs.Commons modules, loading the widget in a throwaway Quickshell (skipped
 # outside a Wayland session), the widget and its singleton live against a fake
-# msi-mux-switch, the model logic, the env file sourced by sh against fixture
-# trees, setup.sh against a fake sudo, and shellcheck over setup.sh and
-# tests/*.sh (with a self-test that it can fail).
+# msi-mux-switch, the debug read's bounds (a flooding and a hanging fake) and
+# the switch checks' watchdog live, the model logic, the debug read's command
+# against the fakes, the env file sourced by sh against fixture trees,
+# setup.sh against a fake sudo, and shellcheck over setup.sh, tests/*.sh and
+# the fake binaries (with a self-test that it can fail).
 #
 # Nothing here runs the real msi-mux-switch, pkexec, sudo or a shutdown,
 # touches the live shell, or writes under ~/.config: the scratch Quickshell
@@ -410,7 +412,13 @@ EOF
 # --disable-internal-agent, logs its argv and runs the rest) and the fake
 # msi-mux-switch with switching enabled. No real pkexec can be reached: with
 # the real stat the temporary binary fails the gate before any pkexec runs.
-# The singleton is driven directly (no panel, so no window and no dialog):
+# The singleton is driven directly, and the panel's window never maps (its
+# visible binding is replaced first; any sign of mapping ends the run), so
+# opening the panel only runs the widget's logic: MSHybrid and the
+# leftover-flag switch are asked for by the widget with its panel closed, and
+# the panel that reopens itself is key-inert (keys, the catcher's signals and
+# the cursor change nothing, the focus is on its inert key item; a real
+# pointer move wakes it and the keys work again, or Esc closes it).
 # Intel/RTX/Auto write and remove the env file under the temporary HOME;
 # the base GPU dropdown is shown with Discrete current and with MSHybrid or
 # Integrated pending; a second request while one runs is refused; MSHybrid
@@ -460,9 +468,16 @@ printf '%s\n' "\$*" >>"$cfg/pkexec.log"
 shift
 exec "\$@"
 EOF
-  chmod 755 "$fake/stat" "$fake/pkexec"
-  if [[ $(PATH="$fake:$PATH" command -v pkexec) != "$fake/pkexec" ]]; then
-    echo "FAIL pkexec does not resolve to the fake; not running"
+  # A stand-in for the shutdown command: the dialog checks below never
+  # confirm a shutdown, and if one ever did, this would only log it.
+  cat >"$fake/omarchy-system" <<EOF
+#!/bin/bash
+printf '%s\n' "\$*" >>"$cfg/shutdown.log"
+EOF
+  chmod 755 "$fake/stat" "$fake/pkexec" "$fake/omarchy-system"
+  if [[ $(PATH="$fake:$PATH" command -v pkexec) != "$fake/pkexec" ||
+    $(PATH="$fake:$PATH" command -v omarchy-system) != "$fake/omarchy-system" ]]; then
+    echo "FAIL pkexec or omarchy-system does not resolve to the fake; not running"
     rm -rf "$cfg"
     return 1
   fi
@@ -473,10 +488,12 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import "file://$dir" as Plugin
+import "file://$dir/Model.js" as Model
 ShellRoot {
   id: shell
   QtObject { id: holder }
   property var widget: null
+  property var panel: null
   property int step: 0
   property var outcome: null
   function log(s) { console.log("MMFLOW " + s) }
@@ -485,11 +502,30 @@ ShellRoot {
     var c = Qt.createComponent("file://$dir/BarWidget.qml", Component.PreferSynchronous)
     if (c.status !== Component.Ready) { shell.log("ERROR " + c.errorString()); shell.done(); return }
     shell.widget = c.createObject(shell, { settings: { binaryPath: "$bin" } })
+    // The panel's window is never mapped: its visible binding is replaced
+    // before anything opens the panel, so opening it only runs the widget's
+    // logic (no window, no keyboard grab).
+    var panels = shell.findAll(shell.widget, function(it) {
+      return it.focusTarget !== undefined && it.backingWindowVisible !== undefined }, 0, [])
+    if (panels.length !== 1) { shell.log("ERROR panel window not found"); shell.done(); return }
+    shell.panel = panels[0]
+    shell.panel.visible = false
+  }
+  // Any sign of the panel's window mapping ends the run at once.
+  function unmapped() {
+    if (!shell.panel || shell.panel.visible || shell.panel.backingWindowVisible) {
+      if (shell.widget) shell.widget.close()
+      shell.log("ERROR the panel window would map")
+      shell.done()
+      return false
+    }
+    return true
   }
   Connections {
     target: Plugin.MuxState
     function onSwitchFinished(owner, outcome) {
-      shell.log("finished owner " + (owner === holder) + " kind " + outcome.kind + " offer " + outcome.offerShutdown
+      shell.log("finished owner " + (owner === holder ? "holder" : owner === shell.widget ? "widget" : "other")
+        + " kind " + outcome.kind + " offer " + outcome.offerShutdown
         + " warning " + (outcome.warning !== "") + " :: " + outcome.message)
       shell.outcome = outcome
     }
@@ -499,6 +535,7 @@ ShellRoot {
     repeat: true
     running: shell.step < 99
     onTriggered: {
+      if (!shell.unmapped()) return
       var s = Plugin.MuxState
       if (shell.step === 0) {
         if (!s.dmiRead) return
@@ -509,17 +546,22 @@ ShellRoot {
           + " pending " + s.debug.pending + " env " + s.envChoice)
         shell.logShown("discrete current")
         shell.logPanel("discrete current")
+        shell.logSwitchKeys()
         s.setEnvChoice("rtx")
         shell.step = 1
       } else if (shell.step === 1) {
         if (s.envChoice !== "rtx") return
         shell.log("env rtx " + s.envChanged)
-        var first = s.requestSwitch(holder, "mshybrid")
+        // Asked for by the widget with its panel closed: the panel reopens
+        // itself for the result.
+        var first = s.requestSwitch(shell.widget, "mshybrid")
         var second = s.requestSwitch(holder, "integrated")
         shell.log("request " + first + " second " + second)
         shell.step = 2
       } else if (shell.step === 2) {
         if (!shell.outcome || s.busy || !s.debug.pending) return
+        shell.logReopened("staged", "pointer")
+        if (!shell.unmapped()) return
         shell.log("staged pending " + s.debug.pending + " target " + s.debug.target + " env " + s.envChoice)
         shell.logShown("mshybrid pending")
         shell.logPanel("mshybrid pending")
@@ -586,10 +628,12 @@ ShellRoot {
         shell.logPanel("flag before")
         shell.logLock("flag before")
         shell.outcome = null
-        shell.log("flag request " + s.requestSwitch(holder, "integrated"))
+        shell.log("flag request " + s.requestSwitch(shell.widget, "integrated"))
         shell.step = 42
       } else if (shell.step === 42) {
         if (!shell.outcome || s.busy) return
+        shell.logReopened("flag", "esc")
+        if (!shell.unmapped()) return
         shell.log("flag refused pending " + s.debug.pending)
         shell.logPanel("flag refused")
         shell.logLock("flag refused")
@@ -719,9 +763,139 @@ ShellRoot {
       var dlg = shell.findAll(w, function(it) { return it.confirmText === "Shut down now" && it.message !== undefined }, 0, [])
       line += " offered " + w.shutdownOffered + " dialog " + w.shutdownKind + " open " + (dlg.length === 1 && dlg[0].opened)
         + " :: " + (dlg.length === 1 ? dlg[0].message : "")
+      if (dlg.length === 1 && dlg[0].opened)
+        shell.log("shutdown keys " + when + " " + shell.tryKeys(w, dlg[0], function() { return w.shutdownOffered }))
       w.shutdownOffered = false
     }
     shell.log(line + " :: " + w.lockNotice.text)
+  }
+  // Keys sent to the widget's dialog key handler as an open dialog gets
+  // them: stray text keys and Space first (nothing may change), then the
+  // dialog's own keys; it is only ever activated on its cancel button, so
+  // nothing is confirmed.
+  function key(code, text) { return { key: code, text: text, modifiers: 0, accepted: false } }
+  function tryKeys(w, d, isOpen) {
+    var start = d.selectedIndex
+    var stray = [[Qt.Key_H, "h"], [Qt.Key_L, "l"], [Qt.Key_Space, " "], [Qt.Key_E, "e"], [Qt.Key_O, "o"], [Qt.Key_J, "j"],
+      [Qt.Key_K, "k"], [Qt.Key_X, "x"], [Qt.Key_Y, "y"], [Qt.Key_Up, ""], [Qt.Key_Down, ""], [Qt.Key_Space, " "], [Qt.Key_H, "H"]]
+    var moved = 0, swallowed = 0
+    for (var i = 0; i < stray.length; i++) {
+      var e = shell.key(stray[i][0], stray[i][1])
+      w.dialogKeyPressed(e)
+      if (e.accepted) swallowed++
+      if (d.selectedIndex !== start) moved++
+    }
+    var out = "start " + start + " stray " + stray.length + " moved " + moved + " swallowed " + swallowed + " open " + (isOpen() && d.opened)
+    var seq = []
+    var toggles = [Qt.Key_Left, Qt.Key_Right, Qt.Key_Tab, Qt.Key_Backtab]
+    for (var j = 0; j < toggles.length; j++) { w.dialogKeyPressed(shell.key(toggles[j], "")); seq.push(d.selectedIndex) }
+    out += " toggles " + seq.join(",")
+    if (d.selectedIndex === 0) {
+      w.dialogKeyPressed(shell.key(Qt.Key_Return, ""))
+      out += " enter-cancel closed " + !isOpen()
+    } else {
+      out += " ERROR not on cancel"
+      w.dialogKeyPressed(shell.key(Qt.Key_Escape, ""))
+    }
+    return out
+  }
+  // The panel after it reopened itself for a finished switch (asked for by
+  // the widget with the panel closed): key-inert, with the focus on its
+  // inert key item and the catcher blocked. Every key a stray burst of typing
+  // could hold (Space, Enter, Tab, arrows, j/k, h/l, the letters of "git
+  // status", "git log") is sent the way the inert item gets it, and also as
+  // the catcher's own signals; the cursor is pointed at the shutdown stop.
+  // Nothing may change: no cursor, no dialog, no env write, no shutdown, the
+  // panel still open. Then the deliberate action: "pointer" (a first pointer
+  // sample and jitter do nothing, a real move wakes it; the catcher has the
+  // focus and the keys work again: the cursor, the shutdown dialog with the
+  // focus on its key item, Esc dismissing it; closing ends the state and a
+  // user opening is not inert) or "esc" (Esc closes the panel).
+  function logReopened(when, ending) {
+    var w = shell.widget, p = shell.panel, s = Plugin.MuxState
+    var kc = shell.findAll(w, function(it) { return it.blocked !== undefined && it.reorderable !== undefined }, 0, [])
+    if (kc.length !== 1) { shell.log("reopened " + when + " ERROR no key catcher"); return }
+    kc = kc[0]
+    var target = p.focusTarget
+    var env = s.envChoice
+    var line = "reopened " + when + " open " + w.opened + " inert " + w.keysInert + " target " + w.keyTarget
+      + " focus " + (target.parent === kc && target.focus === true && kc.focus === false) + " blocked " + kc.blocked
+      + " offered " + w.shutdownOffered + " cursor " + w.cursorActive + " stops " + w.cursorStops.join(",")
+    var keys = [[Qt.Key_Space, " "], [Qt.Key_Return, ""], [Qt.Key_Enter, ""], [Qt.Key_Tab, ""], [Qt.Key_Backtab, ""],
+      [Qt.Key_Left, ""], [Qt.Key_Right, ""], [Qt.Key_Up, ""], [Qt.Key_Down, ""], [Qt.Key_J, "j"], [Qt.Key_K, "k"],
+      [Qt.Key_H, "h"], [Qt.Key_L, "l"], [Qt.Key_Space, " "], [Qt.Key_Return, ""]]
+    var typed = "git status\rgit log\t\r j j\r"
+    for (var c = 0; c < typed.length; c++) {
+      var ch = typed.charAt(c)
+      keys.push(ch === "\r" ? [Qt.Key_Return, ""] : ch === "\t" ? [Qt.Key_Tab, ""] : ch === " " ? [Qt.Key_Space, " "]
+        : [ch.toUpperCase().charCodeAt(0), ch])
+    }
+    var swallowed = 0
+    for (var i = 0; i < keys.length; i++) {
+      var e = shell.key(keys[i][0], keys[i][1])
+      w.inertKeyPressed(e)
+      if (e.accepted) swallowed++
+      kc.activateRequested()
+      kc.moveRequested(0, 1)
+      kc.moveRequested(1, 0)
+      kc.tabRequested(1)
+      w.pointAt("shutdown")
+    }
+    line += " keys " + keys.length + " swallowed " + swallowed + " after open " + w.opened + " inert " + w.keysInert
+      + " cursor " + w.cursorActive + " offered " + w.shutdownOffered + " confirm '" + w.confirmMode + "' dialog " + w.dialogOpen
+      + " env " + (s.envChoice === env && !s.envBusy) + " busy " + s.busy
+    if (ending === "esc") {
+      w.inertKeyPressed(shell.key(Qt.Key_Escape, ""))
+      line += " esc open " + w.opened + " inert " + w.keysInert
+      shell.log(line)
+      return
+    }
+    w.pointerAt(200, 100)
+    var afterSample = w.keysInert
+    w.pointerAt(201.5, 98.5)
+    var afterJitter = w.keysInert
+    w.pointerAt(210, 100)
+    line += " pointer sample " + afterSample + " jitter " + afterJitter + " moved " + w.keysInert + " target " + w.keyTarget
+      + " focus " + (kc.focus === true && target.focus === false) + " blocked " + kc.blocked
+    kc.activateRequested()
+    line += " cursor " + w.cursorActive + " at " + w.cursorAt
+    kc.activateRequested()
+    var dialogTarget = p.focusTarget
+    line += " offered " + w.shutdownOffered + " target " + w.keyTarget
+      + " focus " + (dialogTarget !== target && dialogTarget.parent === kc && dialogTarget.focus === true)
+    w.dialogKeyPressed(shell.key(Qt.Key_Escape, ""))
+    line += " dismissed " + !w.shutdownOffered + " target " + w.keyTarget + " focus " + (kc.focus === true)
+    w.close()
+    line += " closed inert " + w.keysInert
+    w.open()
+    line += " user open inert " + w.keysInert + " target " + w.keyTarget
+    w.close()
+    shell.log(line)
+  }
+  // The switch dialog on a mode the panel offers: stray keys, its own keys,
+  // Cancel; then opened again after a toggle and Esc: back on Cancel.
+  function logSwitchKeys() {
+    var w = shell.widget
+    var row = w.rows.find(function(r) { return r.action === "switch" && r.enabled })
+    if (!row) { shell.log("switch keys ERROR no row"); return }
+    var dlg = shell.findAll(w, function(it) { return it.confirmText === "Switch" && it.message !== undefined }, 0, [])
+    if (dlg.length !== 1) { shell.log("switch keys ERROR no dialog"); return }
+    w.askSwitch(row)
+    var line = shell.tryKeys(w, dlg[0], function() { return w.confirmMode !== "" })
+    w.askSwitch(row)
+    w.dialogKeyPressed(shell.key(Qt.Key_Left, ""))
+    var toggled = dlg[0].selectedIndex
+    w.dialogKeyPressed(shell.key(Qt.Key_Escape, ""))
+    var escClosed = w.confirmMode === ""
+    w.askSwitch(row)
+    line += " esc closed " + escClosed + " after " + toggled + " reopened on " + dlg[0].selectedIndex
+    w.confirmMode = ""
+    shell.log("switch keys " + line + " busy " + Plugin.MuxState.busy)
+    // The engine's key codes are the model's.
+    shell.log("qt keys " + Model.dialogKeyAction(Qt.Key_Left) + Model.dialogKeyAction(Qt.Key_Right) + Model.dialogKeyAction(Qt.Key_Tab)
+      + Model.dialogKeyAction(Qt.Key_Backtab) + Model.dialogKeyAction(Qt.Key_Return) + Model.dialogKeyAction(Qt.Key_Enter)
+      + Model.dialogKeyAction(Qt.Key_Escape) + "|" + Model.dialogKeyAction(Qt.Key_Space) + Model.dialogKeyAction(Qt.Key_H)
+      + Model.dialogKeyAction(Qt.Key_L) + "|")
   }
   // The widget's env dropdown, found by its label (it has no id outside).
   property int reads: 0
@@ -792,12 +966,13 @@ EOF
   expect_flow "ready ownership ok available true current discrete pending false env auto" "the gate passes through the fake stat; nothing pending, no env file"
   expect_flow "env rtx true" "RTX writes the plugin's exact text (read back as rtx)"
   expect_flow "request true second false" "a second switch while one runs is refused"
-  expect_flow "finished owner true kind success offer true warning false" "MSHybrid: success, the shutdown is offered"
+  expect_flow "finished owner widget kind success offer true warning false" "MSHybrid (asked for by the widget, its panel closed): success, the shutdown is offered"
+  expect_flow "reopened staged open true inert true target inert focus true blocked true offered false cursor false stops shutdown,env keys 40 swallowed 40 after open true inert true cursor false offered false confirm '' dialog false env true busy false pointer sample true jitter true moved false target panel focus true blocked false cursor true at shutdown offered true target dialog focus true dismissed true target panel focus true closed inert false user open inert false target panel" "the panel reopened itself key-inert after the staged switch: focus on the inert key item, catcher blocked, no shutdown dialog; Space, Enter, Tab, arrows, j/k, h/l and typed text change nothing (no cursor, no dialog, no env write); then a first pointer sample and jitter keep it inert; a real move wakes it: the catcher has the focus, keys reach the cursor and the shutdown dialog (focus on its keys), Esc dismisses; closing ends the state; a user opening is not inert"
   expect_flow "staged pending true target mshybrid env rtx" "the re-read shows MSHybrid pending; the env file stays"
   expect_flow "panel discrete current rows 3 buttons 2 [Switch,Switch] lock false" "nothing staged: two Switch buttons, no lock line"
   expect_flow "panel mshybrid pending rows 3 buttons 0 [] lock true" "MSHybrid staged: no switch or cancel button; the lock line is shown"
   expect_flow "restage true" "a re-stage is asked for directly while MSHybrid is staged"
-  expect_flow "finished owner true kind error offer false warning false :: A switch is staged. It can't be changed or cancelled until after a full shutdown." "the tool's refusal is shown as the plain sentence"
+  expect_flow "finished owner holder kind error offer false warning false :: A switch is staged. It can't be changed or cancelled until after a full shutdown." "the tool's refusal is shown as the plain sentence"
   expect_flow "restage refused pending true target mshybrid" "the refusal changed nothing: MSHybrid stays staged"
   expect_flow "panel restage refused rows 3 buttons 0 [] lock true" "the refusal's sentence is shown once (the lock line steps aside)"
   expect_flow "dropdown discrete current shown true" "the base GPU dropdown is shown in Discrete (current, nothing pending)"
@@ -809,10 +984,15 @@ EOF
   expect_flow "panel integrated pending rows 3 buttons 0 [] lock true" "Integrated staged: no button; the lock line is shown"
   expect_flow "round trip pending false env rtx" "after the round trip the RTX choice is still on disk"
   expect_flow "lockline mshybrid pending kind staged text true button true stop true offered true dialog staged open true :: The switch is staged. Shut down now to apply it?" "staged: Shut down now on the lock line, a cursor stop, opening the shutdown dialog"
+  expect_flow "shutdown keys mshybrid pending start 0 stray 13 moved 0 swallowed 13 open true toggles 1,0,1,0 enter-cancel closed true" "shutdown dialog: opens on Later; h, l, Space and other text keys change nothing and confirm nothing; arrows and Tab toggle; Enter on Later closes it"
+  expect_flow "shutdown keys flag refused start 0 stray 13 moved 0 swallowed 13 open true toggles 1,0,1,0 enter-cancel closed true" "the same for the leftover-flag shutdown dialog"
+  expect_flow "switch keys start 0 stray 13 moved 0 swallowed 13 open true toggles 1,0,1,0 enter-cancel closed true esc closed true after 1 reopened on 0 busy false" "switch dialog: opens on Cancel every time; stray keys do nothing; Esc dismisses; no switch asked for"
+  expect_flow "qt keys toggletoggletoggletoggleactivateactivateclose||" "the engine's Qt.Key codes are the model's: the dialog set acts, Space, h and l do not"
   expect_flow "panel flag before rows 3 buttons 2 [Switch,Switch] lock false" "a leftover firmware flag looks like nothing staged: two Switch buttons"
   expect_flow "lockline flag before kind  text false button false stop false :: " "no lock line before the refusal"
   expect_flow "flag request true" "a switch is asked for with the flag left set"
-  expect_flow "finished owner true kind error offer false warning false :: The firmware still has a switch in progress. A full shutdown clears it." "the refusal with nothing staged reads as the leftover flag"
+  expect_flow "finished owner widget kind error offer false warning false :: The firmware still has a switch in progress. A full shutdown clears it." "the refusal with nothing staged reads as the leftover flag"
+  expect_flow "reopened flag open true inert true target inert focus true blocked true offered false cursor false stops mode|mshybrid,mode|integrated,shutdown,env keys 40 swallowed 40 after open true inert true cursor false offered false confirm '' dialog false env true busy false esc open false inert false" "after the refused switch the panel reopened key-inert: the keys reach neither the switch nor the shutdown dialog; Esc closes it"
   expect_flow "flag refused pending false" "nothing staged after the refusal"
   expect_flow "panel flag refused rows 3 buttons 2 [Switch,Switch] lock false" "the staged sentence is not shown for the leftover flag"
   expect_flow "lockline flag refused kind flag text true button true stop true offered true dialog flag open true :: The firmware still has a switch in progress. Shut down now to clear it?" "the leftover flag: its sentence once, Shut down now, a cursor stop, the shutdown dialog's own text"
@@ -826,12 +1006,18 @@ EOF
   expect_flow "failed remove env intel dropdown intel error true :: Could not remove $home/.config/uwsm/env.d/90-msi-mux-gpu." "a failed removal shows the error; the dropdown reverts to the file on disk (Intel)"
   expect_flow "removed after failure env auto" "Auto then removes it once env.d is writable again"
   expect_flow "blocked request true" "a switch is asked for while an msi-mux-switch runs"
-  expect_flow "finished owner true kind error offer false warning false :: msi-mux-switch is already running" "it is refused before pkexec"
+  expect_flow "finished owner holder kind error offer false warning false :: msi-mux-switch is already running" "it is refused before pkexec"
   # The flags are the ones the debug read got (the hardware's).
   local flags want_pk
   flags=$(sed -n '1s/^--debug --json//p' "$cfg/fake.log" 2>/dev/null)
   want_pk=$(printf '%s\n' "--disable-internal-agent $bin mshybrid --json$flags" "--disable-internal-agent $bin integrated --json$flags" \
     "--disable-internal-agent $bin integrated --json$flags" "--disable-internal-agent $bin integrated --json$flags")
+  if [[ -e $cfg/shutdown.log ]]; then
+    echo "FAIL the shutdown command was run: $(tr '\n' '|' <"$cfg/shutdown.log")"
+    ok=1
+  else
+    echo "ok   the shutdown command never ran"
+  fi
   if [[ $(cat "$cfg/pkexec.log" 2>/dev/null) == "$want_pk" ]]; then
     echo "ok   pkexec ran four times (the refused re-stage and the leftover-flag refusal included), with exactly the argv arrays expected"
   else
@@ -849,6 +1035,215 @@ EOF
     ok=1
   fi
   ((ok)) && grep 'MMFLOW' "$log" | sed 's/^ */     | /' | cut -c1-300
+  rm -rf "$cfg"
+  return $ok
+}
+
+# The debug read's bounds and the switch checks' watchdog for real, in a
+# scratch Quickshell with a temporary HOME and PATH starting with fakes:
+# `stat` (root-owned, so the gate passes), `pkexec` and `omarchy-system`
+# (logging; neither may run) and `pgrep` (logs, then hangs). The binary runs
+# one of the fixtures, picked by a file: the plain fake (ready), the flooding
+# fake (the read ends at the cap within moments and reads as an error), the
+# plain fake again, then the hanging fake with a switch asked for while its
+# read runs: the read ends on its timeout (TERM ignored, then KILL), the hung
+# pgrep that follows holds the check, and the watchdog refuses the switch
+# after Model.CHECK_TIMEOUT_MS: the phase returns to "" and nothing ran.
+# Skipped on hardware that is not available or on battery (the real AC is
+# read).
+debug_bounds_live() {
+  local dir=${1:-$PLUGIN_DIR}
+  if ! have_qs_load; then
+    skip_qs_load
+    return $SKIP
+  fi
+  if [[ $dir == *[\"\\]* ]]; then
+    echo "skipped: plugin path contains a quote or backslash"
+    return $SKIP
+  fi
+  local cfg home bin fake ok=0 real_stat f log watchdog_text
+  # The flow lasts about CHECK_TIMEOUT_MS after startup.
+  local LOAD_TIMEOUT_S=45
+  real_stat=$(command -v stat) || return 1
+  watchdog_text=$(node -e 'process.stdout.write(require("fs").readFileSync(process.argv[1], "utf8").match(/var CHECK_TIMEOUT_TEXT = "([^"]*)"/)[1])' \
+    "$PLUGIN_DIR/Model.js") || return 1
+  cfg=$(mktemp -d) || return 1
+  home=$cfg/home fake=$cfg/fakebin bin=$cfg/bin/msi-mux-switch log=$cfg/log
+  mkdir -p "$home" "$fake" "$cfg/bin" "$cfg/fx"
+  for f in fake-msi-mux-switch fake-msi-mux-switch-flood fake-msi-mux-switch-hang; do
+    cp "$PLUGIN_DIR/tests/fixtures/$f" "$cfg/fx/$f"
+    printf '%s' "$f" >"$cfg/mode${f#fake-msi-mux-switch}"
+  done
+  chmod 755 "$cfg/fx/fake-msi-mux-switch" "$cfg/fx/fake-msi-mux-switch-flood" "$cfg/fx/fake-msi-mux-switch-hang"
+  cp "$cfg/mode" "$cfg/mode-plain"
+  cat >"$bin" <<END_BIN
+#!/bin/bash
+exec "$cfg/fx/\$(cat "$cfg/mode")" "\$@"
+END_BIN
+  cat >"$fake/stat" <<END_STAT
+#!/bin/bash
+[[ \$1 == -c && \$3 == -- ]] || exit 1
+"$real_stat" -c '%u	%f	%U	%n' -- "\${@:4}" | while IFS=\$'\t' read -r _ raw _ name; do
+  printf '0\t%x\troot\t%s\n' "\$(( (16#\$raw & 16#F000) | 8#755 ))" "\$name"
+done
+END_STAT
+  cat >"$fake/pkexec" <<END_PKEXEC
+#!/bin/bash
+printf '%s\n' "\$*" >>"$cfg/pkexec.log"
+exit 127
+END_PKEXEC
+  cat >"$fake/omarchy-system" <<END_SYSTEM
+#!/bin/bash
+printf '%s\n' "\$*" >>"$cfg/shutdown.log"
+END_SYSTEM
+  cat >"$fake/pgrep" <<END_PGREP
+#!/bin/bash
+printf '%s\n' "\$*" >>"$cfg/pgrep.log"
+exec sleep 60
+END_PGREP
+  chmod 755 "$bin" "$fake/stat" "$fake/pkexec" "$fake/omarchy-system" "$fake/pgrep"
+  if [[ $(PATH="$fake:$PATH" command -v pkexec) != "$fake/pkexec" ||
+    $(PATH="$fake:$PATH" command -v omarchy-system) != "$fake/omarchy-system" ||
+    $(PATH="$fake:$PATH" command -v pgrep) != "$fake/pgrep" ]]; then
+    echo "FAIL a fake does not resolve first on PATH; not running"
+    rm -rf "$cfg"
+    return 1
+  fi
+  ln -s "$SHELL_DIR/Commons" "$cfg/Commons"
+  ln -s "$SHELL_DIR/Ui" "$cfg/Ui"
+  cat >"$cfg/shell.qml" <<END_QML
+import QtQuick
+import Quickshell
+import Quickshell.Io
+import "file://$dir" as Plugin
+import "file://$dir/Model.js" as Model
+ShellRoot {
+  id: shell
+  QtObject { id: holder }
+  property var widget: null
+  property int step: 0
+  property int reads: 0
+  property real t0: 0
+  property real asked: 0
+  property var outcome: null
+  function log(s) { console.log("MMBOUND " + s) }
+  function done() { shell.log("DONE"); shell.step = 99; Qt.callLater(Qt.quit) }
+  function ms(t) { return Math.round(Date.now() - t) }
+  Component.onCompleted: {
+    var c = Qt.createComponent("file://$dir/BarWidget.qml", Component.PreferSynchronous)
+    if (c.status !== Component.Ready) { shell.log("ERROR " + c.errorString()); shell.done(); return }
+    shell.widget = c.createObject(shell, { settings: { binaryPath: "$bin" } })
+  }
+  Connections {
+    target: Plugin.MuxState
+    function onDebugChanged() { shell.reads++ }
+    function onSwitchFinished(owner, outcome) { shell.outcome = outcome }
+  }
+  Process { id: pick }
+  function use(mode) { pick.command = ["cp", "--", "$cfg/mode" + mode, "$cfg/mode"]; pick.running = true }
+  Timer {
+    interval: 50
+    repeat: true
+    running: shell.step < 99
+    onTriggered: {
+      var s = Plugin.MuxState
+      if (shell.step === 0) {
+        if (!s.dmiRead) return
+        if (s.hardware.state !== "available") { shell.log("skip hardware " + s.hardware.state); shell.done(); return }
+        if (!s.debug.ok || s.ac === null) return
+        if (s.ac !== true) { shell.log("skip ac " + s.ac); shell.done(); return }
+        shell.log("ready available " + s.available + " current " + s.debug.current)
+        shell.use("-flood")
+        shell.step = 1
+      } else if (shell.step === 1) {
+        if (pick.running) return
+        shell.reads = 0
+        shell.t0 = Date.now()
+        s.readDebug()
+        shell.step = 2
+      } else if (shell.step === 2) {
+        if (shell.reads === 0) return
+        shell.log("flood ok " + s.debug.ok + " fast " + (shell.ms(shell.t0) < 5000) + " :: " + s.debug.error)
+        shell.use("-plain")
+        shell.step = 3
+      } else if (shell.step === 3) {
+        if (pick.running) return
+        shell.reads = 0
+        s.readDebug()
+        shell.step = 4
+      } else if (shell.step === 4) {
+        if (shell.reads === 0) return
+        shell.log("plain again ok " + s.debug.ok)
+        shell.use("-hang")
+        shell.step = 5
+      } else if (shell.step === 5) {
+        if (pick.running) return
+        shell.reads = 0
+        shell.t0 = Date.now()
+        s.readDebug()
+        shell.asked = Date.now()
+        shell.log("hang request " + s.requestSwitch(holder, "mshybrid") + " phase " + s.phase)
+        shell.step = 6
+      } else if (shell.step === 6) {
+        if (shell.reads === 0) return
+        var ht = shell.ms(shell.t0)
+        shell.log("hang ended ok " + s.debug.ok + " in time " + (ht >= (Model.DEBUG_TIMEOUT_S - 1) * 1000
+          && ht < (Model.DEBUG_TIMEOUT_S + Model.DEBUG_KILL_AFTER_S + 3) * 1000)
+          + " phase " + s.phase + " busy " + s.busy + " :: " + s.debug.error)
+        shell.step = 7
+      } else if (shell.step === 7) {
+        if (!shell.outcome) return
+        shell.log("watchdog kind " + shell.outcome.kind + " offer " + shell.outcome.offerShutdown
+          + " after " + (shell.ms(shell.asked) >= Model.CHECK_TIMEOUT_MS - 200)
+          + " phase '" + s.phase + "' busy " + s.busy + " :: " + shell.outcome.message)
+        shell.widget.destroy()
+        shell.done()
+      }
+    }
+  }
+  Timer { interval: 40000; running: true; onTriggered: { shell.log("TIMEOUT step " + shell.step); shell.done() } }
+}
+END_QML
+  scratch_qs "$cfg" MMBOUND "HOME=$home" "PATH=$fake:$PATH" "MM_FAKE_LOG=$cfg/fake.log" \
+    "MM_FAKE_CAPTURE=$PLUGIN_DIR/tests/fixtures/debug-discrete.json"
+  if grep -q 'MMBOUND skip' "$log"; then
+    echo "skipped: $(grep -o 'MMBOUND skip.*' "$log" | head -1 | cut -c9-)"
+    rm -rf "$cfg"
+    return $SKIP
+  fi
+  expect_bound() {
+    if grep -qF -- "MMBOUND $1" "$log"; then echo "ok   $2"; else echo "FAIL $2 (no 'MMBOUND $1')"; ok=1; fi
+  }
+  expect_bound "ready available true current discrete" "the plain fake reads; the gate passes through the fake stat"
+  expect_bound "flood ok false fast true :: msi-mux-switch --debug printed more than 1 MiB; not read." \
+    "a flooding binary is cut at the cap within moments and read as an error"
+  expect_bound "plain again ok true" "the plain fake reads again afterwards"
+  expect_bound "hang request true phase checking" "a switch is asked for while a hanging debug read runs"
+  expect_bound "hang ended ok false in time true phase checking busy true :: msi-mux-switch --debug did not answer within 10 s." \
+    "the hanging read ends on its timeout (TERM ignored, then KILL) and says so; the switch is still being checked"
+  expect_bound "watchdog kind error offer false after true phase '' busy false :: $watchdog_text" \
+    "the hung pgrep holds the check; the watchdog refuses the switch and the phase returns to \"\""
+  if [[ $(cat "$cfg/pgrep.log" 2>/dev/null) == "-x msi-mux-switch" ]]; then
+    echo "ok   pgrep was started once, after the debug read ended"
+  else
+    echo "FAIL pgrep log: $(tr '\n' '|' <"$cfg/pgrep.log" 2>/dev/null)"
+    ok=1
+  fi
+  if [[ -e $cfg/pkexec.log || -e $cfg/shutdown.log ]]; then
+    echo "FAIL pkexec or the shutdown command ran"
+    ok=1
+  else
+    echo "ok   neither pkexec nor the shutdown command ran"
+  fi
+  if [[ -n $cfg && -d $cfg/fx ]] && pgrep -f -- "$cfg/fx/fake-" >/dev/null; then
+    echo "FAIL a fake binary is still running: $(pgrep -af -- "$cfg/fx/fake-" | head -3 | tr '\n' '|')"
+    ok=1
+  fi
+  if grep -q 'MMBOUND TIMEOUT\|MMBOUND ERROR\|WARN.*qt\.qml\|TypeError\|ReferenceError' "$log"; then
+    grep 'MMBOUND TIMEOUT\|MMBOUND ERROR\|WARN.*qt\.qml\|TypeError\|ReferenceError' "$log" | head -5 | sed 's/^ */FAIL /' | cut -c1-300
+    ok=1
+  fi
+  ((ok)) && grep 'MMBOUND' "$log" | sed 's/^ */     | /' | cut -c1-300
   rm -rf "$cfg"
   return $ok
 }
@@ -918,14 +1313,14 @@ bash_suite() {
 }
 
 # Usage: shellcheck_check [dir]. Checks setup.sh, tests/*.sh and the fake
-# binary of dir (default: the plugin), globbed now so a new script is
+# binaries (tests/fixtures/fake-msi-mux-switch*) of dir (default: the plugin), globbed now so a new script is
 # included, at default severity. Any finding is printed (gcc format) and
 # fails.
 shellcheck_check() {
   local dir=${1:-$PLUGIN_DIR} f out status
   local files=()
   find_shellcheck || return $SKIP
-  for f in "$dir/setup.sh" "$dir"/tests/*.sh "$dir/tests/fixtures/fake-msi-mux-switch"; do
+  for f in "$dir/setup.sh" "$dir"/tests/*.sh "$dir"/tests/fixtures/fake-msi-mux-switch*; do
     [[ -f $f ]] && files+=("$f")
   done
   if ((${#files[@]} == 0)); then
@@ -981,10 +1376,12 @@ run "QML load (scratch qs)" qml_load
 run "QML load self-test (injected faults)" qml_load_selftest
 run "widget and singleton live against a fake binary (scratch qs)" widget_live
 run "switch and env-file flow against fake pkexec, stat and binary (scratch qs)" switch_flow_live
+run "debug read bounds and the check watchdog against flooding and hanging fakes (scratch qs)" debug_bounds_live
 run "model" node_suite "$PLUGIN_DIR/tests/model-test.js"
+run "debug read command against the fakes (tests/debug-read-test.sh)" bash_suite "$PLUGIN_DIR/tests/debug-read-test.sh"
 run "env file sourced by sh (tests/env-file-test.sh)" bash_suite "$PLUGIN_DIR/tests/env-file-test.sh"
 run "setup.sh against a fake sudo (tests/setup-test.sh)" bash_suite "$PLUGIN_DIR/tests/setup-test.sh"
-run "shellcheck (setup.sh, tests/*.sh, the fake binary)" shellcheck_check
+run "shellcheck (setup.sh, tests/*.sh, the fake binaries)" shellcheck_check
 run "shellcheck self-test (injected unquoted variable)" shellcheck_selftest
 
 if ((FAILURES)); then

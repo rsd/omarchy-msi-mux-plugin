@@ -287,10 +287,62 @@ function setupHelps(verdict) {
 
 // ------------------------------------------------------------------ commands
 
-// The read-only state read, as the user. One pretty-printed JSON object.
-function debugArgv(path, flags) {
+// The read-only state read, as the user: `<binary> --debug --json [flags]`,
+// which prints one pretty-printed JSON object of a few KiB. It runs under
+// `timeout -k DEBUG_KILL_AFTER_S DEBUG_TIMEOUT_S` (TERM, then KILL, sent to
+// the tool's whole process group), inside DEBUG_SCRIPT, which caps both
+// streams while they are read (see there). The timeout and the tool's argv
+// are positional arguments of the script, never part of its text.
+var DEBUG_TIMEOUT_S = 10
+var DEBUG_KILL_AFTER_S = 2
+
+// The most of either stream of the debug read that is kept, in bytes.
+var DEBUG_MAX_BYTES = 1048576
+
+// Run with bash (Omarchy is built on it; setupArgv uses it too) for
+// PIPESTATUS. "$@" is the command. Each stream passes through
+// `head -c DEBUG_MAX_BYTES+1` while the command runs, so at most that much is
+// ever read: once head has its fill it exits, and the command gets SIGPIPE
+// on its next write (or the timeout ends it). tr turns NUL bytes into SUB
+// (1:1, so the byte count holds; bash would drop them). Each stream is kept
+// whole in the script and counted with wc -c (bytes, whatever the locale);
+// then the script prints
+//   stdout: the command's stdout, "\n", "status <exit status>", "\n"
+//   stderr: the command's stderr, "\n", "end", "\n"
+// or, for a stream over DEBUG_MAX_BYTES, "\nover\n" on that stream instead.
+// The last line is always the script's own (the command's output comes
+// before it), and a missing one means the read did not finish
+// (parseDebugRead). The command's exit status is the first PIPESTATUS of the
+// inner pipeline; the script itself exits 0.
+var DEBUG_SCRIPT = [
+  "exec 3>&1",
+  "err=$(",
+  "  {",
+  "    out=$(\"$@\" 3>&- | head -c " + (DEBUG_MAX_BYTES + 1) + " | tr '\\000' '\\032'; printf 'x%s' \"${PIPESTATUS[0]}\")",
+  "    status=${out##*x}",
+  "    out=${out%x*}",
+  "    if [ \"$(printf '%s' \"$out\" | wc -c)\" -gt " + DEBUG_MAX_BYTES + " ]; then printf '\\nover\\n' >&3",
+  "    else printf '%s\\nstatus %s\\n' \"$out\" \"$status\" >&3",
+  "    fi",
+  "  } 2>&1 | head -c " + (DEBUG_MAX_BYTES + 1) + " | tr '\\000' '\\032'",
+  "  printf x",
+  ")",
+  "err=${err%x}",
+  "if [ \"$(printf '%s' \"$err\" | wc -c)\" -gt " + DEBUG_MAX_BYTES + " ]; then printf '\\nover\\n' >&2",
+  "else printf '%s\\nend\\n' \"$err\" >&2",
+  "fi"
+].join("\n")
+
+// The debug read's command: the tool under the timeout.
+function debugCommand(path, flags) {
   if (binaryPathProblem(path) !== "") return []
-  return [String(path), "--debug", "--json"].concat(flags || [])
+  return ["timeout", "-k", String(DEBUG_KILL_AFTER_S), String(DEBUG_TIMEOUT_S), String(path), "--debug", "--json"]
+    .concat(flags || [])
+}
+
+function debugArgv(path, flags) {
+  var command = debugCommand(path, flags)
+  return command.length === 0 ? [] : ["bash", "-c", DEBUG_SCRIPT, "msi-mux-debug"].concat(command)
 }
 
 // The switch, through pkexec, as an argv array: no shell, nothing joined.
@@ -316,6 +368,12 @@ function runningProblem(exitCode) {
   if (exitCode === 0) return "msi-mux-switch is already running (another switch may be in progress). Nothing was run."
   return "Could not check whether msi-mux-switch is already running. Nothing was run."
 }
+
+// The checks before a switch (stat, AC, and pgrep once this plugin's own
+// debug read is over) get this long; then the switch is refused. Longer
+// than a debug read can last (DEBUG_TIMEOUT_S + DEBUG_KILL_AFTER_S).
+var CHECK_TIMEOUT_MS = 15000
+var CHECK_TIMEOUT_TEXT = "The checks before the switch did not finish in time. Nothing was run."
 
 // Set up backend: the plugin's setup.sh in a floating terminal that stays
 // open on its result. The script and the binary path are "$1" and "$2",
@@ -413,6 +471,48 @@ function parseDebug(stdout, stderr, exitCode) {
   out.pending = isPending(out.current, out.target)
   out.modes = availableModes(fw.value)
   return out
+}
+
+// One stream of DEBUG_SCRIPT: { body, tail } (tail: its last line, the
+// script's own), or null when it does not end in a line of the script's.
+function splitDebugStream(text) {
+  var t = String(text === undefined || text === null ? "" : text)
+  if (t.length === 0 || t.charAt(t.length - 1) !== "\n") return null
+  t = t.slice(0, -1)
+  var nl = t.lastIndexOf("\n")
+  if (nl === -1) return null
+  return { body: t.slice(0, nl), tail: t.slice(nl + 1) }
+}
+
+var DEBUG_OVER_TEXT = "msi-mux-switch --debug printed more than 1 MiB; not read."
+var DEBUG_TIMEOUT_TEXT = "msi-mux-switch --debug did not answer within " + DEBUG_TIMEOUT_S + " s."
+
+// The debug read's result from DEBUG_SCRIPT's two streams and its own exit
+// status: a stream over the cap is refused unread, an unfinished read (no
+// last line of the script's, or the script failing) is an error, and the
+// timeout's exit statuses (124: TERM, 137: KILL) say so; anything else is
+// parseDebug of the command's own output and exit status.
+function parseDebugRead(stdout, stderr, exitCode) {
+  var out = splitDebugStream(stdout)
+  var err = splitDebugStream(stderr)
+  if ((out && out.tail === "over") || (err && err.tail === "over")) {
+    var over = emptyDebug()
+    over.error = DEBUG_OVER_TEXT
+    return over
+  }
+  var status = out ? /^status (\d{1,3})$/.exec(out.tail) : null
+  if (exitCode !== 0 || !status || !err || err.tail !== "end") {
+    var unfinished = emptyDebug()
+    unfinished.error = "msi-mux-switch --debug did not finish (exit status " + exitCode + ")."
+    return unfinished
+  }
+  var code = Number(status[1])
+  if (code === 124 || code === 137) {
+    var late = emptyDebug()
+    late.error = DEBUG_TIMEOUT_TEXT
+    return late
+  }
+  return parseDebug(out.body, err.body, code)
 }
 
 // ------------------------------------------------------------ switch events
@@ -871,6 +971,89 @@ function lockNotice(s) {
   if (d.ok && d.pending) return { kind: "staged", text: STAGED_LOCK_TEXT, urgent: refused }
   if (refused) return { kind: "flag", text: FIRMWARE_FLAG_TEXT, urgent: true }
   return { kind: "", text: "", urgent: false }
+}
+
+// After a switch this widget asked for: whether the shutdown dialog opens by
+// itself. Never when the panel had to reopen itself to show the result: the
+// panel takes the keyboard on opening, and the user may be typing into
+// another window by then. The lock line's Shut down now stays the way in.
+function offerShutdownAfterSwitch(outcome, reopened) {
+  return reopened !== true && !!outcome && outcome.offerShutdown === true
+}
+
+// ------------------------------------------------------------ dialog keys
+
+// The Qt key codes (Qt::Key) a dialog in the panel takes.
+var KEY = {
+  Escape: 0x01000000,
+  Tab: 0x01000001,
+  Backtab: 0x01000002,
+  Return: 0x01000004,
+  Enter: 0x01000005,
+  Left: 0x01000012,
+  Right: 0x01000014
+}
+
+// What a key does while a dialog is open, from its key code alone: the set
+// of the shell's own ConfirmDialog. "toggle" (Left, Right, Tab, Backtab)
+// picks the other button, "activate" (Return, Enter) presses the selected
+// one, "close" (Escape) dismisses; "" for every other key, so letters
+// (h and l included) and Space do nothing.
+function dialogKeyAction(key) {
+  if (key === KEY.Escape) return "close"
+  if (key === KEY.Left || key === KEY.Right || key === KEY.Tab || key === KEY.Backtab) return "toggle"
+  if (key === KEY.Return || key === KEY.Enter) return "activate"
+  return ""
+}
+
+// ------------------------------------------------------- reopened panel keys
+
+// A panel that reopened itself to show a finished switch takes the keyboard
+// on opening, while the user may be typing into another window. Until a
+// deliberate action it is key-inert: every key but Esc does nothing, and no
+// cursor shows. keysInert is the state after `what` happened, from `inert`,
+// the state before:
+//   "selfOpen"  the panel reopened itself for the result: inert
+//   "userOpen"  any other opening (the bar button, IPC, Tab from another
+//               panel): not inert
+//   "pointer"   the pointer moved over the panel or pressed on it: not inert
+//   "close"     the panel closed: not inert
+// Anything else leaves it as it was.
+function keysInert(inert, what) {
+  if (what === "selfOpen") return true
+  if (what === "userOpen" || what === "pointer" || what === "close") return false
+  return inert === true
+}
+
+// What a key does on a key-inert panel, from its key code alone: "close"
+// for Escape, "" (nothing) for every other key.
+function inertKeyAction(key) {
+  return key === KEY.Escape ? "close" : ""
+}
+
+// Which item has the panel's keyboard focus: "inert" (a key-inert panel,
+// dialog or not), "dialog" (a dialog is open), else "panel" (the catcher).
+function keyTarget(s) {
+  var st = s || {}
+  if (st.inert === true) return "inert"
+  if (st.dialogOpen === true) return "dialog"
+  return "panel"
+}
+
+// Pointer positions over a key-inert panel, in window coordinates: only a
+// real move wakes it. A panel opening under a resting pointer gets a hover
+// event without the pointer moving, and so do layout changes, so the first
+// position is only a sample: a later one is a move once it is more than
+// POINTER_MOVE_PX away from it on either axis. Returns { sample, moved }:
+// the sample to keep (null before the first) and whether this was a move.
+var POINTER_MOVE_PX = 2
+
+function pointerMove(sample, x, y) {
+  var px = Number(x), py = Number(y)
+  if (!isFinite(px) || !isFinite(py)) return { sample: sample || null, moved: false }
+  if (!sample) return { sample: { x: px, y: py }, moved: false }
+  var moved = Math.abs(px - sample.x) > POINTER_MOVE_PX || Math.abs(py - sample.y) > POINTER_MOVE_PX
+  return { sample: sample, moved: moved }
 }
 
 // The setting as the widget reads it: anything but false is true.
