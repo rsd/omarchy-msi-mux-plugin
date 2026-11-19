@@ -334,6 +334,15 @@ var DEBUG_SCRIPT = [
 ].join("\n")
 
 // The debug read's command: the tool under the timeout.
+//
+// The limit of that timeout: it signals the tool's process group, so a
+// child of the tool that calls setsid() (or setpgid()) leaves the group and
+// is never signalled. If such a child keeps stdout or stderr open, the
+// streams stay open and the read does not end until the child exits; the
+// byte caps of DEBUG_SCRIPT still hold, and a switch waiting on the read is
+// still refused by the checks' watchdog (CHECK_TIMEOUT_MS). The read runs
+// the binary the user configured, as the user; a binary doing this on
+// purpose is outside what these bounds defend against.
 function debugCommand(path, flags) {
   if (binaryPathProblem(path) !== "") return []
   return ["timeout", "-k", String(DEBUG_KILL_AFTER_S), String(DEBUG_TIMEOUT_S), String(path), "--debug", "--json"]
@@ -374,6 +383,16 @@ function runningProblem(exitCode) {
 // than a debug read can last (DEBUG_TIMEOUT_S + DEBUG_KILL_AFTER_S).
 var CHECK_TIMEOUT_MS = 15000
 var CHECK_TIMEOUT_TEXT = "The checks before the switch did not finish in time. Nothing was run."
+
+// A switch asked for while checks the watchdog stopped are still ending
+// (a stopped process takes a moment to exit): refused with this text, so
+// the click is never a silent no-op. `running` says whether any of the stat,
+// AC and pgrep checks is still running; "" when none is.
+var CHECKS_ENDING_TEXT = "The previous checks are still ending. Try again in a moment. Nothing was run."
+
+function checksEndingProblem(running) {
+  return running === true ? CHECKS_ENDING_TEXT : ""
+}
 
 // Set up backend: the plugin's setup.sh in a floating terminal that stays
 // open on its result. The script and the binary path are "$1" and "$2",
@@ -749,7 +768,7 @@ function parseEnvRead(text) {
 }
 
 // The write: env.d created, the text written to ENV_TEMP_NAME beside the
-// target, then renamed over it with `mv -T` (a symbolic link there is
+// target, then renamed over it with `mv -fT` (a symbolic link there is
 // replaced, never followed; a directory there is never moved into: the
 // rename fails). The temporary file is removed on any failure. The previous
 // build's temporary name (sourced by uwsm, having no dot) is removed first
@@ -1006,6 +1025,25 @@ function dialogKeyAction(key) {
   return ""
 }
 
+// The shell's ConfirmDialog selects the button under the pointer when the
+// pointer enters it. Qt also sends that enter when the button slides under
+// a resting pointer: the dialog opening where Switch or Shut down now was
+// just clicked, or a layout change under an open dialog (the panel's
+// height animation, a status read changing its content). Enter would then
+// press the confirm button. So a hover never selects it: the button a
+// dialog keeps after its selection changed to `index` is
+//   - the safe button (DIALOG_SAFE_INDEX: Cancel, Later), always;
+//   - the confirm button only when the change came from the dialog's keys
+//     (o.keyed: Left/Right/Tab/Backtab);
+//   - the safe button for anything else, a hover included.
+// A click on a button acts on that button whatever is selected.
+var DIALOG_SAFE_INDEX = 0
+
+function dialogSelection(index, o) {
+  var opt = o || {}
+  return index === 1 && opt.keyed === true ? 1 : DIALOG_SAFE_INDEX
+}
+
 // ------------------------------------------------------- reopened panel keys
 
 // A panel that reopened itself to show a finished switch takes the keyboard
@@ -1054,6 +1092,24 @@ function pointerMove(sample, x, y) {
   if (!sample) return { sample: { x: px, y: py }, moved: false }
   var moved = Math.abs(px - sample.x) > POINTER_MOVE_PX || Math.abs(py - sample.y) > POINTER_MOVE_PX
   return { sample: sample, moved: moved }
+}
+
+// The pointer over a key-inert panel during its focus prime (the shell's
+// KeyboardPanel.focusPrimed is false for the first 75 ms after it opens):
+// the compositor reports where the pointer already is while the window
+// comes up, so nothing then is a move or a deliberate press. A position
+// before `primed` is dropped, never kept as the sample (the sample is taken
+// from the first position after it); after it, this is pointerMove.
+function inertPointer(sample, x, y, primed) {
+  if (primed !== true) return { sample: null, moved: false }
+  return pointerMove(sample, x, y)
+}
+
+// A press on a key-inert panel: "wake" after the focus prime (the press
+// then goes on to the control under it), "swallow" before it (the press
+// reaches nothing and the panel stays inert).
+function inertPress(primed) {
+  return primed === true ? "wake" : "swallow"
 }
 
 // The setting as the widget reads it: anything but false is true.

@@ -342,8 +342,15 @@ Singleton {
 
   function requestSwitch(owner, mode) {
     if (root.busy || !Model.isMode(mode)) return false
-    // A check stopped by the watchdog may take a moment to end.
-    if (checkStat.running || checkAc.running || checkRunning.running) return false
+    // A check stopped by the watchdog may take a moment to end: refused,
+    // and the panel says so (Model.checksEndingProblem). A check that
+    // ignores TERM keeps this refusal up until it ends (accepted).
+    var ending = Model.checksEndingProblem(checkStat.running || checkAc.running || checkRunning.running)
+    if (ending !== "") {
+      root.switchOwner = owner
+      root.refused(ending)
+      return false
+    }
     if (Model.switchBlocker({ unavailableReason: root.unavailableReason, debug: root.debug, busy: false, ac: root.ac }) !== "")
       return false
     root.phase = "checking"

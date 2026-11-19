@@ -167,7 +167,7 @@ scratch_qs() {
   trap 'kill "$pid" 2>/dev/null; rm -rf "$cfg"; exit 130' INT TERM
   for ((i = 0; i < LOAD_TIMEOUT_S * 10; i++)); do
     kill -0 "$pid" 2>/dev/null || break
-    grep -q "$marker DONE" "$cfg/log" && break
+    grep -sq "$marker DONE" "$cfg/log" && break
     sleep 0.1
   done
   for ((i = 0; i < 20; i++)); do
@@ -417,8 +417,11 @@ EOF
 # opening the panel only runs the widget's logic: MSHybrid and the
 # leftover-flag switch are asked for by the widget with its panel closed, and
 # the panel that reopens itself is key-inert (keys, the catcher's signals and
-# the cursor change nothing, the focus is on its inert key item; a real
-# pointer move wakes it and the keys work again, or Esc closes it).
+# the cursor change nothing, the focus is on its inert key item; during the
+# focus prime neither a press nor a pointer position wakes it; after it a real
+# pointer move wakes it and the keys work again, or Esc closes it). In each
+# dialog, a hover under a resting pointer cannot select the confirm button,
+# one after a real move can.
 # Intel/RTX/Auto write and remove the env file under the temporary HOME;
 # the base GPU dropdown is shown with Discrete current and with MSHybrid or
 # Integrated pending; a second request while one runs is refused; MSHybrid
@@ -774,7 +777,35 @@ ShellRoot {
   // dialog's own keys; it is only ever activated on its cancel button, so
   // nothing is confirmed.
   function key(code, text) { return { key: code, text: text, modifiers: 0, accepted: false } }
+  // Right after a dialog opened: the shell's ConfirmDialog selects the
+  // button under the pointer on hover (selectedIndex = index, as its
+  // onEntered does). A hover never selects the confirm button: not under a
+  // resting pointer, not after jitter, not after a real pointer move (a
+  // layout change can slide it under the pointer). The dialog's keys select
+  // it and a hover over it keeps it; a hover over the safe button selects
+  // that one, and a hover back over the confirm button does not.
+  function tryHover(w, d) {
+    d.selectedIndex = 1
+    var rest = d.selectedIndex
+    w.pointerAt(150, 150)
+    w.pointerAt(151.5, 148.5)
+    d.selectedIndex = 1
+    var jitter = d.selectedIndex
+    w.pointerAt(160, 150)
+    d.selectedIndex = 1
+    var moved = d.selectedIndex
+    w.dialogKeyPressed(shell.key(Qt.Key_Right, ""))
+    var keyed = d.selectedIndex
+    d.selectedIndex = 1
+    var kept = d.selectedIndex
+    d.selectedIndex = 0
+    var back = d.selectedIndex
+    d.selectedIndex = 1
+    return "hover rest " + rest + " jitter " + jitter + " moved " + moved + " keyed " + keyed + " kept " + kept
+      + " back " + back + " again " + d.selectedIndex + " "
+  }
   function tryKeys(w, d, isOpen) {
+    var hover = shell.tryHover(w, d)
     var start = d.selectedIndex
     var stray = [[Qt.Key_H, "h"], [Qt.Key_L, "l"], [Qt.Key_Space, " "], [Qt.Key_E, "e"], [Qt.Key_O, "o"], [Qt.Key_J, "j"],
       [Qt.Key_K, "k"], [Qt.Key_X, "x"], [Qt.Key_Y, "y"], [Qt.Key_Up, ""], [Qt.Key_Down, ""], [Qt.Key_Space, " "], [Qt.Key_H, "H"]]
@@ -785,7 +816,7 @@ ShellRoot {
       if (e.accepted) swallowed++
       if (d.selectedIndex !== start) moved++
     }
-    var out = "start " + start + " stray " + stray.length + " moved " + moved + " swallowed " + swallowed + " open " + (isOpen() && d.opened)
+    var out = hover + "start " + start + " stray " + stray.length + " moved " + moved + " swallowed " + swallowed + " open " + (isOpen() && d.opened)
     var seq = []
     var toggles = [Qt.Key_Left, Qt.Key_Right, Qt.Key_Tab, Qt.Key_Backtab]
     for (var j = 0; j < toggles.length; j++) { w.dialogKeyPressed(shell.key(toggles[j], "")); seq.push(d.selectedIndex) }
@@ -850,6 +881,16 @@ ShellRoot {
       shell.log(line)
       return
     }
+    // The focus prime (the panel's first 75 ms; its window never maps here,
+    // so it is ended by hand): a press reaches nothing and positions,
+    // however far apart, neither wake the panel nor become the sample.
+    var press = { accepted: false }
+    w.inertPressed(press)
+    w.pointerAt(20, 10)
+    w.pointerAt(300, 200)
+    line += " prime " + p.focusPrimed + " press swallowed " + press.accepted + " inert " + w.keysInert
+      + " sample " + (w.pointerSample === null)
+    p.focusPrimed = true
     w.pointerAt(200, 100)
     var afterSample = w.keysInert
     w.pointerAt(201.5, 98.5)
@@ -889,6 +930,9 @@ ShellRoot {
     var escClosed = w.confirmMode === ""
     w.askSwitch(row)
     line += " esc closed " + escClosed + " after " + toggled + " reopened on " + dlg[0].selectedIndex
+    // A new opening: a hover over Switch keeps Cancel.
+    dlg[0].selectedIndex = 1
+    line += " reopened hover " + dlg[0].selectedIndex
     w.confirmMode = ""
     shell.log("switch keys " + line + " busy " + Plugin.MuxState.busy)
     // The engine's key codes are the model's.
@@ -967,7 +1011,7 @@ EOF
   expect_flow "env rtx true" "RTX writes the plugin's exact text (read back as rtx)"
   expect_flow "request true second false" "a second switch while one runs is refused"
   expect_flow "finished owner widget kind success offer true warning false" "MSHybrid (asked for by the widget, its panel closed): success, the shutdown is offered"
-  expect_flow "reopened staged open true inert true target inert focus true blocked true offered false cursor false stops shutdown,env keys 40 swallowed 40 after open true inert true cursor false offered false confirm '' dialog false env true busy false pointer sample true jitter true moved false target panel focus true blocked false cursor true at shutdown offered true target dialog focus true dismissed true target panel focus true closed inert false user open inert false target panel" "the panel reopened itself key-inert after the staged switch: focus on the inert key item, catcher blocked, no shutdown dialog; Space, Enter, Tab, arrows, j/k, h/l and typed text change nothing (no cursor, no dialog, no env write); then a first pointer sample and jitter keep it inert; a real move wakes it: the catcher has the focus, keys reach the cursor and the shutdown dialog (focus on its keys), Esc dismisses; closing ends the state; a user opening is not inert"
+  expect_flow "reopened staged open true inert true target inert focus true blocked true offered false cursor false stops shutdown,env keys 40 swallowed 40 after open true inert true cursor false offered false confirm '' dialog false env true busy false prime false press swallowed true inert true sample true pointer sample true jitter true moved false target panel focus true blocked false cursor true at shutdown offered true target dialog focus true dismissed true target panel focus true closed inert false user open inert false target panel" "the panel reopened itself key-inert after the staged switch: focus on the inert key item, catcher blocked, no shutdown dialog; Space, Enter, Tab, arrows, j/k, h/l and typed text change nothing (no cursor, no dialog, no env write); during the focus prime a press reaches nothing and pointer positions neither wake it nor become the sample; after it a first pointer sample and jitter keep it inert; a real move wakes it: the catcher has the focus, keys reach the cursor and the shutdown dialog (focus on its keys), Esc dismisses; closing ends the state; a user opening is not inert"
   expect_flow "staged pending true target mshybrid env rtx" "the re-read shows MSHybrid pending; the env file stays"
   expect_flow "panel discrete current rows 3 buttons 2 [Switch,Switch] lock false" "nothing staged: two Switch buttons, no lock line"
   expect_flow "panel mshybrid pending rows 3 buttons 0 [] lock true" "MSHybrid staged: no switch or cancel button; the lock line is shown"
@@ -984,9 +1028,9 @@ EOF
   expect_flow "panel integrated pending rows 3 buttons 0 [] lock true" "Integrated staged: no button; the lock line is shown"
   expect_flow "round trip pending false env rtx" "after the round trip the RTX choice is still on disk"
   expect_flow "lockline mshybrid pending kind staged text true button true stop true offered true dialog staged open true :: The switch is staged. Shut down now to apply it?" "staged: Shut down now on the lock line, a cursor stop, opening the shutdown dialog"
-  expect_flow "shutdown keys mshybrid pending start 0 stray 13 moved 0 swallowed 13 open true toggles 1,0,1,0 enter-cancel closed true" "shutdown dialog: opens on Later; h, l, Space and other text keys change nothing and confirm nothing; arrows and Tab toggle; Enter on Later closes it"
-  expect_flow "shutdown keys flag refused start 0 stray 13 moved 0 swallowed 13 open true toggles 1,0,1,0 enter-cancel closed true" "the same for the leftover-flag shutdown dialog"
-  expect_flow "switch keys start 0 stray 13 moved 0 swallowed 13 open true toggles 1,0,1,0 enter-cancel closed true esc closed true after 1 reopened on 0 busy false" "switch dialog: opens on Cancel every time; stray keys do nothing; Esc dismisses; no switch asked for"
+  expect_flow "shutdown keys mshybrid pending hover rest 0 jitter 0 moved 0 keyed 1 kept 1 back 0 again 0 start 0 stray 13 moved 0 swallowed 13 open true toggles 1,0,1,0 enter-cancel closed true" "shutdown dialog: opens on Later; a hover never selects Shut down now (resting, jittering or after a real move); its keys select it and a hover over it keeps it; h, l, Space and other text keys change nothing and confirm nothing; arrows and Tab toggle; Enter on Later closes it"
+  expect_flow "shutdown keys flag refused hover rest 0 jitter 0 moved 0 keyed 1 kept 1 back 0 again 0 start 0 stray 13 moved 0 swallowed 13 open true toggles 1,0,1,0 enter-cancel closed true" "the same for the leftover-flag shutdown dialog"
+  expect_flow "switch keys hover rest 0 jitter 0 moved 0 keyed 1 kept 1 back 0 again 0 start 0 stray 13 moved 0 swallowed 13 open true toggles 1,0,1,0 enter-cancel closed true esc closed true after 1 reopened on 0 reopened hover 0 busy false" "switch dialog: opens on Cancel every time; a hover never selects Switch, even after a real move; its keys do; stray keys do nothing; Esc dismisses; no switch asked for"
   expect_flow "qt keys toggletoggletoggletoggleactivateactivateclose||" "the engine's Qt.Key codes are the model's: the dialog set acts, Space, h and l do not"
   expect_flow "panel flag before rows 3 buttons 2 [Switch,Switch] lock false" "a leftover firmware flag looks like nothing staged: two Switch buttons"
   expect_flow "lockline flag before kind  text false button false stop false :: " "no lock line before the refusal"
@@ -1048,7 +1092,9 @@ EOF
 # plain fake again, then the hanging fake with a switch asked for while its
 # read runs: the read ends on its timeout (TERM ignored, then KILL), the hung
 # pgrep that follows holds the check, and the watchdog refuses the switch
-# after Model.CHECK_TIMEOUT_MS: the phase returns to "" and nothing ran.
+# after Model.CHECK_TIMEOUT_MS: the phase returns to "" and nothing ran. A
+# switch asked for right then, while the stopped checks are still ending, is
+# refused with Model.CHECKS_ENDING_TEXT.
 # Skipped on hardware that is not available or on battery (the real AC is
 # read).
 debug_bounds_live() {
@@ -1061,11 +1107,13 @@ debug_bounds_live() {
     echo "skipped: plugin path contains a quote or backslash"
     return $SKIP
   fi
-  local cfg home bin fake ok=0 real_stat f log watchdog_text
+  local cfg home bin fake ok=0 real_stat f log watchdog_text ending_text
   # The flow lasts about CHECK_TIMEOUT_MS after startup.
   local LOAD_TIMEOUT_S=45
   real_stat=$(command -v stat) || return 1
   watchdog_text=$(node -e 'process.stdout.write(require("fs").readFileSync(process.argv[1], "utf8").match(/var CHECK_TIMEOUT_TEXT = "([^"]*)"/)[1])' \
+    "$PLUGIN_DIR/Model.js") || return 1
+  ending_text=$(node -e 'process.stdout.write(require("fs").readFileSync(process.argv[1], "utf8").match(/var CHECKS_ENDING_TEXT = "([^"]*)"/)[1])' \
     "$PLUGIN_DIR/Model.js") || return 1
   cfg=$(mktemp -d) || return 1
   home=$cfg/home fake=$cfg/fakebin bin=$cfg/bin/msi-mux-switch log=$cfg/log
@@ -1099,7 +1147,12 @@ END_SYSTEM
   cat >"$fake/pgrep" <<END_PGREP
 #!/bin/bash
 printf '%s\n' "\$*" >>"$cfg/pgrep.log"
-exec sleep 60
+# Hangs, and on the watchdog's TERM takes a moment to end (a stopped check
+# still ending); pgrep.term records the TERM and the end.
+trap 'kill "\$c" 2>/dev/null; printf "term\n" >>"$cfg/pgrep.term"; sleep 1.5; printf "ended\n" >>"$cfg/pgrep.term"; exit 143' TERM
+sleep 60 &
+c=\$!
+wait "\$c"
 END_PGREP
   chmod 755 "$bin" "$fake/stat" "$fake/pkexec" "$fake/omarchy-system" "$fake/pgrep"
   if [[ $(PATH="$fake:$PATH" command -v pkexec) != "$fake/pkexec" ||
@@ -1137,7 +1190,28 @@ ShellRoot {
   Connections {
     target: Plugin.MuxState
     function onDebugChanged() { shell.reads++ }
-    function onSwitchFinished(owner, outcome) { shell.outcome = outcome }
+    // The watchdog's refusal: once its handler is over (the checks told
+    // to stop, the fake pgrep still ending on its TERM), a switch asked for
+    // is refused with a reason the panel shows, not dropped in silence.
+    function onSwitchFinished(owner, outcome) {
+      if (shell.retrying) { shell.retryOutcome = outcome; return }
+      shell.outcome = outcome
+      if (shell.step < 5 || shell.retried) return
+      shell.retried = true
+      Qt.callLater(shell.retry)
+    }
+  }
+  property bool retried: false
+  property bool retrying: false
+  property var retryOutcome: null
+  property real retriedAt: 0
+  function retry() {
+    shell.retrying = true
+    var r = Plugin.MuxState.requestSwitch(holder, "mshybrid")
+    shell.retrying = false
+    shell.retriedAt = Date.now()
+    shell.log("retry request " + r + " phase '" + Plugin.MuxState.phase + "' :: "
+      + (shell.retryOutcome ? shell.retryOutcome.kind + " " + shell.retryOutcome.message : "nothing shown"))
   }
   Process { id: pick }
   function use(mode) { pick.command = ["cp", "--", "$cfg/mode" + mode, "$cfg/mode"]; pick.running = true }
@@ -1196,6 +1270,10 @@ ShellRoot {
         shell.log("watchdog kind " + shell.outcome.kind + " offer " + shell.outcome.offerShutdown
           + " after " + (shell.ms(shell.asked) >= Model.CHECK_TIMEOUT_MS - 200)
           + " phase '" + s.phase + "' busy " + s.busy + " :: " + shell.outcome.message)
+        shell.step = 8
+      } else if (shell.step === 8) {
+        // The stopped pgrep's end (pgrep.term) is awaited before quitting.
+        if (shell.retriedAt === 0 || Date.now() - shell.retriedAt < 3000) return
         shell.widget.destroy()
         shell.done()
       }
@@ -1223,6 +1301,14 @@ END_QML
     "the hanging read ends on its timeout (TERM ignored, then KILL) and says so; the switch is still being checked"
   expect_bound "watchdog kind error offer false after true phase '' busy false :: $watchdog_text" \
     "the hung pgrep holds the check; the watchdog refuses the switch and the phase returns to \"\""
+  expect_bound "retry request false phase '' :: error $ending_text" \
+    "a switch asked for while the stopped checks are still ending is refused with a visible reason, not dropped"
+  if [[ $(tr '\n' '|' <"$cfg/pgrep.term" 2>/dev/null) == "term|ended|" ]]; then
+    echo "ok   the watchdog stopped the hung pgrep (TERM), which then took a moment to end"
+  else
+    echo "FAIL pgrep.term: $(tr '\n' '|' <"$cfg/pgrep.term" 2>/dev/null)"
+    ok=1
+  fi
   if [[ $(cat "$cfg/pgrep.log" 2>/dev/null) == "-x msi-mux-switch" ]]; then
     echo "ok   pgrep was started once, after the debug read ended"
   else

@@ -23,7 +23,7 @@ const test = (name, fn) => tests.push([name, fn])
 
 const BIN = "/opt/msi-mux-switch/msi-mux-switch"
 const FLAGS = ["--allow-unsupported-hardware", "--allow-unvalidated-bios"]
-const JUGGERNAUT = { vendor: "Micro-Star International Co., Ltd.", model: "Vector 16 HX AI A2XWIG", board: "MS-15M3", bios: "E15M3IMS.10E" }
+const SUPPORTED_DMI = { vendor: "Micro-Star International Co., Ltd.", model: "Vector 16 HX AI A2XWIG", board: "MS-15M3", bios: "E15M3IMS.10E" }
 const CAPTURE = read("tests/fixtures/debug-discrete.json")
 const withFirmware = (over) => {
   const doc = JSON.parse(CAPTURE)
@@ -34,12 +34,12 @@ const withFirmware = (over) => {
 // ------------------------------------------------------------------ hardware
 
 test("hardware: the allowlisted machine is available, with both override flags", () => {
-  const d = M.hardwareDecision(JUGGERNAUT)
+  const d = M.hardwareDecision(SUPPORTED_DMI)
   assert.deepStrictEqual(d, { state: "available", source: "allowlist", flags: FLAGS, reason: "" })
   // A copy: changing it does not change the constant.
   d.flags.push("--x")
   assert.deepStrictEqual(M.OVERRIDE_FLAGS, FLAGS)
-  assert.deepStrictEqual(M.hardwareDecision(JUGGERNAUT).flags, FLAGS)
+  assert.deepStrictEqual(M.hardwareDecision(SUPPORTED_DMI).flags, FLAGS)
 })
 
 test("hardware: the tool's native table at 223ca06 needs no flags", () => {
@@ -60,12 +60,12 @@ test("hardware: one allowlist entry, exact", () => {
 
 test("hardware: any other MSI machine is unavailable, naming model, board and BIOS", () => {
   const cases = [
-    Object.assign({}, JUGGERNAUT, { bios: "E15M3IMS.10" }),
-    Object.assign({}, JUGGERNAUT, { bios: "E15M3IMS.10F" }),
-    Object.assign({}, JUGGERNAUT, { board: "MS-15M2" }),
-    Object.assign({}, JUGGERNAUT, { model: "Vector 16 HX AI A2XWIH" }),
+    Object.assign({}, SUPPORTED_DMI, { bios: "E15M3IMS.10" }),
+    Object.assign({}, SUPPORTED_DMI, { bios: "E15M3IMS.10F" }),
+    Object.assign({}, SUPPORTED_DMI, { board: "MS-15M2" }),
+    Object.assign({}, SUPPORTED_DMI, { model: "Vector 16 HX AI A2XWIH" }),
     { vendor: "MSI", model: "Raider", board: "MS-1", bios: "X" },
-    Object.assign({}, JUGGERNAUT, { bios: "e15m3ims.10e" })
+    Object.assign({}, SUPPORTED_DMI, { bios: "e15m3ims.10e" })
   ]
   for (const c of cases) {
     const d = M.hardwareDecision(c)
@@ -88,7 +88,7 @@ test("hardware: values are trimmed like the tool does", () => {
 
 test("hardware: non-MSI vendors are hidden, whatever the rest says", () => {
   for (const vendor of ["LENOVO", "ASUSTeK COMPUTER INC.", "", "msi", "Micro-Star", "QEMU", " ", "Dell Inc."]) {
-    const d = M.hardwareDecision(Object.assign({}, JUGGERNAUT, { vendor }))
+    const d = M.hardwareDecision(Object.assign({}, SUPPORTED_DMI, { vendor }))
     assert.strictEqual(d.state, "hidden", vendor)
     assert.deepStrictEqual(d.flags, [])
   }
@@ -101,7 +101,7 @@ test("hardware: non-MSI vendors are hidden, whatever the rest says", () => {
 test("DMI: the read script's answer, and nothing without its end line", () => {
   assert.deepStrictEqual(M.dmiArgv(), ["sh", "-c", M.DMI_SCRIPT, "msi-mux-dmi", "/sys/class/dmi/id"])
   const text = "sys_vendor=Micro-Star International Co., Ltd.\nproduct_name=Vector 16 HX AI A2XWIG\nboard_name=MS-15M3\nbios_version=E15M3IMS.10E\nend\n"
-  assert.deepStrictEqual(M.parseDmi(text), JUGGERNAUT)
+  assert.deepStrictEqual(M.parseDmi(text), SUPPORTED_DMI)
   assert.strictEqual(M.parseDmi(text.replace("end\n", "")), null)
   assert.deepStrictEqual(M.parseDmi("sys_vendor=\nend\n"), { vendor: "", model: "", board: "", bios: "" })
   assert.deepStrictEqual(M.parseDmi("product_name=a=b\nend\n").model, "a=b")
@@ -1178,18 +1178,83 @@ test("reopened panel: the widget wires the gate thinly, from opening to keys, cu
   assert.ok(/onActivateRequested: \{\s*if \(root\.keysInert\) return/.test(catcher))
   assert.ok(/onTabRequested: function\(direction\) \{ if \(!root\.keysInert\) root\.switchPanel\(direction\) \}/.test(catcher))
   assert.ok(/function pointAt\(key\) \{\s*if \(root\.keysInert\) return/.test(bar))
-  // The pointer: moves in window coordinates through pointerMove, and a
-  // press that goes on to the control under it.
-  assert.ok(/onPointChanged: root\.pointerAt\(panelHover\.point\.scenePosition\.x, panelHover\.point\.scenePosition\.y\)/.test(bar))
+  // The pointer: moves in window coordinates through inertPointer, gated on
+  // the panel's focus prime, and a press through inertPress.
+  assert.ok(/onPointChanged: if \(panelHover\.hovered\) root\.pointerAt\(panelHover\.point\.scenePosition\.x, panelHover\.point\.scenePosition\.y\)/.test(bar),
+    "a point while the pointer is not over the panel is no sample")
   const ptr = bar.slice(bar.indexOf("function pointerAt(x, y)"))
-  assert.ok(/if \(!root\.keysInert\) return\s*var m = Model\.pointerMove\(root\.pointerSample, x, y\)\s*root\.pointerSample = m\.sample\s*if \(m\.moved\) root\.wakeKeys\("pointer"\)/.test(ptr.slice(0, ptr.indexOf("\n  }\n"))))
-  assert.ok(/enabled: root\.keysInert\s*acceptedButtons: Qt\.AllButtons\s*onPressed: function\(mouse\) \{\s*root\.wakeKeys\("pointer"\)\s*mouse\.accepted = false/.test(bar))
+  assert.ok(/if \(!root\.keysInert\) return\s*var m = Model\.inertPointer\(root\.pointerSample, x, y, panel\.focusPrimed\)\s*root\.pointerSample = m\.sample\s*if \(m\.moved\) root\.wakeKeys\("pointer"\)/.test(ptr.slice(0, ptr.indexOf("\n  }\n"))))
+  assert.ok(!/Model\.pointerMove\(root\.pointerSample/.test(bar), "the inert sample never bypasses the focus prime")
+  assert.ok(/enabled: root\.keysInert\s*acceptedButtons: Qt\.AllButtons\s*onPressed: function\(mouse\) \{ root\.inertPressed\(mouse\) \}/.test(bar))
+  const press = bar.slice(bar.indexOf("function inertPressed(mouse)"))
+  assert.ok(/if \(Model\.inertPress\(panel\.focusPrimed\) === "wake"\) \{\s*root\.wakeKeys\("pointer"\)\s*mouse\.accepted = false\s*\} else mouse\.accepted = true/.test(press.slice(0, press.indexOf("\n  }\n"))))
+  // The panel's focus prime is the shell's own property.
+  assert.ok(/property bool focusPrimed: false/.test(fs.readFileSync("/usr/share/omarchy/shell/Ui/KeyboardPanel.qml", "utf8")) ||
+    !fs.existsSync("/usr/share/omarchy/shell/Ui/KeyboardPanel.qml"))
+})
+
+test("reopened panel: nothing during the focus prime wakes it or becomes the sample", () => {
+  // Before the prime: dropped, whatever the sample and however far.
+  for (const primed of [false, undefined, null, 1, "true"]) {
+    assert.deepStrictEqual(M.inertPointer(null, 100, 50, primed), { sample: null, moved: false }, String(primed))
+    assert.deepStrictEqual(M.inertPointer({ x: 0, y: 0 }, 500, 500, primed), { sample: null, moved: false }, String(primed))
+    assert.strictEqual(M.inertPress(primed), "swallow", String(primed))
+  }
+  assert.strictEqual(M.inertPress(true), "wake")
+  // After it: exactly pointerMove, the first position after the prime being
+  // the sample.
+  let r = M.inertPointer(M.inertPointer(null, 10, 10, false).sample, 200, 100, true)
+  assert.deepStrictEqual(r, { sample: { x: 200, y: 100 }, moved: false }, "the first primed position is the sample")
+  assert.deepStrictEqual(M.inertPointer(r.sample, 201.5, 98.5, true), { sample: { x: 200, y: 100 }, moved: false })
+  assert.deepStrictEqual(M.inertPointer(r.sample, 210, 100, true), { sample: { x: 200, y: 100 }, moved: true })
+  assert.deepStrictEqual(M.inertPointer(r.sample, NaN, 1, true), { sample: { x: 200, y: 100 }, moved: false })
+})
+
+test("dialogs: a hover never selects the confirm button, only the dialog's keys do", () => {
+  assert.strictEqual(M.DIALOG_SAFE_INDEX, 0)
+  // The safe button is always kept.
+  for (const o of [undefined, null, {}, { keyed: true }, { keyed: false }, { pointerMoved: true }])
+    assert.strictEqual(M.dialogSelection(0, o), 0, JSON.stringify(o))
+  // The confirm button: only from the keys. A hover is never keyed, whether
+  // or not the pointer moved (a layout change can slide the button under a
+  // resting pointer at any time).
+  assert.strictEqual(M.dialogSelection(1, { keyed: true }), 1)
+  for (const o of [undefined, null, {}, { keyed: false }, { keyed: 1 }, { keyed: "true" }, { pointerMoved: true }, { keyed: false, pointerMoved: true }])
+    assert.strictEqual(M.dialogSelection(1, o), 0, JSON.stringify(o))
+  // Anything that is not one of the two buttons is the safe one.
+  for (const i of [-1, 2, undefined, null, "1", NaN]) assert.strictEqual(M.dialogSelection(i, { keyed: true }), 0, String(i))
+})
+
+test("dialogs: the widget passes every selection change through dialogSelection", () => {
+  const bar = qmlCode("BarWidget.qml")
+  for (const id of ["confirmDialog", "shutdownDialog"]) {
+    assert.ok(new RegExp("onOpenedChanged: if \\(" + id + "\\.opened\\) root\\.dialogOpened\\(" + id + "\\)").test(bar), id)
+    assert.ok(new RegExp("onSelectedIndexChanged: root\\.keepDialogSelection\\(" + id + "\\)").test(bar), id)
+  }
+  const opened = bar.slice(bar.indexOf("function dialogOpened(dialog)"))
+  assert.ok(/\{\s*dialog\.selectedIndex = Model\.DIALOG_SAFE_INDEX\s*\}/.test(opened.slice(0, opened.indexOf("\n  }\n") + 4)))
+  const keep = bar.slice(bar.indexOf("function keepDialogSelection(dialog)"))
+  assert.ok(/var keep = Model\.dialogSelection\(dialog\.selectedIndex, \{ keyed: root\.dialogKeyed \}\)\s*if \(keep !== dialog\.selectedIndex\) dialog\.selectedIndex = keep/.test(keep.slice(0, keep.indexOf("\n  }\n"))))
+  // keyed is set only around the dialog keys' toggle.
+  const key = bar.slice(bar.indexOf("function dialogKey(dialog, what)"))
+  assert.ok(/if \(what === "toggle"\) \{\s*root\.dialogKeyed = true\s*dialog\.selectedIndex = dialog\.selectedIndex === 0 \? 1 : 0\s*root\.dialogKeyed = false\s*\}/.test(key.slice(0, key.indexOf("\n  }\n"))))
+  assert.strictEqual((bar.match(/root\.dialogKeyed = true/g) || []).length, 1)
+  // No pointer state gates the dialog's selection any more.
+  assert.ok(!/dialogPointer/.test(bar), "no pointer-moved path for the dialogs")
+  assert.ok(!/pointerMoved/.test(bar))
+})
+
+test("panel: closing it closes the dropdown's list", () => {
+  const bar = qmlCode("BarWidget.qml")
+  const opened = bar.slice(bar.indexOf("onOpenedChanged: {"))
+  const body = opened.slice(0, opened.indexOf("\n  }\n"))
+  assert.ok(/return\s*\}\s*root\.wakeKeys\("close"\)\s*envDropdown\.close\(\)/.test(body))
 })
 
 test("dialogs: each opens on its safe button (Cancel, Later), every time", () => {
   const bar = qmlCode("BarWidget.qml")
-  assert.ok(/onOpenedChanged: if \(confirmDialog\.opened\) confirmDialog\.selectedIndex = 0/.test(bar))
-  assert.ok(/onOpenedChanged: if \(shutdownDialog\.opened\) shutdownDialog\.selectedIndex = 0/.test(bar))
+  assert.ok(/onOpenedChanged: if \(confirmDialog\.opened\) root\.dialogOpened\(confirmDialog\)/.test(bar))
+  assert.ok(/onOpenedChanged: if \(shutdownDialog\.opened\) root\.dialogOpened\(shutdownDialog\)/.test(bar))
   // Index 0 is the cancel button in the shell's ConfirmDialog (handleKey:
   // Enter on 0 is canceled()).
   assert.ok(/cancelText: "Later"/.test(bar) && /cancelText: "Cancel"/.test(bar))
@@ -1219,6 +1284,13 @@ test("shutdown offer: never opened by itself when the panel reopened to show the
   assert.ok(/root\.shutdownOffered = true/.test(offer.slice(0, offer.indexOf("\n  }\n"))))
 })
 
+test("switch checks: a switch asked for while stopped checks are ending says why", () => {
+  assert.strictEqual(M.checksEndingProblem(true), M.CHECKS_ENDING_TEXT)
+  assert.ok(/Nothing was run\.$/.test(M.CHECKS_ENDING_TEXT))
+  assert.ok(/still ending/.test(M.CHECKS_ENDING_TEXT) && /Try again/.test(M.CHECKS_ENDING_TEXT))
+  for (const v of [false, undefined, null, 1, "true"]) assert.strictEqual(M.checksEndingProblem(v), "", String(v))
+})
+
 test("switch checks: a watchdog refuses a switch still being checked after CHECK_TIMEOUT_MS", () => {
   assert.strictEqual(M.CHECK_TIMEOUT_MS, 15000)
   assert.ok(M.CHECK_TIMEOUT_MS > (M.DEBUG_TIMEOUT_S + M.DEBUG_KILL_AFTER_S) * 1000 + 2000, "longer than a debug read can last")
@@ -1233,7 +1305,10 @@ test("switch checks: a watchdog refuses a switch still being checked after CHECK
   const req = state.slice(state.indexOf("function requestSwitch("))
   const reqBody = req.slice(0, req.indexOf("\n  }\n"))
   assert.ok(/checkWatchdog\.restart\(\)\s*return true/.test(reqBody), "armed with every request")
-  assert.ok(/if \(checkStat\.running \|\| checkAc\.running \|\| checkRunning\.running\) return false/.test(reqBody))
+  // A request while stopped checks are still ending is refused with a
+  // reason (finish, so the panel shows it), never dropped in silence.
+  assert.ok(/var ending = Model\.checksEndingProblem\(checkStat\.running \|\| checkAc\.running \|\| checkRunning\.running\)\s*if \(ending !== ""\) \{\s*root\.switchOwner = owner\s*root\.refused\(ending\)\s*return false\s*\}/.test(reqBody))
+  assert.ok(reqBody.indexOf("checksEndingProblem") < reqBody.indexOf("root.phase = \"checking\""), "before anything starts")
   const fin = state.slice(state.indexOf("function finish(outcome)"))
   assert.ok(/checkWatchdog\.stop\(\)/.test(fin.slice(0, fin.indexOf("\n  }\n"))))
   const start = state.slice(state.indexOf("function startSwitch()"))
@@ -1260,7 +1335,7 @@ test("manifest: identity, version and the settings schema", () => {
   assert.strictEqual(m.id, "io.github.rsd.msi-mux")
   assert.strictEqual(m.id, M.PLUGIN_ID)
   assert.strictEqual(m.name, "MSI GPU MUX")
-  assert.strictEqual(m.version, "0.2.5")
+  assert.strictEqual(m.version, "0.2.6")
   assert.strictEqual(m.license, "MIT")
   assert.deepStrictEqual(m.kinds, ["bar-widget"])
   assert.deepStrictEqual(m.entryPoints, { barWidget: "BarWidget.qml" })

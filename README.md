@@ -96,12 +96,19 @@ running the old code. Do not use `omarchy-refresh-shell`; it resets your
 
 1. `omarchy plugin disable io.github.rsd.msi-mux`, and `omarchy plugin remove
    io.github.rsd.msi-mux` to delete the folder too.
-2. If you ever picked Intel or RTX as the base GPU, delete the one file the
-   plugin writes, then log out and in:
-   `rm ~/.config/uwsm/env.d/90-msi-mux-gpu`
+2. If you ever picked Intel or RTX as the base GPU, delete the file the
+   plugin writes and its two temporary names (the same command **Auto**
+   runs), then log out and in:
+   `cd ~/.config/uwsm/env.d && rm -f -- 90-msi-mux-gpu .90-msi-mux-gpu.tmp 90-msi-mux-gpu.new`
 
-The plugin writes nothing else. msi-mux-switch and its folder are yours to keep
-or delete.
+That pick is the plugin's only write. It runs `mkdir -p ~/.config/uwsm/env.d`
+(the folder is uwsm's; leave it), removes `90-msi-mux-gpu.new` there (a
+temporary file an earlier version could leave), writes the text to the
+temporary file `.90-msi-mux-gpu.tmp` beside the env file and renames it over
+`90-msi-mux-gpu` with `mv -fT`; on a failure it removes the temporary file.
+Nothing else is written; after a pick, `90-msi-mux-gpu` is the only one of
+these files left.
+msi-mux-switch and its folder are yours to keep or delete.
 
 ## Backend setup
 
@@ -209,11 +216,18 @@ The **Hyprland base GPU** dropdown is shown in every mode:
 | **Intel** | Hyprland renders on the Intel GPU. |
 | **RTX** | Hyprland renders on the RTX. Verified: aquamarine logs "gpu /dev/dri/card1 becomes primary drm", and Hyprland starts with all outputs up. |
 
-Intel or RTX writes exactly one file, creating `~/.config/uwsm/env.d` if needed:
+Intel or RTX writes one file, through a temporary file beside it:
 
 ```
 ~/.config/uwsm/env.d/90-msi-mux-gpu
 ```
+
+The write runs `mkdir -p ~/.config/uwsm/env.d`, removes
+`~/.config/uwsm/env.d/90-msi-mux-gpu.new` (a temporary file an earlier version
+could leave there, which uwsm would source), writes the text to
+`.90-msi-mux-gpu.tmp` in the same folder (its leading dot keeps uwsm from
+sourcing it) and renames that over the file with `mv -fT`. On a failure the
+temporary file is removed.
 
 uwsm sources every file in that folder with `sh` at login, before Hyprland
 starts. This one sets `AQ_DRM_DEVICES`, which tells Hyprland's backend
@@ -327,12 +341,14 @@ What the plugin runs and writes, and when:
   them.
 - **Shutdown**: `omarchy-system shutdown` runs only from **Shut down now** in
   the shutdown confirmation dialog.
-- **Files**: the one file it writes is `~/.config/uwsm/env.d/90-msi-mux-gpu`,
-  only when you pick Intel or RTX in the dropdown. That write creates `env.d`
-  if it is missing (`mkdir -p`), goes through a dot-prefixed temporary file
-  beside the file, renamed over it, and removes `90-msi-mux-gpu.new`, a
-  temporary file an earlier version could leave there. Auto removes the file
-  (and both temporary names, with `rm -f`).
+- **Files**: it writes only `~/.config/uwsm/env.d/90-msi-mux-gpu` and, for
+  the moment of the write, its temporary file `.90-msi-mux-gpu.tmp` in the
+  same folder, only when you pick Intel or RTX in the dropdown. That write
+  runs `mkdir -p ~/.config/uwsm/env.d`, removes `90-msi-mux-gpu.new` there (a
+  temporary file an earlier version could leave) and any leftover
+  `.90-msi-mux-gpu.tmp`, writes the text to `.90-msi-mux-gpu.tmp` and renames
+  it over the file with `mv -fT`; on a failure it removes the temporary file.
+  Auto runs `rm -f --` on the file and those two temporary names.
 - **As you**, read-only: the DMI strings under `/sys/class/dmi/id/`, `stat` of
   the binary and its folders, the AC state under `/sys/class/power_supply`,
   `pgrep -x msi-mux-switch`, the env file above, and `msi-mux-switch --debug

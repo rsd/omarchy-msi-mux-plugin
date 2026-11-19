@@ -42,10 +42,14 @@ import "Model.js" as Model
 // ConfirmDialog's keys act (Model.dialogKeyAction: Left/Right/Tab pick its
 // button, Enter activates it, Esc dismisses it); letters and Space do
 // nothing. Each dialog opens on its safe button (Cancel, Later), and closes
-// the dropdown's list. A panel that reopened itself to show a finished
-// switch is key-inert (inertKeys has the focus: Esc closes, nothing else
-// acts, no cursor shows) until the pointer moves over it or presses on it,
-// or the user opens the panel (Model.keysInert).
+// the dropdown's list. Only the dialog's keys select its confirm button: a
+// hover over it leaves the safe button selected (Model.dialogSelection),
+// and a click on either button still acts on it.
+// A panel that reopened itself to show a finished switch is key-inert
+// (inertKeys has the focus: Esc closes, nothing else acts, no cursor shows)
+// until the pointer moves over it or presses on it after the panel's first
+// 75 ms (Model.inertPointer, Model.inertPress), or the user opens the panel
+// (Model.keysInert). Closing the panel closes the dropdown's list.
 //
 // Every Text here declares textFormat: Text.PlainText (tool messages are
 // shown); the model test checks each Text block for its own declaration.
@@ -99,11 +103,16 @@ Panel {
   readonly property bool dialogOpen: confirmDialog.opened || shutdownDialog.opened
 
   // A panel that reopened itself is key-inert until a deliberate action
-  // (Model.keysInert); pointerSample is its first pointer position
-  // (Model.pointerMove). keyTarget names the item with the keyboard focus.
+  // (Model.keysInert); pointerSample is its first pointer position after
+  // the panel's focus prime (Model.inertPointer). keyTarget names the item
+  // with the keyboard focus.
   property bool keysInert: false
   property var pointerSample: null
   readonly property string keyTarget: Model.keyTarget({ inert: root.keysInert, dialogOpen: root.dialogOpen })
+
+  // The open dialog's selection (Model.dialogSelection): dialogKeyed while
+  // its keys change it.
+  property bool dialogKeyed: false
 
   // ------------------------------------------------------------- style
 
@@ -179,8 +188,11 @@ Panel {
   // The open dialog's buttons: "toggle", "activate" or "close" (see
   // Model.dialogKeyAction); anything else does nothing.
   function dialogKey(dialog, what) {
-    if (what === "toggle") dialog.selectedIndex = dialog.selectedIndex === 0 ? 1 : 0
-    else if (what === "activate") {
+    if (what === "toggle") {
+      root.dialogKeyed = true
+      dialog.selectedIndex = dialog.selectedIndex === 0 ? 1 : 0
+      root.dialogKeyed = false
+    } else if (what === "activate") {
       if (dialog.selectedIndex === 0) dialog.canceled()
       else dialog.confirmed()
     } else if (what === "close") dialog.canceled()
@@ -188,6 +200,18 @@ Panel {
 
   function openDialog() {
     return confirmDialog.opened ? confirmDialog : (shutdownDialog.opened ? shutdownDialog : null)
+  }
+
+  // A dialog opening: its safe button.
+  function dialogOpened(dialog) {
+    dialog.selectedIndex = Model.DIALOG_SAFE_INDEX
+  }
+
+  // Every change of a dialog's selection (its keys, or the hover of the
+  // shell's ConfirmDialog) goes through Model.dialogSelection.
+  function keepDialogSelection(dialog) {
+    var keep = Model.dialogSelection(dialog.selectedIndex, { keyed: root.dialogKeyed })
+    if (keep !== dialog.selectedIndex) dialog.selectedIndex = keep
   }
 
   // Every key while a dialog is open lands here (dialogKeys) and goes no
@@ -211,12 +235,22 @@ Panel {
   }
 
   // A pointer position over the panel, in window coordinates: a real move
-  // wakes a key-inert panel (Model.pointerMove).
+  // after the focus prime wakes a key-inert panel (Model.inertPointer).
   function pointerAt(x, y) {
     if (!root.keysInert) return
-    var m = Model.pointerMove(root.pointerSample, x, y)
+    var m = Model.inertPointer(root.pointerSample, x, y, panel.focusPrimed)
     root.pointerSample = m.sample
     if (m.moved) root.wakeKeys("pointer")
+  }
+
+  // A press on a key-inert panel (Model.inertPress): after the focus prime
+  // it wakes the panel and goes on to the control under it; before, it
+  // reaches nothing.
+  function inertPressed(mouse) {
+    if (Model.inertPress(panel.focusPrimed) === "wake") {
+      root.wakeKeys("pointer")
+      mouse.accepted = false
+    } else mouse.accepted = true
   }
 
   function keyTargetItem() {
@@ -268,6 +302,7 @@ Panel {
       return
     }
     root.wakeKeys("close")
+    envDropdown.close()
     MuxState.releaseOpen(root)
     root.confirmMode = ""
     root.shutdownOffered = false
@@ -374,10 +409,11 @@ Panel {
 
       // The pointer moving over the panel (in window coordinates, which the
       // card's opening animation does not shift) or pressing on it wakes a
-      // key-inert panel. The press goes on to the control under it.
+      // key-inert panel (pointerAt, inertPressed). A point while the
+      // pointer is not over the panel (the reset as it leaves) is no sample.
       HoverHandler {
         id: panelHover
-        onPointChanged: root.pointerAt(panelHover.point.scenePosition.x, panelHover.point.scenePosition.y)
+        onPointChanged: if (panelHover.hovered) root.pointerAt(panelHover.point.scenePosition.x, panelHover.point.scenePosition.y)
       }
 
       MouseArea {
@@ -385,10 +421,7 @@ Panel {
         z: 20
         enabled: root.keysInert
         acceptedButtons: Qt.AllButtons
-        onPressed: function(mouse) {
-          root.wakeKeys("pointer")
-          mouse.accepted = false
-        }
+        onPressed: function(mouse) { root.inertPressed(mouse) }
       }
 
       Flickable {
@@ -646,7 +679,8 @@ Panel {
         cancelText: "Cancel"
         confirmText: "Switch"
         fontFamily: root.fontFamily
-        onOpenedChanged: if (confirmDialog.opened) confirmDialog.selectedIndex = 0
+        onOpenedChanged: if (confirmDialog.opened) root.dialogOpened(confirmDialog)
+        onSelectedIndexChanged: root.keepDialogSelection(confirmDialog)
         onCanceled: root.confirmMode = ""
         onConfirmed: root.confirmSwitch()
       }
@@ -660,7 +694,8 @@ Panel {
         cancelText: "Later"
         confirmText: "Shut down now"
         fontFamily: root.fontFamily
-        onOpenedChanged: if (shutdownDialog.opened) shutdownDialog.selectedIndex = 0
+        onOpenedChanged: if (shutdownDialog.opened) root.dialogOpened(shutdownDialog)
+        onSelectedIndexChanged: root.keepDialogSelection(shutdownDialog)
         onCanceled: root.shutdownOffered = false
         onConfirmed: root.shutDownNow()
       }
