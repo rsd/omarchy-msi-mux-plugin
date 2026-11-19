@@ -446,7 +446,7 @@ Panel {
           PanelHero {
             width: parent.width
             title: Model.DISPLAY_NAME
-            meta: Model.summary(MuxState.debug)
+            meta: Model.summary(MuxState.debug, MuxState.debugBlocked)
             foreground: root.foreground
             fontFamily: root.fontFamily
             iconOpacity: root.glyph.dimmed ? 0.5 : 1.0

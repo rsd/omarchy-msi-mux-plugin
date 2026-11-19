@@ -1,13 +1,17 @@
 #!/bin/bash
 
 # setup.sh against temporary trees, a fake sudo and a fake stat; never for
-# real. The fake sudo records its arguments and plays the four commands
+# real. The fake sudo records its arguments and plays the five commands
 # setup.sh may run: chown and chmod of the folder mark it as fixed, install
 # copies the binary and marks the copy, mv renames the copy over the binary
-# and marks it. The fake stat reports a marked path as root-owned with mode
-# 755, a path in the "others" list as owned by uid 4242, and anything else as
-# the real stat does. Every run has PATH starting with the fakes and a
-# temporary HOME; a run is refused if `sudo` would resolve anywhere else.
+# and marks it, rm removes a path. MM_SUDO_NOOP=1 makes every command do
+# nothing, MM_SUDO_NOOP=<command> just that one. The fake stat (for setup.sh's
+# owner-and-mode query only) reports a marked path as root-owned with mode
+# 755, a path in the "others" list as owned by uid 4242, a path in the
+# "root-real" list (checked first) as root-owned with its real mode, and
+# anything else as the real stat does. Every run has PATH starting with the
+# fakes and a temporary HOME; a run is refused if `sudo` would resolve
+# anywhere else.
 
 set -u
 
@@ -29,22 +33,28 @@ trap 'chmod -R u+rwx "$T" 2>/dev/null; rm -rf "$T"' EXIT
 FAKE=$T/fakebin
 ROOTS=$T/roots       # paths the fake stat reports as root:root 755
 OTHERS=$T/others     # paths the fake stat reports as owned by uid 4242
+ROOTREAL=$T/rootreal # paths the fake stat reports as root-owned, real mode
 SUDO_LOG=$T/sudo.log
 mkdir -p "$FAKE" "$T/home"
 : >"$ROOTS"
 : >"$OTHERS"
+: >"$ROOTREAL"
 
 cat >"$FAKE/sudo" <<EOF
 #!/bin/bash
 printf '%s\n' "\$*" >>"$SUDO_LOG"
 [[ \${MM_SUDO_FAIL:-} == 1 ]] && exit 1
-[[ \${MM_SUDO_NOOP:-} == 1 ]] && exit 0
+[[ \${MM_SUDO_NOOP:-} == 1 || \${MM_SUDO_NOOP:-} == "\$1" ]] && exit 0
 mark() { printf '%s\n' "\$1" >>"$ROOTS"; }
 if [[ \$1 == chown && \$2 == -h && \$3 == root:root && \$4 == -- && \$# == 5 ]]; then
   mark "\$5"
   # The race setup.sh guards against: the binary swapped for a link while
   # sudo asks for the password.
   if [[ -n \${MM_SUDO_SWAP:-} ]]; then rm -f -- "\$MM_SUDO_SWAP"; ln -s /etc/hostname "\$MM_SUDO_SWAP"; fi
+  # The binary made writable by others, or rewritten in place (same file,
+  # same mode), at the same moment.
+  if [[ -n \${MM_SUDO_CHMOD:-} ]]; then chmod 757 -- "\$MM_SUDO_CHMOD"; fi
+  if [[ -n \${MM_SUDO_REWRITE:-} ]]; then printf 'echo changed\\n' >>"\$MM_SUDO_REWRITE"; fi
   exit 0
 fi
 if [[ \$1 == chmod && \$2 == 755 && \$3 == -- && \$# == 4 ]]; then
@@ -59,6 +69,10 @@ if [[ \$1 == mv && \$2 == -f && \$3 == -- && \$# == 5 ]]; then
   mv -f -- "\$4" "\$5" && mark "\$5"
   exit
 fi
+if [[ \$1 == rm && \$2 == -f && \$3 == -- && \$# == 4 ]]; then
+  rm -f -- "\$4"
+  exit
+fi
 exit 1
 EOF
 
@@ -66,12 +80,19 @@ EOF
 cat >"$FAKE/stat" <<EOF
 #!/bin/bash
 path=\${4:-}
-if [[ \$1 == -c && \$3 == -- ]] && grep -qxF -- "\$path" "$ROOTS"; then
+fake=0
+[[ \${1:-} == -c && \${2:-} == '%u %f %U' && \${3:-} == -- && \$# == 4 ]] && fake=1
+if ((fake)) && grep -qxF -- "\$path" "$ROOTREAL"; then
+  raw=\$("$REAL_STAT" -c %f -- "\$path") || exit 1
+  printf '0 %s root\n' "\$raw"
+  exit 0
+fi
+if ((fake)) && grep -qxF -- "\$path" "$ROOTS"; then
   raw=\$("$REAL_STAT" -c %f -- "\$path") || exit 1
   printf '0 %x root\n' "\$(( (16#\$raw & 16#F000) | 8#755 ))"
   exit 0
 fi
-if [[ \$1 == -c && \$3 == -- ]] && grep -qxF -- "\$path" "$OTHERS"; then
+if ((fake)) && grep -qxF -- "\$path" "$OTHERS"; then
   raw=\$("$REAL_STAT" -c %f -- "\$path") || exit 1
   printf '4242 %s someone\n' "\$raw"
   exit 0
@@ -261,6 +282,44 @@ expect "a failing directory further up is refused" 1 "A directory above $T/b/x/o
 if grep -qF "$T/b/x/opt is owned by" <<<"$OUT"; then ok "the failing ancestor is named"; else fail "the failing ancestor is not named"; fi
 no_sudo "further ancestor"
 
+# A directory further up owned by root but writable by others.
+make_tree "$T/g"
+chmod 757 "$T/g/opt"
+printf '%s\n' "$T/g/opt" >>"$ROOTREAL"
+run_setup "y\n" "$T/g/opt/msi-mux-switch/msi-mux-switch"
+expect "a root-owned but other-writable directory further up is refused" 1 "$T/g/opt is writable by group or others."
+if grep -qF "A directory above $T/g/opt/msi-mux-switch fails the check:" <<<"$OUT"; then ok "it is reported as a directory above"; else fail "not reported as a directory above"; fi
+no_sudo "other-writable ancestor"
+
+# --- the binary itself: another user's, or writable by group or others
+
+make_tree "$T/ob"
+printf '%s\n' "$T/ob/opt/msi-mux-switch/msi-mux-switch" >>"$OTHERS"
+run_setup "y\n" "$T/ob/opt/msi-mux-switch/msi-mux-switch"
+expect "a binary owned by another user is refused" 1 "Refusing to install $T/ob/opt/msi-mux-switch/msi-mux-switch:"
+if grep -qF "  $T/ob/opt/msi-mux-switch/msi-mux-switch is owned by someone, not by you or root." <<<"$OUT"; then ok "the other owner is named"; else fail "the other owner is not named"; quote "$OUT"; fi
+if grep -qF "Nothing was changed." <<<"$OUT"; then ok "another user's binary: nothing was changed"; else fail "no 'Nothing was changed.'"; fi
+no_sudo "other user's binary"
+
+make_tree "$T/ow"
+chmod 757 "$T/ow/opt/msi-mux-switch/msi-mux-switch"
+run_setup "y\n" "$T/ow/opt/msi-mux-switch/msi-mux-switch"
+expect "an other-writable binary is refused" 1 "Refusing to install $T/ow/opt/msi-mux-switch/msi-mux-switch:"
+if grep -qF "  $T/ow/opt/msi-mux-switch/msi-mux-switch is writable by group or others." <<<"$OUT"; then ok "the writable binary is named"; else fail "the writable binary is not named"; quote "$OUT"; fi
+# A file others could write may hold their content (or still be written
+# through a descriptor they opened earlier): the hint is a fresh copy, never
+# chmod.
+if grep -qF "Rebuild or re-download msi-mux-switch into a folder only you can write" <<<"$OUT" && ! grep -q "chmod" <<<"$OUT"; then
+  ok "the writable binary's hint is a fresh copy, not chmod"
+else
+  fail "the writable binary's hint is not a fresh copy (or suggests chmod)"; quote "$OUT"
+fi
+no_sudo "other-writable binary"
+chmod 775 "$T/ow/opt/msi-mux-switch/msi-mux-switch"
+run_setup "y\n" "$T/ow/opt/msi-mux-switch/msi-mux-switch"
+expect "a group-writable binary is refused" 1 "Refusing to install $T/ow/opt/msi-mux-switch/msi-mux-switch:"
+no_sudo "group-writable binary"
+
 # --- the commands, declined and accepted
 
 run_setup "n\n" "$BIN"
@@ -285,7 +344,13 @@ expect "a failing sudo is reported" 1 "A command failed"
 if [[ $(cat "$SUDO_LOG") == "chown -h root:root -- $DIR" ]]; then ok "a failing first command stops the rest"; else fail "sudo ran: $(tr '\n' '|' <"$SUDO_LOG")"; fi
 
 MM_SUDO_NOOP=1 run_setup "y\n" "$BIN"
-expect "sudo that fixes nothing: the re-check says so" 1 "Still not safe:"
+expect "sudo that makes no copy: nothing is moved" 1 "The copy $DIR/.msi-mux-switch.new cannot be checked"
+if grep -q '^mv ' "$SUDO_LOG"; then fail "mv ran without a checked copy"; else ok "no mv without a checked copy"; fi
+
+MM_SUDO_NOOP="mv" run_setup "y\n" "$BIN"
+expect "an mv that changes nothing: the final check says so" 1 "Still not safe:"
+if grep -qF "  $BIN is owned by $(id -un), not root." <<<"$(sed -n '/Still not safe:/,$p' <<<"$OUT")"; then ok "the final check names the binary"; else fail "the final check does not name the binary"; quote "$OUT"; fi
+rm -f -- "$DIR/.msi-mux-switch.new"
 
 # The binary swapped for a link between the check and sudo: the folder is
 # fixed, the binary is not touched (no install, no mv).
@@ -297,6 +362,30 @@ if [[ $(cat "$SUDO_LOG") == "$(printf '%s\n%s' "chown -h root:root -- $T/r/opt/m
 else
   fail "sudo ran: $(tr '\n' '|' <"$SUDO_LOG")"
 fi
+
+# The binary rewritten in place between the check and the copy: the staged
+# copy does not match the checksum, so it is removed and nothing is moved.
+make_tree "$T/c"
+CBIN=$T/c/opt/msi-mux-switch/msi-mux-switch
+CDIR=$T/c/opt/msi-mux-switch
+MM_SUDO_REWRITE=$CBIN run_setup "y\n" "$CBIN"
+expect "a binary changed after the check: refused" 1 "$CBIN changed after it was checked"
+if grep -qF "  sudo rm -f -- $CDIR/.msi-mux-switch.new" <<<"$OUT"; then ok "the removal of the copy is shown"; else fail "the removal is not shown"; quote "$OUT"; fi
+want_log=$(printf '%s\n' "chown -h root:root -- $CDIR" "chmod 755 -- $CDIR" \
+  "install -o root -g root -m 755 -- $CBIN $CDIR/.msi-mux-switch.new" "rm -f -- $CDIR/.msi-mux-switch.new")
+if [[ $(cat "$SUDO_LOG") == "$want_log" ]]; then
+  ok "changed binary: the copy is removed, no mv"
+else
+  fail "sudo ran: $(tr '\n' '|' <"$SUDO_LOG")"
+fi
+if [[ ! -e $CDIR/.msi-mux-switch.new ]]; then ok "no staged copy is left"; else fail "the staged copy is left"; fi
+
+# The binary made other-writable during sudo: the recheck stops before the copy.
+make_tree "$T/m"
+MBIN=$T/m/opt/msi-mux-switch/msi-mux-switch
+MM_SUDO_CHMOD=$MBIN run_setup "y\n" "$MBIN"
+expect "a binary made writable during sudo: stops after the folder" 1 "$MBIN is writable by group or others."
+if [[ $(wc -l <"$SUDO_LOG") == 2 ]]; then ok "only the folder's two commands ran"; else fail "sudo ran: $(tr '\n' '|' <"$SUDO_LOG")"; fi
 
 ino_before=$("$REAL_STAT" -c %i -- "$BIN")
 run_setup "y\n" "$BIN"

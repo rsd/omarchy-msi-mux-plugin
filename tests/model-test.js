@@ -186,7 +186,7 @@ test("ownership: a symlink is refused, even root-owned", () => {
   const v = verdict(replaceLine(ROOT_OK, BIN, st(0, "a1ff", "root", BIN)))
   assert.strictEqual(v.kind, "symlink")
   assert.strictEqual(v.ok, false)
-  assert.strictEqual(M.binaryPresent(BIN, M.parseStat(replaceLine(ROOT_OK, BIN, st(0, "a1ff", "root", BIN)))), false)
+  assert.deepStrictEqual(M.debugReadArgv(BIN, M.parseStat(replaceLine(ROOT_OK, BIN, st(0, "a1ff", "root", BIN))), FLAGS), [])
 })
 
 test("ownership: a writable or user-owned ancestor is refused, naming it", () => {
@@ -209,14 +209,14 @@ test("ownership: the machine as it is today (file and folder owned by raul)", ()
   const today = [st(1000, "81ed", "raul", BIN), st(1000, "41ed", "raul", "/opt/msi-mux-switch"), st(0, "41ed", "root", "/opt"), st(0, "416d", "root", "/")].join("\n")
   const v = verdict(today)
   assert.strictEqual(v.reason, BIN + " is owned by raul, not root.")
-  assert.strictEqual(M.binaryPresent(BIN, M.parseStat(today)), true, "the read-only debug read still runs")
+  assert.deepStrictEqual(M.debugReadArgv(BIN, M.parseStat(today), FLAGS), [], "not even the read-only debug read runs it")
 })
 
 test("ownership: missing binary, not a file, and a bad setting", () => {
   const missing = ROOT_OK.split("\n").filter(l => !l.endsWith("\t" + BIN)).join("\n")
   assert.deepStrictEqual(verdict(missing), { ok: false, kind: "missing", reason: "msi-mux-switch was not found at " + BIN + "." })
   assert.ok(M.setupHelps(verdict(missing)))
-  assert.strictEqual(M.binaryPresent(BIN, M.parseStat(missing)), false)
+  assert.deepStrictEqual(M.debugReadArgv(BIN, M.parseStat(missing), FLAGS), [])
   assert.strictEqual(verdict(replaceLine(ROOT_OK, BIN, st(0, "41ed", "root", BIN))).kind, "notfile")
   const bad = M.ownershipVerdict("relative", {})
   assert.strictEqual(bad.kind, "invalid")
@@ -259,6 +259,7 @@ test("argv: the debug read, as the user, with the hardware's flags, under a time
   assert.deepStrictEqual(M.debugArgv(BIN, FLAGS), ["bash", "-c", M.DEBUG_SCRIPT, "msi-mux-debug"].concat(command, FLAGS))
   assert.deepStrictEqual(M.debugArgv(BIN, []), ["bash", "-c", M.DEBUG_SCRIPT, "msi-mux-debug"].concat(command))
   assert.deepStrictEqual(M.debugArgv("relative/msi-mux-switch", FLAGS), [])
+  assert.strictEqual(typeof M.binaryPresent, "undefined", "no ungated presence check is left to run the binary on")
   // The script's only spliced text is the cap; the command is "$@".
   assert.strictEqual(M.DEBUG_MAX_BYTES, 1048576)
   const spliced = M.DEBUG_SCRIPT.replace(/head -c 1048577/g, "").replace(/-gt 1048576/g, "")
@@ -266,6 +267,34 @@ test("argv: the debug read, as the user, with the hardware's flags, under a time
   assert.strictEqual((M.DEBUG_SCRIPT.match(/head -c 1048577 \| tr '\\000' '\\032'/g) || []).length, 2, "both streams capped while read")
   assert.ok(/out=\$\("\$@" 3>&- \| head -c/.test(M.DEBUG_SCRIPT), "the command is \"$@\", read through head")
   assert.ok(!/\beval\b|\$\*/.test(M.DEBUG_SCRIPT))
+})
+
+test("argv: the debug read runs the binary only when it passes the switch's ownership gate", () => {
+  const ok = M.parseStat(ROOT_OK)
+  assert.deepStrictEqual(M.debugReadArgv(BIN, ok, FLAGS), M.debugArgv(BIN, FLAGS), "root-owned: the usual argv")
+  assert.deepStrictEqual(M.debugReadArgv(BIN, ok, []), M.debugArgv(BIN, []))
+  const refused = {
+    "owned by uid 1000": replaceLine(ROOT_OK, BIN, st(1000, "81ed", "raul", BIN)),
+    "group-writable binary": replaceLine(ROOT_OK, BIN, st(0, "81fd", "root", BIN)),
+    "group-writable ancestor": replaceLine(ROOT_OK, "/opt", st(0, "41fd", "root", "/opt")),
+    "user-owned ancestor": replaceLine(ROOT_OK, "/opt/msi-mux-switch", st(1000, "41ed", "raul", "/opt/msi-mux-switch")),
+    "symlinked binary": replaceLine(ROOT_OK, BIN, st(0, "a1ff", "root", BIN)),
+    "symlinked ancestor": replaceLine(ROOT_OK, "/opt", st(0, "a1ff", "root", "/opt")),
+    "ancestor not stat'ed": ROOT_OK.split("\n").filter(l => !l.endsWith("\t/opt")).join("\n"),
+    "missing binary": ROOT_OK.split("\n").filter(l => !l.endsWith("\t" + BIN)).join("\n")
+  }
+  for (const [why, text] of Object.entries(refused)) {
+    assert.strictEqual(M.ownershipVerdict(BIN, M.parseStat(text)).ok, false, why)
+    assert.deepStrictEqual(M.debugReadArgv(BIN, M.parseStat(text), FLAGS), [], why)
+  }
+  for (const m of M.USER_MOUNTS) {
+    const p = m + "/x/msi-mux-switch"
+    const all = M.parseStat([st(0, "81ed", "root", p)].concat(M.ancestorDirs(p).map(d => st(0, "41ed", "root", d))).join("\n"))
+    assert.deepStrictEqual(M.debugReadArgv(p, all, FLAGS), [], p + ": a user mount, whatever stat says")
+  }
+  assert.deepStrictEqual(M.debugReadArgv(BIN, {}, FLAGS), [], "no stat, no read")
+  assert.deepStrictEqual(M.debugReadArgv(BIN, undefined, FLAGS), [])
+  assert.deepStrictEqual(M.debugReadArgv("relative/msi-mux-switch", ok, FLAGS), [])
 })
 
 test("argv: pkexec switch, exact array, no shell", () => {
@@ -358,6 +387,14 @@ test("debug: firmware unavailable, malformed JSON, and a failed run", () => {
   assert.ok(d.error.includes("exit status 1"))
   assert.strictEqual(M.parseDebug("", "", -1).ok, false)
   assert.strictEqual(M.summary(M.emptyDebug()), "Reading the GPU mode…")
+  // No read runs while the backend is refused: the mode is unknown, not being read.
+  assert.strictEqual(M.summary(M.emptyDebug(), true), "GPU mode unknown")
+  assert.strictEqual(M.summary(M.emptyDebug(), false), "Reading the GPU mode…")
+  // A refused backend outweighs an earlier good read: its mode is no longer trusted.
+  const okRead = { ok: true, error: "", current: "mshybrid", target: "mshybrid", pending: false, modes: M.MODES }
+  assert.strictEqual(M.summary(okRead, false), "Current: MSHybrid")
+  assert.strictEqual(M.summary(okRead, true), "GPU mode unknown")
+  assert.strictEqual(M.summary(Object.assign({}, okRead, { pending: true, target: "integrated" }), true), "GPU mode unknown")
 })
 
 // What DEBUG_SCRIPT prints for a command's stdout, stderr and status.
@@ -804,6 +841,12 @@ test("dialogs: the mode and the full shutdown are named; Integrated warns unless
   // No cancel and no replace wording: a staged switch can be neither.
   assert.strictEqual(M.confirmMessage.length, 2, "no isCancel or staged-target parameter")
   for (const m of M.MODES) assert.ok(!/cancel|replaces/i.test(M.confirmMessage(m, true)), m)
+  // The backend's own reminder (recovery_key_warning): the recovery key, off this laptop.
+  for (const m of M.MODES) for (const w of [true, false]) {
+    const msg = M.confirmMessage(m, w)
+    assert.ok(msg.includes("\n\n" + M.RECOVERY_KEY_TEXT), m + " " + w)
+    assert.ok(/recovery key/.test(M.RECOVERY_KEY_TEXT) && /off this laptop/.test(M.RECOVERY_KEY_TEXT))
+  }
   assert.strictEqual(M.warnSetting(undefined), true)
   assert.strictEqual(M.warnSetting(false), false)
   assert.ok(/Shut down now/.test(M.SHUTDOWN_MESSAGE) && /full shutdown/.test(M.SHUTDOWN_MESSAGE))
@@ -1458,9 +1501,47 @@ test("debug read: parsed through parseDebugRead; one run's end is never taken fo
   const state = qmlCode("MuxState.qml")
   assert.ok(/root\.debug = Model\.parseDebugRead\(debugProc\.out, debugProc\.err, debugProc\.exitCode\)/.test(state))
   assert.ok(!/Model\.parseDebug\(/.test(state))
-  assert.ok(/var argv = Model\.debugArgv\(root\.binaryPath, root\.hardware\.flags\)/.test(state))
   assert.ok(/debugProc\.run = \+\+root\.debugRuns/.test(state))
   assert.ok(/var run = debugProc\.run\s*Qt\.callLater\(function\(\) \{\s*if \(debugProc\.run !== run \|\| debugProc\.running\) return\s*debugProc\.exited = true/.test(state))
+})
+
+test("debug read: only through the ownership gate, on the stat taken right before it", () => {
+  const state = qmlCode("MuxState.qml")
+  for (const file of qmlFiles) {
+    assert.ok(!/Model\.debugArgv\(|Model\.debugCommand\(|Model\.binaryPresent\(/.test(qmlCode(file)), file + " builds an ungated debug read")
+  }
+  const fn = state.slice(state.indexOf("function readDebug(stats)"))
+  const body = fn.slice(0, fn.indexOf("\n  }\n"))
+  assert.ok(body.length > 0 && fn.length > 0, "readDebug(stats)")
+  assert.ok(/var argv = Model\.debugReadArgv\(root\.binaryPath, stats, root\.hardware\.flags\)\s*if \(argv\.length === 0\) \{\s*root\.debug = Model\.emptyDebug\(\)\s*return\s*\}/.test(body),
+    "gated first; a refused binary leaves no earlier read's state")
+  assert.ok(body.indexOf("Model.debugReadArgv") < body.indexOf("debugProc.running = true"))
+  assert.ok(body.indexOf("Model.debugReadArgv") < body.indexOf("root.debugAgain = true"), "a read waits only once it passed")
+  assert.ok(/if \(debugProc\.running \|\| root\.phase === "checking"\) \{ root\.debugAgain = true; return \}/.test(body), "never while a switch is checked")
+  assert.strictEqual((state.match(/debugProc\.running = true/g) || []).length, 1, "the debug read starts in one place")
+  // Called from one place: the end of the stat, with that stat's result.
+  assert.strictEqual((state.match(/root\.readDebug\(/g) || []).length, 1, "readDebug has one caller")
+  assert.ok(/root\.stats = Model\.parseStat\(text\)\s*root\.statRead = true\s*root\.readDebug\(root\.stats\)/.test(state))
+  // Every read asked for again goes through a new stat.
+  assert.ok(/root\.debugAgain = false\s*root\.checkBinary\(\)\s*\}\)/.test(state), "after a read ends")
+  const fin = state.slice(state.indexOf("function finish(outcome)"))
+  assert.ok(/if \(root\.debugAgain && !debugProc\.running\) \{\s*root\.debugAgain = false\s*root\.checkBinary\(\)/.test(fin.slice(0, fin.indexOf("\n  }\n"))), "after a switch")
+  const exited = state.slice(state.indexOf("function switchExited()"))
+  assert.ok(/root\.debugAgain = true\s*root\.finish\(outcome\)\s*\}/.test(exited.slice(0, exited.indexOf("\n  }\n") + 4)), "a switch's end reads again through finish")
+  // A read that ends after the gate failed is dropped, and so is the earlier one.
+  const fd = state.slice(state.indexOf("function finishDebug()"))
+  const fdBody = fd.slice(0, fd.indexOf("\n  }\n"))
+  const drop = "if (!root.ownership.ok) { root.debug = Model.emptyDebug(); return }"
+  assert.ok(fdBody.indexOf(drop) !== -1 && fdBody.indexOf(drop) < fdBody.indexOf("root.debug = Model.parseDebugRead"))
+  // The switch's own stat refusing the binary drops the earlier read too.
+  const ss = state.slice(state.indexOf("function startSwitch()"))
+  const ssBody = ss.slice(0, ss.indexOf("\n  }\n"))
+  assert.ok(/root\.stats = checkStat\.result\s*var verdict = Model\.ownershipVerdict\(root\.binaryPath, checkStat\.result\)\s*if \(!verdict\.ok\) \{\s*root\.debug = Model\.emptyDebug\(\)\s*return root\.refused\(/.test(ssBody),
+    "a refused pre-switch stat clears the debug read")
+  assert.ok(!/\bpresent\b/.test(state), "no ungated presence flag")
+  const bar = qmlCode("BarWidget.qml")
+  assert.ok(/meta: Model\.summary\(MuxState\.debug, MuxState\.debugBlocked\)/.test(bar))
+  assert.ok(/readonly property bool debugBlocked: root\.hardware\.state === "unavailable" \|\| \(root\.statRead && !root\.ownership\.ok\)/.test(state))
 })
 
 // ---------------------------------------------------- manifest and layout
@@ -1471,7 +1552,7 @@ test("manifest: identity, version and the settings schema", () => {
   assert.strictEqual(m.id, "io.github.rsd.msi-mux")
   assert.strictEqual(m.id, M.PLUGIN_ID)
   assert.strictEqual(m.name, "MSI GPU MUX")
-  assert.strictEqual(m.version, "0.2.7")
+  assert.strictEqual(m.version, "0.2.8")
   assert.strictEqual(m.license, "MIT")
   assert.deepStrictEqual(m.kinds, ["bar-widget"])
   assert.deepStrictEqual(m.entryPoints, { barWidget: "BarWidget.qml" })

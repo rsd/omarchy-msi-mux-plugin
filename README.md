@@ -38,7 +38,10 @@ Two separate settings are involved:
 ## Switching
 
 1. Click **Switch** on a mode, confirm, and authenticate in Omarchy's polkit
-   prompt. This only **stages** the switch.
+   prompt. This only **stages** the switch. The confirmation reminds you: "If
+   your disk is encrypted, have its recovery key saved off this laptop before
+   switching." (msi-mux-switch's own warning: keep any disk-encryption
+   recovery key available off the laptop.)
 2. Do a **full shutdown** (the panel offers **Shut down now**, which runs
    `omarchy-system shutdown`, or **Later**). A reboot does not apply it. If
    the panel closed during authentication, it reopens to show the result
@@ -132,6 +135,10 @@ can change the binary. The plugin refuses to switch unless:
 - it is not under `/media`, `/mnt`, `/run/media` or `/run/user`, where a user
   can mount a disk or owns the files.
 
+The same check gates the plugin's automatic read-only `msi-mux-switch --debug
+--json` read, which runs as you: a binary that fails it is never run, not even
+for that read. The header then says "GPU mode unknown".
+
 When the check fails, the panel shows the reason (for example
 "/opt/msi-mux-switch/msi-mux-switch is owned by alice, not root.") and a
 **Set up backend** button. It opens a terminal running the plugin's `setup.sh`,
@@ -151,16 +158,31 @@ The folder is made root-owned first so nothing in it can be swapped; the binary
 is replaced by a fresh root-owned copy, never chowned in place (a process that
 still had it open for writing could otherwise change it afterwards).
 
+Before it asks, `setup.sh` opens the binary once, confirms the open file is the
+same device and inode as the path, and records its SHA-256 through that
+descriptor. After the folder is root-owned it checks the binary's owner, mode
+and inode again. After `sudo install` makes the root-owned copy it hashes that
+copy, and runs the `mv` only if the hashes match. If they differ, the binary
+changed after it was checked: the script prints and runs
+`sudo rm -f -- /opt/msi-mux-switch/.msi-mux-switch.new`, replaces nothing and
+exits with an error. Every command is printed before it runs.
+
 `setup.sh` refuses, and changes nothing, when:
 
+- the source binary is not a regular file, is a symbolic link, is not owned by
+  you or root, or is writable by group or others. It does not fix such a file
+  in place: rebuild or re-download msi-mux-switch into a folder only you can
+  write, then run `setup.sh` on that fresh file;
 - the binary's folder is your home, `/`, or directly under `/` or `/home`, or
   the binary is under `/media`, `/mnt`, `/run/media` or `/run/user`;
 - the folder is owned by someone other than you or root, has the sticky bit,
   is writable by group or others, or holds anything besides the binary
   (dotfiles included);
-- a folder further up fails the check.
+- a folder further up is not owned by root or is writable by group or others.
 
-Move the binary to a folder of its own instead. To run it by hand:
+Move the binary to a folder of its own instead. At the end, `setup.sh` checks
+that the binary and every folder above it are owned by root and writable by
+no one but root. To run it by hand:
 
 ```bash
 bash ~/.config/omarchy/plugins/io.github.rsd.msi-mux/setup.sh /opt/msi-mux-switch/msi-mux-switch
@@ -337,8 +359,19 @@ What the plugin runs and writes, and when:
   checked again: root-owned, not writable by group or others, not a symlink,
   not under a user mount (see [Make it root-owned](#2-make-it-root-owned)).
 - **With sudo**, only `setup.sh`, opened in a visible terminal when you click
-  **Set up backend**. It shows its commands and asks before running any of
-  them.
+  **Set up backend**. It prints every command before it runs and asks before
+  running the first. It refuses a source binary that is not a regular file, is
+  a symlink, is not owned by you or root, or is writable by group or others;
+  its folder must be owned by you or root and not writable by group or others,
+  and every folder above it root-owned and not writable by group or others.
+  After those checks it opens the binary once, confirms the open file is the
+  same device and inode as the path, and records its SHA-256 through that
+  descriptor. After the folder is made root-owned it rechecks the binary's
+  owner, mode and inode. After `sudo install` makes the root-owned staged copy
+  it hashes that copy and runs the `mv` only on a match; otherwise it prints
+  and runs `sudo rm -f -- <staged>` and replaces nothing. At the end the binary
+  and every folder above it must be owned by root and writable by no one but
+  root.
 - **Shutdown**: `omarchy-system shutdown` runs only from **Shut down now** in
   the shutdown confirmation dialog.
 - **Files**: it writes only `~/.config/uwsm/env.d/90-msi-mux-gpu` and, for
@@ -353,7 +386,12 @@ What the plugin runs and writes, and when:
   the binary and its folders, the AC state under `/sys/class/power_supply`,
   `pgrep -x msi-mux-switch`, the env file above, and `msi-mux-switch --debug
   --json`, under a 10 s timeout with each output stream capped at 1 MiB as it
-  is read.
+  is read. That last read is gated by the same check as the switch (regular
+  file, not a symlink, root-owned, not writable by group or others, every
+  folder above it root-owned, not writable by group or others and not a
+  symlink, not under a user mount), judged on a `stat` taken just before each
+  read. A binary that fails it is never run: the panel shows why, the header
+  says "GPU mode unknown", and no earlier reading stays on screen.
 - **Switch output**: the switch's stdout and stderr are read in raw chunks
   and split into lines by the plugin, and no line it holds grows past
   65,537 characters: the rest of a longer line is dropped up to its next
@@ -375,8 +413,11 @@ bash tests/run.sh
 
 runs the manifest validation, QML lint and load checks, the widget live
 against fake binaries (including the dialogs' keys and those of a panel that
-reopened by itself, and a flooding and a hanging binary), the model tests, the env file sourced by `sh` against fixture
-trees, `setup.sh` against a fake `sudo`, and shellcheck. It never runs the real
+reopened by itself, a flooding and a hanging binary, and a binary that fails
+the ownership check and must never be run, even for the debug read), the model
+tests, the env file sourced by `sh` against fixture trees, `setup.sh` against a
+fake `sudo` (including its source-binary refusals and the checksum mismatch
+path), and shellcheck. It never runs the real
 msi-mux-switch, `pkexec`, `sudo` or a shutdown, and never writes under
 `~/.config`.
 

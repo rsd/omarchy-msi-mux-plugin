@@ -23,13 +23,30 @@
 # root-owned copy (a file you could still write through an open descriptor is
 # never chowned in place).
 #
-# It changes nothing else. It refuses (and changes nothing) when the folder is
-# your home, /, a folder directly under / or directly under /home, under
-# /media, /mnt, /run/media or /run/user, when the folder is not owned by you or
-# root, has the sticky bit, is writable by group or others, or holds anything
-# but the binary, or when a directory further up fails the same check. It
-# builds and downloads nothing: see the plugin's README for building
-# msi-mux-switch.
+# Before asking, it records the binary's SHA-256, read through one open
+# descriptor that is checked to be the same file (device and inode) the path
+# names. After install, the root-owned copy is hashed again; if the two
+# differ, the binary changed after it was checked: the copy is removed with
+# `sudo rm -f -- <folder>/.<name>.new` (shown before it runs), the binary is
+# not replaced, and the script exits with an error.
+#
+# It changes nothing else. It refuses (and changes nothing) when:
+#   - the path is relative, a symbolic link, or not a regular file;
+#   - the binary is not owned by you or root, or is writable by group or
+#     others (it is not fixed in place: rebuild or re-download it into a
+#     folder only you can write, then run this on that fresh file);
+#   - the folder is your home, /, a folder directly under / or directly under
+#     /home, or under /media, /mnt, /run/media or /run/user;
+#   - the folder is not owned by you or root, has the sticky bit, is writable
+#     by group or others, or holds anything but the binary;
+#   - a directory further up is not owned by root or is writable by group or
+#     others.
+# After the folder is made root-owned it checks the binary again (still the
+# same regular file, owned by you or root, not writable by group or others)
+# and stops before the copy if not. The final check requires the binary and
+# every directory above it to be owned by root and not writable by group or
+# others. It builds and downloads nothing: see the plugin's README for
+# building msi-mux-switch.
 
 set -u
 
@@ -215,12 +232,69 @@ if [[ -n $dir_problem ]]; then
   refuse
 fi
 
+me=$(id -u)
+
+# bin_problem: why the binary itself may not be installed, or nothing. It
+# must be a regular file owned by you or root, not writable by group or
+# others: a binary another account can write could be changed to run as root.
+bin_problem() {
+  local line uid raw owner
+  if ! line=$(stat_line "$bin"); then
+    say "$bin cannot be checked (missing or not readable)."
+    return
+  fi
+  read -r uid raw owner <<<"$line"
+  if (((16#$raw & 16#F000) != 16#8000)); then
+    say "$bin is not a regular file."
+  elif ((uid != 0 && uid != me)); then
+    say "$bin is owned by $owner, not by you or root."
+  elif (((16#$raw & 8#022) != 0)); then
+    say "$bin is writable by group or others."
+  fi
+}
+
+# dev_ino <path>: "<device>:<inode>" of the path itself (not following a link).
+dev_ino() {
+  stat -c '%d:%i' -- "$1" 2>/dev/null
+}
+
+bin_refusal=$(bin_problem)
+if [[ -n $bin_refusal ]]; then
+  say "Refusing to install $bin:"
+  indent "$bin_refusal"
+  # Not chmod: a file others could write may already hold their content, and
+  # they may still write through a descriptor opened earlier.
+  say "Rebuild or re-download msi-mux-switch into a folder only you can write (for example a fresh build from the upstream source; see the README), then run this on that fresh file."
+  refuse
+fi
+
+# The checksum of what was checked: read through one descriptor that must be
+# the same file the path names.
+if ! exec 3<"$bin"; then
+  say "$bin cannot be read."
+  refuse
+fi
+bin_id=$(dev_ino "$bin")
+fd_id=$(stat -L -c '%d:%i' -- /proc/self/fd/3 2>/dev/null)
+if [[ -z $bin_id || $bin_id != "$fd_id" ]]; then
+  say "$bin changed while it was being checked."
+  refuse
+fi
+checked_sum=$(sha256sum <&3 2>/dev/null)
+checked_sum=${checked_sum%% *}
+exec 3<&-
+if [[ ! $checked_sum =~ ^[0-9a-f]{64}$ ]]; then
+  say "The checksum of $bin could not be taken (sha256sum)."
+  refuse
+fi
+
 name=${bin##*/}
 staged=$dir/.$name.new
 chown_cmd=("$SUDO" chown -h root:root -- "$dir")
 chmod_cmd=("$SUDO" chmod 755 -- "$dir")
 install_cmd=("$SUDO" install -o root -g root -m 755 -- "$bin" "$staged")
 mv_cmd=("$SUDO" mv -f -- "$staged" "$bin")
+rm_cmd=("$SUDO" rm -f -- "$staged")
 shown() {
   local line
   printf -v line '%q ' "$@"
@@ -232,6 +306,7 @@ shown "${chmod_cmd[@]}"
 shown "${install_cmd[@]}"
 shown "${mv_cmd[@]}"
 say "(the folder first, then a fresh root-owned copy replaces the binary)"
+say "(if the copy does not match the binary as checked, it is removed instead and the binary is not replaced)"
 say ""
 printf 'Run these commands? [y/N] '
 answer=""
@@ -255,12 +330,18 @@ failed() {
 "${chown_cmd[@]}" || failed
 "${chmod_cmd[@]}" || failed
 
-# 2. The binary again, now that the folder is fixed: still a regular file
-# (not a link), still alone in the folder.
+# 2. The binary again, now that the folder is fixed: still the same regular
+# file (not a link), owned by you or root, not writable by group or others,
+# still alone in the folder.
 recheck=$(
   line=$(stat_line "$bin") || { say "$bin cannot be checked any more."; exit 0; }
   read -r _ raw _ <<<"$line"
-  (((16#$raw & 16#F000) == 16#8000)) || say "$bin is no longer a regular file."
+  if (((16#$raw & 16#F000) != 16#8000)); then
+    say "$bin is no longer a regular file."
+  else
+    bin_problem
+    [[ $(dev_ino "$bin") == "$bin_id" ]] || say "$bin was replaced by another file after it was checked."
+  fi
   own_dir_problem
 )
 if [[ -n $recheck ]]; then
@@ -271,8 +352,24 @@ if [[ -n $recheck ]]; then
   exit 1
 fi
 
-# 3. A fresh root-owned copy replaces the binary.
+# 3. A fresh root-owned copy, in the root-owned folder, where only root can
+# change it; it replaces the binary only if it is what was checked.
 "${install_cmd[@]}" || failed
+staged_sum=$(sha256sum -- "$staged" 2>/dev/null)
+staged_sum=${staged_sum%% *}
+if [[ $staged_sum != "$checked_sum" ]]; then
+  say ""
+  if [[ -z $staged_sum ]]; then
+    say "The copy $staged cannot be checked (it was not made, or cannot be read)."
+  else
+    say "$bin changed after it was checked: the copy does not match it."
+  fi
+  say "Removing the copy; the binary is not replaced:"
+  shown "${rm_cmd[@]}"
+  "${rm_cmd[@]}" || failed
+  say "Check $bin and run this again."
+  exit 1
+fi
 "${mv_cmd[@]}" || failed
 
 problems=$(

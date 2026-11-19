@@ -16,12 +16,17 @@ import "Model.js" as Model
 //     (Model.hardwareDecision).
 //   - stat of the binary and every directory above it (Model.statArgv):
 //     after the DMI read, when the binary path changes, on a panel opening,
-//     and again right before a switch (Model.ownershipVerdict).
+//     before every debug read, and again right before a switch
+//     (Model.ownershipVerdict).
 //   - the read-only state read, `<binary> --debug --json [flags]` as the
-//     user (Model.debugArgv): after each stat that finds the binary on
-//     available hardware, and after each switch. Never on a timer: only this
-//     tool changes the mode. Bounded: under a timeout, and at most
-//     Model.DEBUG_MAX_BYTES of each stream is read (Model.DEBUG_SCRIPT).
+//     user (Model.debugReadArgv): only at the end of a stat (checkBinary),
+//     on available hardware, and only if that stat passes the same ownership
+//     gate as the switch; otherwise the binary is never run and no earlier
+//     read's state is kept. A read asked for while another runs or a switch
+//     is being checked, and the read after each switch, start a new stat
+//     first. Never on a timer: only this tool changes the mode. Bounded:
+//     under a timeout, and at most Model.DEBUG_MAX_BYTES of each stream is
+//     read (Model.DEBUG_SCRIPT).
 //   - AC (Model.acArgv): at startup, on a panel opening, every
 //     Model.AC_POLL_MS only while a panel is open, and right before a switch.
 //   - `pgrep -x msi-mux-switch` (Model.pgrepArgv): right before a switch,
@@ -70,7 +75,9 @@ Singleton {
   readonly property var ownership: root.statRead
     ? Model.ownershipVerdict(root.binaryPath, root.stats)
     : { ok: false, kind: "", reason: "Checking the backend…" }
-  readonly property bool present: root.statRead && Model.binaryPresent(root.binaryPath, root.stats)
+  // No debug read can run: the hardware is not validated, or the last stat
+  // refused the binary (the panel shows the mode as unknown).
+  readonly property bool debugBlocked: root.hardware.state === "unavailable" || (root.statRead && !root.ownership.ok)
 
   // Why switching is impossible ("" when it is not): the hardware first,
   // then the binary.
@@ -80,7 +87,8 @@ Singleton {
   readonly property bool canSetUp: root.hardware.state === "available" && Model.setupHelps(root.ownership)
     && root.pluginDir !== ""
 
-  // The last debug read (Model.parseDebug).
+  // The last debug read (Model.parseDebugRead); empty while the binary is
+  // refused.
   property var debug: Model.emptyDebug()
 
   // AC: true, false or null (unknown).
@@ -204,6 +212,7 @@ Singleton {
     if (argv.length === 0) {
       root.stats = ({})
       root.statRead = true
+      root.debug = Model.emptyDebug()
       return
     }
     statProc.path = root.binaryPath
@@ -220,7 +229,7 @@ Singleton {
         if (statProc.path !== root.binaryPath) return
         root.stats = Model.parseStat(text)
         root.statRead = true
-        root.readDebug()
+        root.readDebug(root.stats)
       }
     }
     onRunningChanged: {
@@ -235,13 +244,20 @@ Singleton {
   // of the next one started meanwhile.
   property int debugRuns: 0
 
-  function readDebug() {
-    if (!root.present || root.hardware.state !== "available") return
+  // Called only by the stat that just finished, with its result: the binary
+  // runs only if that stat passes the switch's ownership gate
+  // (Model.debugReadArgv). A read that has to wait is asked for again
+  // through checkBinary, so it too follows a fresh stat.
+  function readDebug(stats) {
+    if (root.hardware.state !== "available") return
+    var argv = Model.debugReadArgv(root.binaryPath, stats, root.hardware.flags)
+    if (argv.length === 0) {
+      root.debug = Model.emptyDebug()
+      return
+    }
     // Not while a switch is being checked: pgrep must not see this plugin's
     // own debug read (finish() reads again).
     if (debugProc.running || root.phase === "checking") { root.debugAgain = true; return }
-    var argv = Model.debugArgv(root.binaryPath, root.hardware.flags)
-    if (argv.length === 0) return
     debugProc.path = root.binaryPath
     debugProc.run = ++root.debugRuns
     debugProc.out = ""
@@ -255,10 +271,12 @@ Singleton {
   }
 
   // Finished only when both streams and the exit status are in, in whatever
-  // order they arrive.
+  // order they arrive. Dropped if a stat since refused the binary, and so is
+  // any earlier read (debugBlocked is then true).
   function finishDebug() {
     if (!debugProc.outDone || !debugProc.errDone || !debugProc.exited) return
     if (debugProc.path !== root.binaryPath) return
+    if (!root.ownership.ok) { root.debug = Model.emptyDebug(); return }
     root.debug = Model.parseDebugRead(debugProc.out, debugProc.err, debugProc.exitCode)
   }
 
@@ -306,7 +324,7 @@ Singleton {
         }
         if (!root.debugAgain || root.phase === "checking") return
         root.debugAgain = false
-        root.readDebug()
+        root.checkBinary()
       })
     }
   }
@@ -402,10 +420,11 @@ Singleton {
     root.outcomeOwner = owner
     root.outcomes++
     root.switchFinished(owner, outcome)
-    // A debug read asked for while the switch was checked.
+    // A debug read asked for while the switch was checked, or after it ran
+    // (switchExited): a new stat first, then the read.
     if (root.debugAgain && !debugProc.running) {
       root.debugAgain = false
-      root.readDebug()
+      root.checkBinary()
     }
   }
 
@@ -417,9 +436,15 @@ Singleton {
     if (root.phase !== "checking" || checkStat.result === null || checkAc.result === undefined
         || checkRunning.result === undefined) return
     if (checkStat.path !== root.binaryPath) return root.refused("The binary path changed; nothing was run.")
+    // The fresh stat becomes the last one, so a refusal also blocks the debug
+    // read (debugBlocked) and drops the earlier read: its mode came from a
+    // binary no longer trusted.
     root.stats = checkStat.result
     var verdict = Model.ownershipVerdict(root.binaryPath, checkStat.result)
-    if (!verdict.ok) return root.refused(verdict.reason + " Nothing was run.")
+    if (!verdict.ok) {
+      root.debug = Model.emptyDebug()
+      return root.refused(verdict.reason + " Nothing was run.")
+    }
     root.ac = checkAc.result
     if (checkAc.result !== true) return root.refused(Model.acText(checkAc.result))
     var running = Model.runningProblem(checkRunning.result)
@@ -490,8 +515,9 @@ Singleton {
     if (tail !== null) root.ingest(tail)
     var outcome = Model.switchOutcome(root.switchRun, switchProc.exitCode, root.switchMode,
       root.debug.ok && root.debug.pending)
+    // The mode is read again after the switch, through finish.
+    root.debugAgain = true
     root.finish(outcome)
-    root.readDebug()
   }
 
   Process {

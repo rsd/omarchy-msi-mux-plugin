@@ -235,7 +235,8 @@ function userMountOf(path) {
   return ""
 }
 
-// Whether pkexec may run the binary: { ok, kind, reason }. kind is "ok",
+// Whether the binary may be run at all, by pkexec for the switch or as the
+// user for the debug read (debugReadArgv): { ok, kind, reason }. kind is "ok",
 // "invalid" (the setting), "mount" (under a user mount), "missing",
 // "symlink", "notfile", "owner", "mode" or "ancestor". The binary must be a regular file owned by root with no
 // group or other write bit, and so must every directory above it (a
@@ -271,14 +272,6 @@ function ownershipVerdict(path, stats) {
   return { ok: true, kind: "ok", reason: "" }
 }
 
-// Whether the binary exists as a regular file the user may run read-only
-// (the debug read needs no ownership: it runs as the user).
-function binaryPresent(path, stats) {
-  if (binaryPathProblem(path) !== "") return false
-  var b = (stats || {})[String(path)]
-  return !!b && b.type === "file"
-}
-
 // Set up backend helps with every ownership problem except a bad setting or
 // a user mount (setup.sh refuses those too).
 function setupHelps(verdict) {
@@ -288,7 +281,9 @@ function setupHelps(verdict) {
 // ------------------------------------------------------------------ commands
 
 // The read-only state read, as the user: `<binary> --debug --json [flags]`,
-// which prints one pretty-printed JSON object of a few KiB. It runs under
+// which prints one pretty-printed JSON object of a few KiB. It runs only
+// through debugReadArgv: the binary must pass the switch's own ownership
+// gate first, on a stat taken right before the read. It runs under
 // `timeout -k DEBUG_KILL_AFTER_S DEBUG_TIMEOUT_S` (TERM, then KILL, sent to
 // the tool's whole process group), inside DEBUG_SCRIPT, which caps both
 // streams while they are read (see there). The timeout and the tool's argv
@@ -341,8 +336,9 @@ var DEBUG_SCRIPT = [
 // streams stay open and the read does not end until the child exits; the
 // byte caps of DEBUG_SCRIPT still hold, and a switch waiting on the read is
 // still refused by the checks' watchdog (CHECK_TIMEOUT_MS). The read runs
-// the binary the user configured, as the user; a binary doing this on
-// purpose is outside what these bounds defend against.
+// the binary the user configured, as the user, and only once it passed the
+// ownership gate (debugReadArgv); a root-owned binary doing this on purpose
+// is outside what these bounds defend against.
 function debugCommand(path, flags) {
   if (binaryPathProblem(path) !== "") return []
   return ["timeout", "-k", String(DEBUG_KILL_AFTER_S), String(DEBUG_TIMEOUT_S), String(path), "--debug", "--json"]
@@ -352,6 +348,16 @@ function debugCommand(path, flags) {
 function debugArgv(path, flags) {
   var command = debugCommand(path, flags)
   return command.length === 0 ? [] : ["bash", "-c", DEBUG_SCRIPT, "msi-mux-debug"].concat(command)
+}
+
+// The debug read as the plugin runs it: debugArgv, or [] unless the binary
+// passes ownershipVerdict for `stats` (parseStat of a stat taken right before
+// it), the same gate as the switch. A binary owned by another account, in a
+// folder a user can write or under a user mount, or a symbolic link, is never
+// run, not even read-only.
+function debugReadArgv(path, stats, flags) {
+  if (!ownershipVerdict(path, stats).ok) return []
+  return debugArgv(path, flags)
 }
 
 // The switch, through pkexec, as an argv array: no shell, nothing joined.
@@ -918,8 +924,12 @@ function pendingText(target) {
 }
 
 // The panel's one-line meta under the title; short enough not to elide.
-function summary(debug) {
+// blocked: no debug read can run (the hardware or the backend is refused),
+// so the mode is unknown, whatever an earlier read said, rather than still
+// coming.
+function summary(debug, blocked) {
   var d = debug || emptyDebug()
+  if (blocked === true) return "GPU mode unknown"
   if (!d.ok) return d.error !== "" ? "GPU mode unknown" : "Reading the GPU mode…"
   if (!isMode(d.current)) return "Current mode not recognised"
   if (d.pending) return modeLabel(d.current) + " → " + modeLabel(d.target) + " after shutdown"
@@ -1005,11 +1015,16 @@ function modeRows(s) {
   return rows
 }
 
+// msi-mux-switch's own reminder before a firmware switch (its
+// recovery_key_warning): have any full-disk-encryption recovery key
+// available off the machine. Shown in every mode's confirmation.
+var RECOVERY_KEY_TEXT = "If your disk is encrypted, have its recovery key saved off this laptop before switching."
+
 function confirmMessage(mode, warnIntegrated) {
   var msg = "Switch to " + modeLabel(mode) + "? It takes effect after a full shutdown (a reboot is not enough). You will be asked to authenticate."
   if (mode === "integrated" && warnIntegrated !== false)
     msg += "\n\nIntegrated uses the Intel GPU only: external screens wired to the RTX will probably stay dark."
-  return msg
+  return msg + "\n\n" + RECOVERY_KEY_TEXT
 }
 
 var SHUTDOWN_MESSAGE = "The switch is staged. Shut down now to apply it? Save your work first. A reboot does not apply it; it needs a full shutdown and power-on. The laptop may power itself back on afterwards; that's normal."

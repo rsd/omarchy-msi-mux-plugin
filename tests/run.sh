@@ -272,13 +272,15 @@ qml_load_selftest() {
 # fixture capture for --debug --json and refuses anything else), with a
 # temporary HOME. A scratch Quickshell creates BarWidget.qml with the fake as
 # its binaryPath setting (its panel is never opened, no switch is asked for,
-# no env file is written), waits for the DMI read, the stat, the debug read
-# and the AC read, and reports them. The real DMI decides the hardware: on a
-# machine that is not an MSI the widget must be hidden and nothing else is
-# read. Checks that the singleton is the widget's (one instance), that the
-# fake was run with exactly --debug --json and the hardware's flags, that the
-# temporary binary fails the ownership gate (it is not root-owned), and that
-# no binding throws or the engine warns.
+# no env file is written), waits for the DMI read, the stat and the AC read
+# (and a while longer, for a debug read that should not come), and reports
+# them. The real DMI decides the hardware: on a machine that is not an MSI
+# the widget must be hidden and nothing else is read. Checks that the
+# singleton is the widget's (one instance), that the temporary binary fails
+# the ownership gate (it is not root-owned) and is therefore never run, not
+# even for the read-only debug read (the fake logs every run), that the
+# panel shows the gate's reason, offers Set up backend and says the mode is
+# unknown, and that no binding throws or the engine warns.
 widget_live() {
   local dir=${1:-$PLUGIN_DIR}
   if ! have_qs_load; then
@@ -329,9 +331,13 @@ ShellRoot {
   function maybeReport() {
     var s = Plugin.MuxState
     if (!s.dmiRead) return
+    if (s.hardware.state === "available" && !s.statRead) return
+    // A refused binary: wait long enough to see a debug read start anyway.
+    if (s.hardware.state === "available" && !s.ownership.ok) { settle.start(); return }
     if (s.hardware.state === "available" && (!s.debug.ok && s.debug.error === "")) return
     Qt.callLater(shell.report)
   }
+  Timer { id: settle; interval: 1500; onTriggered: shell.report() }
   function report() {
     if (shell.reported) return
     shell.reported = true
@@ -343,6 +349,8 @@ ShellRoot {
       + " modes " + s.debug.modes.join(",") + " rows " + w.rows.length + " env " + s.envChoice
       + " busy " + s.busy + " flags " + s.hardware.flags.join(","))
     console.log("MMLIVE ac " + (s.ac === true || s.ac === false || s.ac === null))
+    console.log("MMLIVE panel reason " + (s.unavailableReason !== "" && s.unavailableReason === s.ownership.reason)
+      + " setup " + s.canSetUp + " meta " + Model.summary(s.debug, s.debugBlocked))
     w.destroy()
     console.log("MMLIVE DONE")
     Qt.callLater(Qt.quit)
@@ -370,15 +378,19 @@ EOF
       echo "FAIL the fake binary ran on unvalidated hardware"
       ok=1
     fi
-  elif [[ $line =~ hardware\ available\ hidden\ false\ shown\ true\ path\ true\ stat\ true\ kind\ (owner|ancestor)\ available\ false\ debug\ true\ current\ discrete\ modes\ discrete,mshybrid,integrated\ rows\ 3\ env\ auto\ busy\ false\ flags\ (.*)$ ]]; then
+  elif [[ $line =~ hardware\ available\ hidden\ false\ shown\ true\ path\ true\ stat\ true\ kind\ (owner|ancestor)\ available\ false\ debug\ false\ current\ \ modes\ \ rows\ 3\ env\ auto\ busy\ false\ flags ]]; then
     echo "ok   available hardware; the temporary binary fails the ownership gate (${BASH_REMATCH[1]})"
-    echo "ok   one debug read through the fake: current discrete, three modes, three rows; no env file"
-    local want="--debug --json"
-    [[ -n ${BASH_REMATCH[2]} ]] && want+=" ${BASH_REMATCH[2]//,/ }"
-    if [[ $(cat "$cfg/fake.log" 2>/dev/null) == "$want" ]]; then
-      echo "ok   the fake ran once, with exactly: $want"
+    echo "ok   no debug state: mode unread, three rows; no env file"
+    if [[ -e $cfg/fake.log ]]; then
+      echo "FAIL the refused fake binary was run: $(tr '\n' '|' <"$cfg/fake.log")"
+      ok=1
     else
-      echo "FAIL the fake's arguments: $(tr '\n' '|' <"$cfg/fake.log" 2>/dev/null) (want: $want)"
+      echo "ok   the refused fake binary was never run, not even with --debug --json"
+    fi
+    if grep -q 'MMLIVE panel reason true setup true meta GPU mode unknown$' "$cfg/log"; then
+      echo "ok   the panel shows the gate's reason, offers Set up backend, and the mode as unknown"
+    else
+      echo "FAIL panel: $(grep -o 'MMLIVE panel.*' "$cfg/log" | head -1)"
       ok=1
     fi
   else
@@ -439,8 +451,11 @@ EOF
 # with Auto queued behind it keeps its error shown after Auto succeeds; a
 # removal that fails shows its error and puts the dropdown back on Intel; a
 # switch while a process named msi-mux-switch runs (a copy of sleep) is
-# refused before pkexec. Skipped on hardware that is not available or on
-# battery (the real AC is read).
+# refused before pkexec; a switch after the fake stat turns the binary
+# foreign-owned is refused by its own stat before pkexec, and the earlier
+# read is dropped (no mode, the read blocked, the header "GPU mode unknown").
+# Skipped on hardware that is not available or on battery (the real AC is
+# read).
 switch_flow_live() {
   local dir=${1:-$PLUGIN_DIR}
   if ! have_qs_load; then
@@ -461,10 +476,13 @@ switch_flow_live() {
   chmod 755 "$bin"
   cat >"$fake/stat" <<EOF
 #!/bin/bash
-# Called as: stat -c <format> -- <paths...>; every path reads as root:root 755.
+# Called as: stat -c <format> -- <paths...>; every path reads as root:root 755,
+# or, once $cfg/stat.foreign exists, as owned by uid 1000.
 [[ \$1 == -c && \$3 == -- ]] || exit 1
+uid=0 user=root
+[[ -e "$cfg/stat.foreign" ]] && uid=1000 user=someone
 "$real_stat" -c '%u	%f	%U	%n' -- "\${@:4}" | while IFS=\$'\t' read -r _ raw _ name; do
-  printf '0\t%x\troot\t%s\n' "\$(( (16#\$raw & 16#F000) | 8#755 ))" "\$name"
+  printf '%s\t%x\t%s\t%s\n' "\$uid" "\$(( (16#\$raw & 16#F000) | 8#755 ))" "\$user" "\$name"
 done
 EOF
   cat >"$fake/pkexec" <<EOF
@@ -502,6 +520,7 @@ ShellRoot {
   property var panel: null
   property int step: 0
   property var outcome: null
+  property int ticks: 0
   function log(s) { console.log("MMFLOW " + s) }
   function done() { shell.log("DONE"); shell.step = 99; Qt.callLater(Qt.quit) }
   Component.onCompleted: {
@@ -586,7 +605,7 @@ ShellRoot {
         shell.step = 31
       } else if (shell.step === 31) {
         if (stateReset.running) return
-        s.readDebug()
+        s.checkBinary()
         shell.step = 32
       } else if (shell.step === 32) {
         if (s.debug.pending) return
@@ -615,7 +634,7 @@ ShellRoot {
         shell.step = 36
       } else if (shell.step === 36) {
         if (stateReset.running) return
-        s.readDebug()
+        s.checkBinary()
         shell.step = 37
       } else if (shell.step === 37) {
         if (s.debug.pending) return
@@ -643,7 +662,7 @@ ShellRoot {
         shell.step = 73
       } else if (shell.step === 73) {
         if (floodReset.running) return
-        s.readDebug()
+        s.checkBinary()
         shell.step = 74
       } else if (shell.step === 74) {
         if (s.debug.pending) return
@@ -766,6 +785,25 @@ ShellRoot {
       } else if (shell.step === 11) {
         if (!shell.outcome || s.busy) return
         blocker.running = false
+        shell.ticks = 0
+        shell.step = 12
+      } else if (shell.step === 12) {
+        // The re-read after that refusal settles; then the binary turns
+        // foreign-owned before the next switch's own stat.
+        if (!s.debug.ok || ++shell.ticks < 10) return
+        shell.log("before foreign ok " + s.debug.ok + " blocked " + s.debugBlocked
+          + " meta " + Model.summary(s.debug, s.debugBlocked))
+        foreignSet.running = true
+        shell.step = 13
+      } else if (shell.step === 13) {
+        if (foreignSet.running) return
+        shell.outcome = null
+        shell.log("foreign request " + s.requestSwitch(holder, "integrated"))
+        shell.step = 14
+      } else if (shell.step === 14) {
+        if (!shell.outcome || s.busy) return
+        shell.log("foreign refused ok " + s.debug.ok + " current '" + s.debug.current + "' blocked " + s.debugBlocked
+          + " meta " + Model.summary(s.debug, s.debugBlocked))
         shell.widget.destroy()
         shell.done()
       }
@@ -774,6 +812,7 @@ ShellRoot {
   Process { id: blocker; command: ["$cfg/run/msi-mux-switch", "30"] }
   Process { id: envDirMode }
   Process { id: stateReset; command: ["rm", "-f", "--", "$cfg/state"] }
+  Process { id: foreignSet; command: ["touch", "--", "$cfg/stat.foreign"] }
   Process { id: flagSet; command: ["touch", "--", "$cfg/state.apply-ready"] }
   Process { id: floodSet; command: ["touch", "--", "$cfg/state.flood"] }
   Process { id: floodReset; command: ["rm", "-f", "--", "$cfg/state", "$cfg/state.flood"] }
@@ -1083,6 +1122,9 @@ EOF
   expect_flow "removed after failure env auto" "Auto then removes it once env.d is writable again"
   expect_flow "blocked request true" "a switch is asked for while an msi-mux-switch runs"
   expect_flow "finished owner holder kind error offer false warning false :: msi-mux-switch is already running" "it is refused before pkexec"
+  expect_flow "before foreign ok true blocked false meta Current: Discrete" "after that refusal the mode is read again (Discrete)"
+  expect_flow "foreign request true" "a switch is asked for after the binary turned foreign-owned"
+  expect_flow "foreign refused ok false current '' blocked true meta GPU mode unknown" "the switch's own stat refuses the binary before pkexec and drops the earlier read: no mode, the read blocked, the header says the mode is unknown"
   # The flags are the ones the debug read got (the hardware's).
   local flags want_pk
   flags=$(sed -n '1s/^--debug --json//p' "$cfg/fake.log" 2>/dev/null)
@@ -1234,6 +1276,7 @@ ShellRoot {
       Qt.callLater(shell.retry)
     }
   }
+  property int runs: 0
   property bool retried: false
   property bool retrying: false
   property var retryOutcome: null
@@ -1266,7 +1309,7 @@ ShellRoot {
         if (pick.running) return
         shell.reads = 0
         shell.t0 = Date.now()
-        s.readDebug()
+        s.checkBinary()
         shell.step = 2
       } else if (shell.step === 2) {
         if (shell.reads === 0) return
@@ -1276,7 +1319,7 @@ ShellRoot {
       } else if (shell.step === 3) {
         if (pick.running) return
         shell.reads = 0
-        s.readDebug()
+        s.checkBinary()
         shell.step = 4
       } else if (shell.step === 4) {
         if (shell.reads === 0) return
@@ -1287,7 +1330,12 @@ ShellRoot {
         if (pick.running) return
         shell.reads = 0
         shell.t0 = Date.now()
-        s.readDebug()
+        // A debug read follows its own stat: wait for it to start.
+        shell.runs = s.debugRuns
+        s.checkBinary()
+        shell.step = 51
+      } else if (shell.step === 51) {
+        if (s.debugRuns === shell.runs) return
         shell.asked = Date.now()
         shell.log("hang request " + s.requestSwitch(holder, "mshybrid") + " phase " + s.phase)
         shell.step = 6
