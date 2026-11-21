@@ -26,7 +26,9 @@ import "Model.js" as Model
 //     cancelled before a full shutdown (Model.STAGED_LOCK_TEXT says so).
 //   - Shut down now on that lock line (Model.lockNotice), shown while a
 //     switch is staged and after an apply-ready refusal with nothing staged
-//     (a leftover firmware flag): the same shutdown dialog, then the same
+//     (a leftover firmware flag, which MuxState remembers past the panel
+//     closing, until a read or a new boot says otherwise: no mode has a
+//     button meanwhile either): the same shutdown dialog, then the same
 //     command.
 //   - Hyprland base GPU (shown in every mode; acts only in MSHybrid):
 //     MuxState.setEnvChoice, which writes or removes
@@ -69,7 +71,8 @@ Panel {
     debug: MuxState.debug,
     unavailableReason: MuxState.unavailableReason,
     busy: MuxState.busy,
-    ac: MuxState.ac
+    ac: MuxState.ac,
+    flag: MuxState.flagRecord
   })
   readonly property var glyph: Model.barState(root.view)
   readonly property var rows: Model.modeRows(root.view)
@@ -87,7 +90,8 @@ Panel {
   property string shutdownKind: "staged"
 
   // The line under the modes that offers Shut down now (Model.lockNotice).
-  readonly property var lockNotice: Model.lockNotice({ debug: MuxState.debug, outcome: MuxState.outcome, busy: MuxState.busy })
+  readonly property var lockNotice: Model.lockNotice({ debug: MuxState.debug, outcome: MuxState.outcome, busy: MuxState.busy,
+    unavailableReason: MuxState.unavailableReason, flag: MuxState.flagRecord })
 
   // The panel reopening itself to show a finished switch keeps the result;
   // any other opening clears a result already seen.

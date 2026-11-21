@@ -57,6 +57,16 @@ Notes:
   further mode change. While staged, no mode has a Switch button, and the line
   "A switch is staged. It can't be changed or cancelled until after a full
   shutdown." carries a **Shut down now** button.
+- A switch that fails and rolls back can leave that flag set with nothing
+  staged. The panel then shows "The firmware still has a switch in progress. A
+  full shutdown clears it." with **Shut down now** instead of the Switch
+  buttons, like the staged case. The plugin remembers this in the shell,
+  tagged with the boot id (`/proc/sys/kernel/random/boot_id`), so it survives
+  closing and reopening the panel. It forgets it when the boot id changes
+  (a full shutdown), when a later status read shows a different current or
+  target mode, or when the ownership check refuses. The memory is in the
+  shell's memory only: after a shell restart it is gone, and the next switch
+  attempt shows the refusal again.
 - AC power is required. On battery the buttons are disabled.
 - Integrated asks for an extra confirmation about external screens (setting
   `warnBeforeIntegrated`).
@@ -133,15 +143,37 @@ can change the binary. The plugin refuses to switch unless:
   group or others (a folder you can write lets you swap the binary for
   something that then runs as root);
 - it is not under `/media`, `/mnt`, `/run/media` or `/run/user`, where a user
-  can mount a disk or owns the files.
+  can mount a disk or owns the files;
+- no mount at the binary's path or at any folder above it is a FUSE
+  filesystem (`fuse`, `fuseblk`, `fuse.*`) or carries `user_id=` other than 0,
+  as `/proc/self/mountinfo` lists it. An account that may use FUSE with
+  `allow_other` (`user_allow_other` in `/etc/fuse.conf`) could mount a
+  filesystem over a folder it owns and report every file there as owned by
+  root, which `stat` cannot tell apart from the real thing. If mountinfo
+  cannot be read, is larger than 1 MiB or does not parse, the check refuses.
+
+The check is one process: it runs `stat`, reads mountinfo, then runs `stat`
+again, and refuses if the two answers differ (a FUSE daemon could unmount
+itself lazily while answering the first `stat`). Every value reaches that
+process as a positional argument, never as part of the script text.
 
 The same check gates the plugin's automatic read-only `msi-mux-switch --debug
 --json` read, which runs as you: a binary that fails it is never run, not even
-for that read. The header then says "GPU mode unknown".
+for that read. The status read and the `pkexec` switch share one verdict, each
+from a fresh read.
+
+When the check refuses, at the status read or right before a switch, nothing
+read earlier stays on screen. The header says "GPU mode unknown" with the
+reason; no mode row shows a status; there is no lock line and no **Shut down
+now**; the environment status is neutral. That covers a failed `stat` as well
+as a failed mount check.
 
 When the check fails, the panel shows the reason (for example
-"/opt/msi-mux-switch/msi-mux-switch is owned by alice, not root.") and a
-**Set up backend** button. It opens a terminal running the plugin's `setup.sh`,
+"/opt/msi-mux-switch/msi-mux-switch is owned by alice, not root.") and, for
+an ownership or mode problem, a **Set up backend** button. A mount refusal
+(under a user-mount prefix, on a FUSE or user mount, or a mount table that
+could not be checked) gets no such button: moving the binary is the only fix.
+**Set up backend** opens a terminal running the plugin's `setup.sh`,
 which checks the binary, shows these commands (only for the binary and its own
 folder), asks, runs them, and checks again. Use it only for a binary you built
 yourself from source you trust: from then on, that binary runs as root whenever
@@ -170,19 +202,36 @@ exits with an error. Every command is printed before it runs.
 `setup.sh` refuses, and changes nothing, when:
 
 - the source binary is not a regular file, is a symbolic link, is not owned by
-  you or root, or is writable by group or others. It does not fix such a file
-  in place: rebuild or re-download msi-mux-switch into a folder only you can
-  write, then run `setup.sh` on that fresh file;
+  you or root, or is writable by group or others;
 - the binary's folder is your home, `/`, or directly under `/` or `/home`, or
   the binary is under `/media`, `/mnt`, `/run/media` or `/run/user`;
+- the binary or a folder above it is on a FUSE mount (`fuse`, `fuseblk`,
+  `fuse.*`) or a mount with `user_id=` other than 0, or `/proc/self/mountinfo`
+  cannot be read or parsed. It runs the same stat, mountinfo, stat check as
+  the plugin, and refuses if the two stats differ;
 - the folder is owned by someone other than you or root, has the sticky bit,
   is writable by group or others, or holds anything besides the binary
   (dotfiles included);
 - a folder further up is not owned by root or is writable by group or others.
 
-Move the binary to a folder of its own instead. At the end, `setup.sh` checks
-that the binary and every folder above it are owned by root and writable by
-no one but root. To run it by hand:
+Where another account could already have changed the binary, `setup.sh` does
+not fix anything in place. That means the binary or any folder above it is
+writable by group or others or owned by another account, it is on a FUSE or
+user mount, or the binary changed while or after it was checked (the stats
+differ, the open file is not the path's file, or the checksums differ). It
+says to rebuild or re-download msi-mux-switch into a folder only you can write,
+under folders owned by root and not writable by group or others, then run
+setup again on that fresh file.
+
+Never `chmod` such a file and retry. A file another account could write may
+already hold that account's content, and a write descriptor it opened earlier
+survives a `chmod`: it could keep writing afterwards. Only a fresh file in a
+folder only you can write is known to hold only what you built.
+
+For the other refusals (a folder of the wrong shape, for instance one that
+holds other files), put the binary in a folder of its own. At the end,
+`setup.sh` checks that the binary and every folder above it are owned by root,
+writable by no one but root and on no FUSE or user mount. To run it by hand:
 
 ```bash
 bash ~/.config/omarchy/plugins/io.github.rsd.msi-mux/setup.sh /opt/msi-mux-switch/msi-mux-switch
@@ -322,7 +371,10 @@ Ctrl+Alt+F2, log in on the text console and run the same `rm`.
 
 | What the panel shows | Meaning and fix |
 |---|---|
-| Greyed, "...is owned by ..., not root", "...writable by group or others", "...is a symbolic link" | The root-ownership check failed. Use **Set up backend**. |
+| Greyed, "...is owned by ..., not root", "...writable by group or others", "...is a symbolic link" | The root-ownership check failed. Use **Set up backend**; it tells you to rebuild into a folder only you can write when another account could already have changed the file. |
+| "GPU mode unknown" with "...is on a fuse mount at ..., which another account may control." or "...is on a mount at ... owned by user_id ..." | A FUSE or user mount sits on the binary's path or a folder above it. Move the binary to a folder like `/opt/msi-mux-switch`. No **Set up backend** button. |
+| "...could not be checked: /proc/self/mountinfo could not be read." (or "...could not be parsed.", "...has no entry for /.") | The mount table could not be read whole (it is limited to 1 MiB), so the plugin refuses. Try again; if it persists, the table is unusual. No **Set up backend** button. |
+| "... or a folder above it changed while it was being checked (stat gave two different answers)." | The binary or a folder above it changed between the two stats. Rebuild into a folder only you can write, then try again. |
 | Greyed, "msi-mux-switch was not found at ..." | Install the binary, or fix the path setting. |
 | "Not an MSI machine": widget hidden | Expected. |
 | Greyed, "...have not been tested on this machine (model, board, BIOS)" | Not in either table; switching stays off. |
@@ -331,7 +383,7 @@ Ctrl+Alt+F2, log in on the text console and run the same `rm`.
 | "Needs AC power (state unknown)" | The plugin could not find an AC supply under `/sys/class/power_supply`. |
 | "Not offered by this firmware" | That mode is not available on this laptop. |
 | "A switch is staged..." | A switch is waiting for a full shutdown (see [Switching](#switching)). Use **Shut down now**. |
-| "The firmware still has a switch in progress. A full shutdown clears it." | The firmware's apply-ready flag is set with nothing staged, usually after a switch that failed and rolled back. msi-mux-switch refuses ("apply-ready is already set before any write") until a full shutdown. Use **Shut down now**. |
+| "The firmware still has a switch in progress. A full shutdown clears it." | The firmware's apply-ready flag is set with nothing staged, usually after a switch that failed and rolled back. msi-mux-switch refuses ("apply-ready is already set before any write") until a full shutdown. Use **Shut down now**. The plugin remembers this in the shell until the boot changes (see [Switching](#switching)); a shell restart forgets it, and the next switch attempt shows the refusal again. |
 | "Authentication cancelled" / "Not authorized" | The polkit prompt was dismissed or refused. Nothing changed. |
 | "msi-mux-switch is already running" | Another switch is in progress; wait for it. |
 | "msi-mux-switch --debug did not answer within 10 s." / "...printed more than 1 MiB; not read." | The state read was stopped (it is limited to 10 s and 1 MiB). Check the binary path setting and run `msi-mux-switch --debug --json` by hand. |
@@ -356,8 +408,9 @@ What the plugin runs and writes, and when:
 - **As root**, only `pkexec --disable-internal-agent <binary> <mode> --json
   [flags]`, an argv array with no shell, after you confirm the mode in the
   switch dialog. Right before it, the binary and every folder above it are
-  checked again: root-owned, not writable by group or others, not a symlink,
-  not under a user mount (see [Make it root-owned](#2-make-it-root-owned)).
+  checked again, by the gate read below: root-owned, not writable by group or
+  others, not a symlink, not under a user-mount prefix, on no FUSE or user
+  mount (see [Make it root-owned](#2-make-it-root-owned)).
 - **With sudo**, only `setup.sh`, opened in a visible terminal when you click
   **Set up backend**. It prints every command before it runs and asks before
   running the first. It refuses a source binary that is not a regular file, is
@@ -369,9 +422,33 @@ What the plugin runs and writes, and when:
   descriptor. After the folder is made root-owned it rechecks the binary's
   owner, mode and inode. After `sudo install` makes the root-owned staged copy
   it hashes that copy and runs the `mv` only on a match; otherwise it prints
-  and runs `sudo rm -f -- <staged>` and replaces nothing. At the end the binary
-  and every folder above it must be owned by root and writable by no one but
-  root.
+  and runs `sudo rm -f -- <staged>` and replaces nothing. It also runs the
+  mount check (see below) before the first change, after the folder is made
+  root-owned and at the end. At the end the binary and every folder above it
+  must be owned by root, writable by no one but root and on no FUSE or user
+  mount. Wherever another account could already have changed the binary
+  (writable or foreign-owned binary or folder above it, a FUSE or user mount,
+  a change while or after the check) it prints the same advice: rebuild or
+  re-download msi-mux-switch into a folder only you can write, then run setup
+  again. It never says to `chmod` and retry: the file may already hold another
+  account's content, and a write descriptor opened earlier survives a `chmod`.
+- **The gate read** (the status read and the switch use the same one): one
+  `bash -c` process that runs `stat` on the binary and every folder above it,
+  reads `/proc/self/mountinfo` (at most 1 MiB), and runs the same `stat`
+  again. It refuses when any mount at the binary's path or a folder above it
+  (every such mount, not only the topmost) is `fuse`, `fuseblk` or `fuse.*`
+  or carries `user_id=` other than 0, when mountinfo is unreadable, over
+  1 MiB, malformed or has no entry for `/`, or when the two `stat` answers
+  differ. The paths and format are positional arguments; nothing but the size
+  cap is part of the script text. Each gate decision uses a fresh read; the
+  switch never reuses the status read's. The panel offers no **Set up
+  backend** for a mount refusal.
+- **Residual risk**: a check that runs before `pkexec` cannot be atomic with
+  the exec. An account that can mount FUSE with `allow_other`
+  (`user_allow_other` in `/etc/fuse.conf`) could still try to win a timing
+  race by remounting within the ~1 ms between the mountinfo read and the second
+  `stat`. Without `user_allow_other`, another account's FUSE mount is not
+  traversable by this user or root, the `stat` fails and the gate refuses.
 - **Shutdown**: `omarchy-system shutdown` runs only from **Shut down now** in
   the shutdown confirmation dialog.
 - **Files**: it writes only `~/.config/uwsm/env.d/90-msi-mux-gpu` and, for
@@ -389,9 +466,22 @@ What the plugin runs and writes, and when:
   is read. That last read is gated by the same check as the switch (regular
   file, not a symlink, root-owned, not writable by group or others, every
   folder above it root-owned, not writable by group or others and not a
-  symlink, not under a user mount), judged on a `stat` taken just before each
-  read. A binary that fails it is never run: the panel shows why, the header
-  says "GPU mode unknown", and no earlier reading stays on screen.
+  symlink, not under a user-mount prefix, on no FUSE or user mount), judged on
+  the gate read taken just before each read. Also read, with each state read:
+  `/proc/sys/kernel/random/boot_id`. A binary that fails the gate is never
+  run: the panel shows why, the header says "GPU mode unknown", and no earlier
+  reading stays on screen. That holds for any refusal (the `stat` or the mount
+  check, at the status read or at the switch): no mode row shows a status, there
+  is no lock line or **Shut down now**, and the environment status is neutral.
+- **Leftover firmware flag**: after a switch that failed, rolled back and
+  left the apply-ready flag set with nothing staged, the shell remembers
+  `{boot id, current mode, target mode}` in memory (never on disk). While it
+  holds, the panel shows "The firmware still has a switch in progress. A full
+  shutdown clears it." with **Shut down now** and no Switch buttons, as for a
+  staged switch. It is dropped when the boot id changes or cannot be read,
+  when a later status read shows a different current or target mode, or when
+  the gate refuses. A shell restart forgets it; the next switch attempt shows
+  the refusal again.
 - **Switch output**: the switch's stdout and stderr are read in raw chunks
   and split into lines by the plugin, and no line it holds grows past
   65,537 characters: the rest of a longer line is dropped up to its next
@@ -414,10 +504,10 @@ bash tests/run.sh
 runs the manifest validation, QML lint and load checks, the widget live
 against fake binaries (including the dialogs' keys and those of a panel that
 reopened by itself, a flooding and a hanging binary, and a binary that fails
-the ownership check and must never be run, even for the debug read), the model
-tests, the env file sourced by `sh` against fixture trees, `setup.sh` against a
-fake `sudo` (including its source-binary refusals and the checksum mismatch
-path), and shellcheck. It never runs the real
+the ownership or mount check and must never be run, even for the debug read),
+the model tests (including mountinfo fixtures under `tests/fixtures`), the env file sourced by `sh` against fixture trees, `setup.sh` against a
+fake `sudo` (including its source-binary and mount refusals and the checksum
+mismatch path), and shellcheck. It never runs the real
 msi-mux-switch, `pkexec`, `sudo` or a shutdown, and never writes under
 `~/.config`.
 

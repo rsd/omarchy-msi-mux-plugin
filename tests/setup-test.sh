@@ -9,15 +9,25 @@
 # owner-and-mode query only) reports a marked path as root-owned with mode
 # 755, a path in the "others" list as owned by uid 4242, a path in the
 # "root-real" list (checked first) as root-owned with its real mode, and
-# anything else as the real stat does. Every run has PATH starting with the
-# fakes and a temporary HOME; a run is refused if `sudo` would resolve
-# anywhere else.
+# anything else as the real stat does. The fake cat (for setup.sh's read of
+# /proc/self/mountinfo only) serves the file MM_MOUNTINFO names, fails when
+# it is "unreadable", and serves a plain ext4 root when it is unset; on chown
+# (MM_SUDO_MOUNTINFO) or mv (MM_SUDO_MV_MOUNTINFO) the fake sudo copies the
+# file named there over MM_MOUNTINFO, a mount appearing mid-run. On its
+# MM_CAT_FLIP_AT-th read of mountinfo (1: the first check, 2: the re-check, 3:
+# the final check) the fake cat adds the path MM_CAT_FLIP names to the
+# "flipped" list, which the fake stat (checking it before any other) reports
+# as owned by uid 4242: the stat after the mount check then differs from the
+# one before, as when a FUSE mount forges a stat and unmounts lazily. Every run
+# has PATH starting with the fakes and a temporary HOME; a run is refused if
+# `sudo` would resolve anywhere else.
 
 set -u
 
 PLUGIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 SETUP=$PLUGIN_DIR/setup.sh
 REAL_STAT=$(command -v stat)
+REAL_CAT=$(command -v cat)
 FAILED=0
 CHECKS=0
 
@@ -34,8 +44,12 @@ FAKE=$T/fakebin
 ROOTS=$T/roots       # paths the fake stat reports as root:root 755
 OTHERS=$T/others     # paths the fake stat reports as owned by uid 4242
 ROOTREAL=$T/rootreal # paths the fake stat reports as root-owned, real mode
+FLIPPED=$T/flipped   # paths the fake stat reports as uid 4242, before the rest
+CAT_READS=$T/catreads
 SUDO_LOG=$T/sudo.log
+PLAIN_MI=$T/mountinfo-plain
 mkdir -p "$FAKE" "$T/home"
+printf '%s\n' '22 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw' >"$PLAIN_MI"
 : >"$ROOTS"
 : >"$OTHERS"
 : >"$ROOTREAL"
@@ -48,6 +62,7 @@ printf '%s\n' "\$*" >>"$SUDO_LOG"
 mark() { printf '%s\n' "\$1" >>"$ROOTS"; }
 if [[ \$1 == chown && \$2 == -h && \$3 == root:root && \$4 == -- && \$# == 5 ]]; then
   mark "\$5"
+  if [[ -n \${MM_SUDO_MOUNTINFO:-} ]]; then cp -- "\$MM_SUDO_MOUNTINFO" "\$MM_MOUNTINFO"; fi
   # The race setup.sh guards against: the binary swapped for a link while
   # sudo asks for the password.
   if [[ -n \${MM_SUDO_SWAP:-} ]]; then rm -f -- "\$MM_SUDO_SWAP"; ln -s /etc/hostname "\$MM_SUDO_SWAP"; fi
@@ -66,8 +81,9 @@ if [[ "\$1 \$2 \$3 \$4 \$5 \$6 \$7 \$8" == "install -o root -g root -m 755 --" &
   exit
 fi
 if [[ \$1 == mv && \$2 == -f && \$3 == -- && \$# == 5 ]]; then
-  mv -f -- "\$4" "\$5" && mark "\$5"
-  exit
+  mv -f -- "\$4" "\$5" && mark "\$5" || exit
+  if [[ -n \${MM_SUDO_MV_MOUNTINFO:-} ]]; then cp -- "\$MM_SUDO_MV_MOUNTINFO" "\$MM_MOUNTINFO"; fi
+  exit 0
 fi
 if [[ \$1 == rm && \$2 == -f && \$3 == -- && \$# == 4 ]]; then
   rm -f -- "\$4"
@@ -82,6 +98,11 @@ cat >"$FAKE/stat" <<EOF
 path=\${4:-}
 fake=0
 [[ \${1:-} == -c && \${2:-} == '%u %f %U' && \${3:-} == -- && \$# == 4 ]] && fake=1
+if ((fake)) && grep -qxF -- "\$path" "$FLIPPED"; then
+  raw=\$("$REAL_STAT" -c %f -- "\$path") || exit 1
+  printf '4242 %s someone\n' "\$raw"
+  exit 0
+fi
 if ((fake)) && grep -qxF -- "\$path" "$ROOTREAL"; then
   raw=\$("$REAL_STAT" -c %f -- "\$path") || exit 1
   printf '0 %s root\n' "\$raw"
@@ -99,7 +120,28 @@ if ((fake)) && grep -qxF -- "\$path" "$OTHERS"; then
 fi
 exec "$REAL_STAT" "\$@"
 EOF
-chmod 755 "$FAKE/sudo" "$FAKE/stat"
+# Called by setup.sh as: cat -- /proc/self/mountinfo
+cat >"$FAKE/cat" <<EOF
+#!/bin/bash
+if [[ \$# == 2 && \$1 == -- && \$2 == /proc/self/mountinfo ]]; then
+  printf 'x\n' >>"$CAT_READS"
+  if [[ -n \${MM_CAT_FLIP:-} && \$(wc -l <"$CAT_READS") == "\${MM_CAT_FLIP_AT:-1}" ]]; then
+    printf '%s\n' "\$MM_CAT_FLIP" >>"$FLIPPED"
+  fi
+  # The forged root view of MM_CAT_UNROOT gone after the first read.
+  if [[ -n \${MM_CAT_UNROOT:-} && \$(wc -l <"$CAT_READS") == 1 ]]; then
+    grep -vxF -- "\$MM_CAT_UNROOT" "$ROOTS" >"$ROOTS.new"
+    "$REAL_CAT" -- "$ROOTS.new" >"$ROOTS"
+  fi
+  case \${MM_MOUNTINFO:-} in
+    unreadable) exit 1 ;;
+    "") exec "$REAL_CAT" -- "$PLAIN_MI" ;;
+    *) exec "$REAL_CAT" -- "\$MM_MOUNTINFO" ;;
+  esac
+fi
+exec "$REAL_CAT" "\$@"
+EOF
+chmod 755 "$FAKE/sudo" "$FAKE/stat" "$FAKE/cat"
 
 # run_setup <stdin text> <args...>: setup.sh's output in OUT, status in STATUS.
 OUT=""
@@ -112,6 +154,8 @@ run_setup() {
     exit 1
   fi
   : >"$SUDO_LOG"
+  : >"$FLIPPED"
+  : >"$CAT_READS"
   OUT=$(printf '%b' "$input" | env PATH="$FAKE:$PATH" HOME="$T/home" bash "$SETUP" "$@" 2>&1)
   STATUS=$?
 }
@@ -131,6 +175,23 @@ no_sudo() {
     fail "$1: sudo was called: $(tr '\n' '|' <"$SUDO_LOG")"
   else
     ok "$1: sudo was not called"
+  fi
+}
+
+# fresh_copy_hint <name> <marker>: from the line holding <marker> on, the
+# advice is a fresh build in a folder only you can write, and never a chmod,
+# chown, fix by hand or retry on the same file: a binary another account could
+# have changed may already hold its content.
+REBUILD="Rebuild or re-download msi-mux-switch into a folder only you can write"
+fresh_copy_hint() {
+  local name=$1 rest
+  rest=$(sed -n "/$(printf '%s' "$2" | sed 's/[][\/.*^$]/\\&/g')/,\$p" <<<"$OUT")
+  if [[ -n $rest ]] && grep -qF -- "$REBUILD" <<<"$rest" && grep -qF -- "then run setup again" <<<"$rest" &&
+    ! grep -qiE 'chmod|chown|by hand|run this again|move msi-mux-switch somewhere|Check .* and run' <<<"$rest"; then
+    ok "$name: the hint is a fresh copy, not a fix in place or a retry"
+  else
+    fail "$name: the hint is not a fresh copy (or suggests a fix in place or a retry)"
+    quote "$OUT"
   fi
 }
 
@@ -245,12 +306,14 @@ make_tree "$T/s"
 chmod 1755 "$T/s/opt/msi-mux-switch"
 run_setup "y\n" "$T/s/opt/msi-mux-switch/msi-mux-switch"
 expect "a sticky folder of the user's is refused" 1 "$T/s/opt/msi-mux-switch has the sticky bit"
+fresh_copy_hint "sticky folder" "Refusing to change"
 no_sudo "sticky folder"
 
 make_tree "$T/w"
 chmod 757 "$T/w/opt/msi-mux-switch"
 run_setup "y\n" "$T/w/opt/msi-mux-switch/msi-mux-switch"
 expect "an other-writable folder is refused" 1 "$T/w/opt/msi-mux-switch is writable by group or others."
+fresh_copy_hint "other-writable folder" "Refusing to change"
 no_sudo "other-writable folder"
 chmod 775 "$T/w/opt/msi-mux-switch"
 run_setup "y\n" "$T/w/opt/msi-mux-switch/msi-mux-switch"
@@ -261,6 +324,8 @@ make_tree "$T/e"
 printf 'x\n' >"$T/e/opt/msi-mux-switch/notes.txt"
 run_setup "y\n" "$T/e/opt/msi-mux-switch/msi-mux-switch"
 expect "a folder holding another file is refused" 1 "holds other files besides msi-mux-switch"
+# Not a sign of tampering: the hint is still to give it a folder of its own.
+if grep -qF "Put msi-mux-switch alone in a folder of its own" <<<"$OUT"; then ok "extra file: the hint is a folder of its own"; else fail "extra file: no folder-of-its-own hint"; quote "$OUT"; fi
 no_sudo "extra file"
 rm -f "$T/e/opt/msi-mux-switch/notes.txt"
 printf 'x\n' >"$T/e/opt/msi-mux-switch/.hidden"
@@ -272,6 +337,7 @@ make_tree "$T/o"
 printf '%s\n' "$T/o/opt/msi-mux-switch" >>"$OTHERS"
 run_setup "y\n" "$T/o/opt/msi-mux-switch/msi-mux-switch"
 expect "a folder owned by another user is refused" 1 "$T/o/opt/msi-mux-switch is owned by someone, not by you or root."
+fresh_copy_hint "other user's folder" "Refusing to change"
 no_sudo "other user's folder"
 
 # A directory further up fails: an unmarked tree.
@@ -280,6 +346,7 @@ printf 'x\n' >"$T/b/x/opt/msi-mux-switch/msi-mux-switch"
 run_setup "y\n" "$T/b/x/opt/msi-mux-switch/msi-mux-switch"
 expect "a failing directory further up is refused" 1 "A directory above $T/b/x/opt/msi-mux-switch fails the check:"
 if grep -qF "$T/b/x/opt is owned by" <<<"$OUT"; then ok "the failing ancestor is named"; else fail "the failing ancestor is not named"; fi
+fresh_copy_hint "failing ancestor" "fails the check:"
 no_sudo "further ancestor"
 
 # A directory further up owned by root but writable by others.
@@ -289,6 +356,7 @@ printf '%s\n' "$T/g/opt" >>"$ROOTREAL"
 run_setup "y\n" "$T/g/opt/msi-mux-switch/msi-mux-switch"
 expect "a root-owned but other-writable directory further up is refused" 1 "$T/g/opt is writable by group or others."
 if grep -qF "A directory above $T/g/opt/msi-mux-switch fails the check:" <<<"$OUT"; then ok "it is reported as a directory above"; else fail "not reported as a directory above"; fi
+fresh_copy_hint "other-writable ancestor" "fails the check:"
 no_sudo "other-writable ancestor"
 
 # --- the binary itself: another user's, or writable by group or others
@@ -299,6 +367,7 @@ run_setup "y\n" "$T/ob/opt/msi-mux-switch/msi-mux-switch"
 expect "a binary owned by another user is refused" 1 "Refusing to install $T/ob/opt/msi-mux-switch/msi-mux-switch:"
 if grep -qF "  $T/ob/opt/msi-mux-switch/msi-mux-switch is owned by someone, not by you or root." <<<"$OUT"; then ok "the other owner is named"; else fail "the other owner is not named"; quote "$OUT"; fi
 if grep -qF "Nothing was changed." <<<"$OUT"; then ok "another user's binary: nothing was changed"; else fail "no 'Nothing was changed.'"; fi
+fresh_copy_hint "other user's binary" "Refusing to install"
 no_sudo "other user's binary"
 
 make_tree "$T/ow"
@@ -314,11 +383,212 @@ if grep -qF "Rebuild or re-download msi-mux-switch into a folder only you can wr
 else
   fail "the writable binary's hint is not a fresh copy (or suggests chmod)"; quote "$OUT"
 fi
+fresh_copy_hint "other-writable binary" "Refusing to install"
 no_sudo "other-writable binary"
 chmod 775 "$T/ow/opt/msi-mux-switch/msi-mux-switch"
 run_setup "y\n" "$T/ow/opt/msi-mux-switch/msi-mux-switch"
 expect "a group-writable binary is refused" 1 "Refusing to install $T/ow/opt/msi-mux-switch/msi-mux-switch:"
 no_sudo "group-writable binary"
+
+# --- mounts another account may control (FUSE, user_id=), from mountinfo
+
+# mi_esc <path>: the path as mountinfo writes it (space, tab, newline and
+# backslash as octal escapes).
+mi_esc() {
+  local s=${1//\\/\\134}
+  s=${s// /\\040}
+  s=${s//$'\t'/\\011}
+  s=${s//$'\n'/\\012}
+  printf '%s' "$s"
+}
+MI=$T/mountinfo
+MI_ROOT='22 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw'
+# mi <lines...>: the plain root, then the given lines, as $MI.
+mi() { printf '%s\n' "$MI_ROOT" "$@" >"$MI"; }
+# mi_refused <name> <pattern>: $BIN refused on its mounts, nothing run.
+mi_refused() {
+  MM_MOUNTINFO=$MI run_setup "y\n" "$BIN"
+  expect "$1" 1 "$2"
+  fresh_copy_hint "$1" "$2"
+  no_sudo "$1"
+}
+# mi_passes <name>: the mount check passes (the run goes on to ask).
+mi_passes() {
+  MM_MOUNTINFO=$MI run_setup "n\n" "$BIN"
+  expect "$1" 1 "Cancelled."
+  no_sudo "$1"
+}
+
+mi
+mi_passes "a plain ext4 root passes"
+printf '%s\n' '22 1 259:2 / / rw,relatime - ext4 /dev/nvme0n1p2 rw' \
+  "30 22 0:26 / $(mi_esc "$T") rw shared:2 master:7 propagate_from:1 - tmpfs tmpfs rw,size=8g" >"$MI"
+mi_passes "no optional fields, or three, both parse"
+
+mi "40 22 0:50 / $(mi_esc "$T/a") rw,nosuid,nodev,relatime shared:9 - fuse.sshfs me@host:/srv rw,user_id=1000,group_id=1000"
+mi_refused "fuse.sshfs at an ancestor is refused" "is on a FUSE mount at $(mi_esc "$T/a") (fuse.sshfs)"
+mi "40 22 8:17 / $(mi_esc "$DIR") rw,relatime - fuseblk /dev/sdb1 rw,user_id=0,group_id=0,allow_other"
+mi_refused "fuseblk at the binary's own folder is refused" "is on a FUSE mount at $(mi_esc "$DIR") (fuseblk)"
+mi "40 22 0:51 / $(mi_esc "$BIN") rw - fuse /dev/fuse rw,user_id=0,group_id=0"
+mi_refused "fuse over the binary itself is refused, even with user_id=0" "is on a FUSE mount at $(mi_esc "$BIN") (fuse)"
+mi "40 22 0:52 / $(mi_esc "$T") rw,relatime - tmpfs tmpfs rw,user_id=1000"
+mi_refused "a non-FUSE mount with user_id=1000 is refused" "is on a user mount at $(mi_esc "$T") (user_id=1000)"
+mi "40 22 0:52 / $(mi_esc "$T") rw,relatime,user_id=1000 - tmpfs tmpfs rw"
+mi_refused "user_id=1000 in the mount options is refused" "is on a user mount at $(mi_esc "$T") (user_id=1000)"
+mi "40 22 0:52 / $(mi_esc "$T") rw,relatime - tmpfs tmpfs rw,user_id=0"
+mi_passes "a non-FUSE mount with user_id=0 passes"
+# Mounted at the same point later, below a plain one: still refused.
+mi "40 22 0:50 / $(mi_esc "$T/a") rw - fuse.sshfs x rw" "41 40 0:53 / $(mi_esc "$T/a") rw - ext4 /dev/sdc1 rw"
+mi_refused "a FUSE mount hidden under a later mount at the same point is refused" "is on a FUSE mount"
+mi "40 22 0:50 / $(mi_esc "$T/a")/opt/msi-mux-switchX rw - fuse.sshfs x rw" \
+  "41 22 0:54 / $(mi_esc "$T/a")/op rw - fuse.sshfs x rw"
+mi_passes "a FUSE mount at a sibling with the same prefix passes"
+# A source of "-" and an empty one do not shift the fields.
+mi "40 22 0:55 / $(mi_esc "$T/q") rw - tmpfs - rw" "41 22 0:56 / $(mi_esc "$T/q2") rw - tmpfs  rw"
+mi_passes "a source of '-' or an empty source parses"
+
+# A folder with a space in its name: \040 in mountinfo.
+make_tree "$T/sp ace"
+SPBIN="$T/sp ace/opt/msi-mux-switch/msi-mux-switch"
+mi "40 22 0:50 / $(mi_esc "$T/sp ace") rw - fuse.sshfs x rw"
+if [[ $(mi_esc "$T/sp ace") == *'\040'* ]]; then ok "the fixture escapes the space as \\040"; else fail "the fixture does not escape the space"; fi
+MM_MOUNTINFO=$MI run_setup "y\n" "$SPBIN"
+expect "a FUSE mount whose name holds \\040 and covers the binary is refused" 1 "is on a FUSE mount at $(mi_esc "$T/sp ace")"
+no_sudo "\\040 mount covering"
+mi "40 22 0:50 / $(mi_esc "$T/sp ace2") rw - fuse.sshfs x rw" "41 22 0:50 / $(mi_esc "$T/sp")\\134040ace rw - fuse.sshfs x rw"
+MM_MOUNTINFO=$MI run_setup "n\n" "$SPBIN"
+expect "a FUSE mount whose name holds \\040 and does not cover the binary passes" 1 "Cancelled."
+no_sudo "\\040 mount not covering"
+
+# user_id= is decimal digits worth 0 to pass; empty or not digits refuses.
+mi "40 22 0:52 / $(mi_esc "$T") rw - tmpfs tmpfs rw,user_id=00"
+mi_passes "user_id=00 passes"
+mi "40 22 0:52 / $(mi_esc "$T") rw - tmpfs tmpfs rw,user_id="
+mi_refused "an empty user_id= is refused" "is on a user mount at $(mi_esc "$T") (user_id=)"
+mi "40 22 0:52 / $(mi_esc "$T") rw - tmpfs tmpfs rw,user_id=0x"
+mi_refused "user_id=0x is refused" "is on a user mount at $(mi_esc "$T") (user_id=0x)"
+mi "40 22 0:52 / $(mi_esc "$T") rw - tmpfs tmpfs rw,user_id=-0"
+mi_refused "user_id=-0 is refused" "(user_id=-0)"
+
+# Escapes: a backslash and three octal digits decode, anything else is
+# unparseable.
+mi "40 22 0:52 / $(mi_esc "$T/q")\\400 rw - fuse.sshfs x rw"
+mi_passes "an escape of three octal digits above 377 decodes"
+for bad in '\08x' '\x41' '\12' "\\"; do
+  mi "40 22 0:52 / $(mi_esc "$T/q")$bad rw - tmpfs tmpfs rw"
+  MM_MOUNTINFO=$MI run_setup "y\n" "$BIN"
+  expect "a mount point ending in $bad is unparseable" 1 "$BIN could not be checked: /proc/self/mountinfo could not be parsed."
+  no_sudo "bad escape $bad"
+done
+
+# The numeric fields: mount id, parent id, maj:min.
+for bad in "x 22 0:52" "4a 22 0:52" "40 x 0:52" "40 22 052" "40 22 0:5a" "40 22 :52" "40 22 0:" "-1 22 0:52"; do
+  mi "$bad / $(mi_esc "$T/z") rw - tmpfs tmpfs rw"
+  MM_MOUNTINFO=$MI run_setup "y\n" "$BIN"
+  expect "numeric fields '$bad' are unparseable" 1 "$BIN could not be checked: /proc/self/mountinfo could not be parsed."
+  no_sudo "numeric fields '$bad'"
+done
+
+# Fail safe: what cannot be read or parsed refuses.
+MM_MOUNTINFO=unreadable run_setup "y\n" "$BIN"
+expect "an unreadable mountinfo is refused" 1 "$BIN could not be checked: /proc/self/mountinfo could not be read."
+no_sudo "unreadable mountinfo"
+: >"$MI"
+MM_MOUNTINFO=$MI run_setup "y\n" "$BIN"
+expect "an empty mountinfo is refused" 1 "$BIN could not be checked: /proc/self/mountinfo could not be parsed."
+no_sudo "empty mountinfo"
+mi "40 22 0:52 / $(mi_esc "$T/z") rw shared:3 tmpfs tmpfs rw"
+MM_MOUNTINFO=$MI run_setup "y\n" "$BIN"
+expect "a line without the - separator is refused" 1 "$BIN could not be checked: /proc/self/mountinfo could not be parsed."
+no_sudo "no separator"
+mi "40 22 0:52 / $(mi_esc "$T/z") rw - tmpfs"
+MM_MOUNTINFO=$MI run_setup "y\n" "$BIN"
+expect "a line with too few fields after - is refused" 1 "$BIN could not be checked: /proc/self/mountinfo could not be parsed."
+no_sudo "too few fields after -"
+mi "40 22 0:52 / - tmpfs tmpfs rw"
+MM_MOUNTINFO=$MI run_setup "y\n" "$BIN"
+expect "a line with too few fields before - is refused" 1 "$BIN could not be checked: /proc/self/mountinfo could not be parsed."
+no_sudo "too few fields before -"
+mi "" "40 22 0:52 / $(mi_esc "$T/z") rw - tmpfs tmpfs rw"
+MM_MOUNTINFO=$MI run_setup "y\n" "$BIN"
+expect "an empty line inside is refused" 1 "$BIN could not be checked: /proc/self/mountinfo could not be parsed."
+no_sudo "empty line"
+printf '%s\n' "30 1 259:1 / /boot rw - vfat /dev/nvme0n1p1 rw" >"$MI"
+MM_MOUNTINFO=$MI run_setup "y\n" "$BIN"
+expect "no entry for / is refused" 1 "$BIN could not be checked: /proc/self/mountinfo has no entry for /."
+no_sudo "no / entry"
+if grep -qF "Refusing" <<<"$OUT" && ! grep -qF "Rebuild" <<<"$OUT"; then ok "a mountinfo that cannot be checked does not blame the binary"; else fail "unexpected hint for an unchecked mountinfo"; quote "$OUT"; fi
+
+# A FUSE mount appearing over the folder while sudo runs: the re-check after
+# the folder stops before the copy.
+make_tree "$T/fm"
+FMBIN=$T/fm/opt/msi-mux-switch/msi-mux-switch
+mi
+printf '%s\n' "$MI_ROOT" "40 22 0:50 / $(mi_esc "$T/fm/opt") rw - fuse.sshfs x rw" >"$T/mountinfo-fuse-fm"
+MM_MOUNTINFO=$MI MM_SUDO_MOUNTINFO=$T/mountinfo-fuse-fm run_setup "y\n" "$FMBIN"
+expect "a FUSE mount appearing during sudo: stops after the folder" 1 "is on a FUSE mount at $(mi_esc "$T/fm/opt")"
+if [[ $(wc -l <"$SUDO_LOG") == 2 ]]; then ok "FUSE during sudo: only the folder's two commands ran"; else fail "sudo ran: $(tr '\n' '|' <"$SUDO_LOG")"; fi
+fresh_copy_hint "FUSE mount during sudo" "Stopped after making"
+
+# ... or after the move: the final check says so.
+make_tree "$T/fv"
+FVBIN=$T/fv/opt/msi-mux-switch/msi-mux-switch
+mi
+printf '%s\n' "$MI_ROOT" "40 22 0:50 / $(mi_esc "$T/fv") rw - fuse.sshfs x rw" >"$T/mountinfo-fuse-fv"
+MM_MOUNTINFO=$MI MM_SUDO_MV_MOUNTINFO=$T/mountinfo-fuse-fv run_setup "y\n" "$FVBIN"
+expect "a FUSE mount appearing after the move: still not safe" 1 "Still not safe:"
+if grep -qF "  $FVBIN is on a FUSE mount at $(mi_esc "$T/fv")" <<<"$OUT"; then ok "the final check names the mount"; else fail "the final check does not name the mount"; quote "$OUT"; fi
+
+# --- the stats around the mount check must agree (a FUSE mount can forge a
+# stat, then unmount lazily before mountinfo is read)
+
+# Forged as root-owned 755 for the first stat, really yours after: without
+# the second stat this would pass as already set up.
+make_tree "$T/fg"
+FGBIN=$T/fg/opt/msi-mux-switch/msi-mux-switch
+printf '%s\n' "$FGBIN" "$T/fg/opt/msi-mux-switch" >>"$ROOTS"
+run_setup "y\n" "$FGBIN"
+expect "a forged root-owned binary: the control run is already set up" 0 "Already set up"
+MM_CAT_UNROOT=$FGBIN run_setup "y\n" "$FGBIN"
+expect "a forged stat that changes after the mount check is refused" 1 \
+  "$FGBIN, or a directory above it, changed while it was being checked."
+fresh_copy_hint "forged stat" "changed while it was being checked"
+no_sudo "forged stat"
+if grep -qF "Already set up" <<<"$OUT"; then fail "forged stat: still reported as set up"; else ok "forged stat: not reported as set up"; fi
+
+make_tree "$T/f1"
+F1BIN=$T/f1/opt/msi-mux-switch/msi-mux-switch
+MM_CAT_FLIP=$F1BIN run_setup "y\n" "$F1BIN"
+expect "the binary's owner changing across the first mount check is refused" 1 \
+  "$F1BIN, or a directory above it, changed while it was being checked."
+fresh_copy_hint "binary changed across the first mount check" "changed while it was being checked"
+no_sudo "binary changed across the first mount check"
+make_tree "$T/f2"
+MM_CAT_FLIP=$T/f2/opt run_setup "y\n" "$T/f2/opt/msi-mux-switch/msi-mux-switch"
+expect "an ancestor's owner changing across the first mount check is refused" 1 "changed while it was being checked."
+no_sudo "ancestor changed across the first mount check"
+
+# The re-check after the folder: its own stats around its mount check.
+make_tree "$T/f3"
+F3BIN=$T/f3/opt/msi-mux-switch/msi-mux-switch
+MM_CAT_FLIP=$T/f3/opt/msi-mux-switch MM_CAT_FLIP_AT=2 run_setup "y\n" "$F3BIN"
+expect "a change across the re-check's mount check stops after the folder" 1 \
+  "$F3BIN, or a directory above it, changed while it was being checked."
+if grep -qF "Stopped after making" <<<"$OUT"; then ok "re-check change: stopped after the folder"; else fail "re-check change: not stopped after the folder"; quote "$OUT"; fi
+if [[ $(wc -l <"$SUDO_LOG") == 2 ]]; then ok "re-check change: only the folder's two commands ran"; else fail "sudo ran: $(tr '\n' '|' <"$SUDO_LOG")"; fi
+fresh_copy_hint "change across the re-check" "Stopped after making"
+
+# The final check: the same.
+make_tree "$T/f4"
+F4BIN=$T/f4/opt/msi-mux-switch/msi-mux-switch
+MM_CAT_FLIP=$T/f4/opt MM_CAT_FLIP_AT=3 run_setup "y\n" "$F4BIN"
+expect "a change across the final mount check: still not safe" 1 "Still not safe:"
+if grep -qF "  $F4BIN, or a directory above it, changed while it was being checked." <<<"$OUT"; then
+  ok "the final check names the change"
+else
+  fail "the final check does not name the change"; quote "$OUT"
+fi
+fresh_copy_hint "change across the final check" "Still not safe:"
 
 # --- the commands, declined and accepted
 
@@ -357,6 +627,7 @@ rm -f -- "$DIR/.msi-mux-switch.new"
 make_tree "$T/r"
 MM_SUDO_SWAP=$T/r/opt/msi-mux-switch/msi-mux-switch run_setup "y\n" "$T/r/opt/msi-mux-switch/msi-mux-switch"
 expect "a binary swapped during sudo: stops after the folder" 1 "is no longer a regular file."
+fresh_copy_hint "binary swapped during sudo" "Stopped after making"
 if [[ $(cat "$SUDO_LOG") == "$(printf '%s\n%s' "chown -h root:root -- $T/r/opt/msi-mux-switch" "chmod 755 -- $T/r/opt/msi-mux-switch")" ]]; then
   ok "only the folder's two commands ran"
 else
@@ -379,6 +650,7 @@ else
   fail "sudo ran: $(tr '\n' '|' <"$SUDO_LOG")"
 fi
 if [[ ! -e $CDIR/.msi-mux-switch.new ]]; then ok "no staged copy is left"; else fail "the staged copy is left"; fi
+fresh_copy_hint "binary changed after the check" "changed after it was checked"
 
 # The binary made other-writable during sudo: the recheck stops before the copy.
 make_tree "$T/m"
@@ -386,6 +658,7 @@ MBIN=$T/m/opt/msi-mux-switch/msi-mux-switch
 MM_SUDO_CHMOD=$MBIN run_setup "y\n" "$MBIN"
 expect "a binary made writable during sudo: stops after the folder" 1 "$MBIN is writable by group or others."
 if [[ $(wc -l <"$SUDO_LOG") == 2 ]]; then ok "only the folder's two commands ran"; else fail "sudo ran: $(tr '\n' '|' <"$SUDO_LOG")"; fi
+fresh_copy_hint "binary made writable during sudo" "Stopped after making"
 
 ino_before=$("$REAL_STAT" -c %i -- "$BIN")
 run_setup "y\n" "$BIN"

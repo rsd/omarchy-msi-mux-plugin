@@ -189,10 +189,10 @@ function ancestorDirs(path) {
   return out
 }
 
-// stat as an argv array, never through a shell, never -L (a symlink is
-// reported as itself). %f is the raw mode in hex, so the type and the
-// permission bits come without locale-dependent words; the name is last
-// because it is the only field that can hold a tab.
+// stat with every path as an argument, never -L (a symlink is reported as
+// itself); the plugin runs it inside gateArgv. %f is the raw mode in hex, so
+// the type and the permission bits come without locale-dependent words; the
+// name is last because it is the only field that can hold a tab.
 var STAT_FORMAT = "%u\t%f\t%U\t%n"
 
 function statArgv(path) {
@@ -235,19 +235,198 @@ function userMountOf(path) {
   return ""
 }
 
+// The mount table, as the kernel writes it (proc(5)), one line per mount:
+//   id parent maj:min root mountpoint mountopts [optional...] - fstype source superopts
+// The optional fields vary in number; a lone "-" ends them. In a path the
+// kernel escapes space, tab, newline and backslash as \040 \011 \012 \134;
+// any backslash and three octal digits is decoded as that byte, and any
+// other backslash makes the table unparseable.
+// With user_allow_other another account can FUSE-mount over a folder it owns
+// under a root-owned parent, and the mount can then report any owner, so
+// stat alone cannot clear a binary on one. setup.sh applies the same rule.
+var MOUNTINFO_PATH = "/proc/self/mountinfo"
+// The most of the mount table that is read, in bytes. A larger table is not
+// parsed: the gate then refuses (fail safe), it never checks a part of it.
+var MOUNTINFO_MAX_BYTES = 1048576
+
+// A mountinfo path field decoded, or null for a backslash not followed by
+// three octal digits. The value is taken as one byte (modulo 256, as bash's
+// printf %b in setup.sh does).
+function decodeMountPath(field) {
+  var f = String(field)
+  var out = ""
+  for (var i = 0; i < f.length; i++) {
+    var c = f.charAt(i)
+    if (c !== "\\") { out += c; continue }
+    var oct = f.slice(i + 1, i + 4)
+    if (!/^[0-7]{3}$/.test(oct)) return null
+    out += String.fromCharCode(parseInt(oct, 8) & 0xFF)
+    i += 3
+  }
+  return out
+}
+
+function optionList(text) {
+  return text === "" ? [] : text.split(",")
+}
+
+// [{ mountPoint, fstype, options, superOptions }] in table order, or null for
+// a table that is empty, does not end in "\n", or has any line that is not a
+// mountinfo line: the verdict then refuses (fail safe).
+function parseMountinfo(text) {
+  if (typeof text !== "string" || text.length === 0 || text.length > MOUNTINFO_MAX_BYTES) return null
+  if (text.charAt(text.length - 1) !== "\n") return null
+  var lines = text.slice(0, -1).split("\n")
+  var out = []
+  for (var i = 0; i < lines.length; i++) {
+    var f = lines[i].split(" ")
+    var dash = f.indexOf("-", 6)
+    if (dash === -1 || f.length - dash !== 4) return null
+    if (!/^[0-9]+$/.test(f[0]) || !/^[0-9]+$/.test(f[1]) || !/^[0-9]+:[0-9]+$/.test(f[2])) return null
+    var mp = decodeMountPath(f[4])
+    if (mp === null || mp.charAt(0) !== "/" || f[dash + 1] === "") return null
+    out.push({ mountPoint: mp, fstype: f[dash + 1], options: optionList(f[5]), superOptions: optionList(f[dash + 3]) })
+  }
+  return out
+}
+
+function isFuseType(fstype) {
+  return fstype === "fuse" || fstype === "fuseblk" || fstype.indexOf("fuse.") === 0
+}
+
+// The value of the first user_id= in either option list that is not a
+// decimal 0 (user_id=0 and user_id=00 pass): another account's number, or an
+// empty or non-decimal value, which cannot be read as root's. "" when every
+// user_id= is 0 or there is none. setup.sh applies the same rule.
+function foreignUserId(entry) {
+  var all = entry.options.concat(entry.superOptions)
+  for (var i = 0; i < all.length; i++) {
+    if (all[i].indexOf("user_id=") !== 0) continue
+    var v = all[i].slice(8)
+    if (!/^0+$/.test(v)) return v === "" ? "(empty)" : v
+  }
+  return ""
+}
+
+// "" when no mount at or above a valid path can be another account's, else
+// why. Every entry whose mount point is the path or a folder above it (whole
+// components; "/" covers all) counts, not only the topmost, so the order of
+// mounts stacked at one point does not matter. Refused: fstype fuse, fuseblk
+// or fuse.*, or a user_id other than 0; and a table that is missing (null),
+// malformed or has no entry for / (the one entry that covers every path; a
+// table without it is not the kernel's).
+function mountProblem(path, mountinfo) {
+  var p = String(path)
+  var tail = ", which another account may control. Install msi-mux-switch somewhere like " + DEFAULT_BINARY + "."
+  if (isGateChanged(mountinfo))
+    return p + " or a folder above it changed while it was being checked (stat gave two different answers)."
+  if (typeof mountinfo !== "string") return p + " could not be checked: " + MOUNTINFO_PATH + " could not be read."
+  var mounts = parseMountinfo(mountinfo)
+  if (mounts === null) return p + " could not be checked: " + MOUNTINFO_PATH + " could not be parsed."
+  var rooted = false
+  for (var i = 0; i < mounts.length; i++) {
+    var m = mounts[i]
+    var at = m.mountPoint
+    if (!(at === "/" || at === p || p.indexOf(at + "/") === 0)) continue
+    if (at === "/") rooted = true
+    if (isFuseType(m.fstype)) return p + " is on a " + m.fstype + " mount at " + at + tail
+    var uid = foreignUserId(m)
+    if (uid !== "") return p + " is on a mount at " + at + " owned by user_id " + uid + tail
+  }
+  if (!rooted) return p + " could not be checked: " + MOUNTINFO_PATH + " has no entry for /."
+  return ""
+}
+
+// The ownership gate's one read, in one run: stat of the binary and every
+// folder above it, then the mount table, then the same stat again, so each
+// gate decision gets all three from the same moment and a fresh table every
+// time (the switch never reuses the status read's). The second stat closes
+// the gap a FUSE daemon could use: it can answer the first stat with a
+// forged owner and only then detach itself (a lazy unmount), so the table
+// read after it shows no mount; the second stat then reaches the real files,
+// and a read whose two stats differ in any byte is refused (GATE_CHANGED).
+// (Matching device numbers instead does not work: on btrfs stat's device is
+// not the one mountinfo lists.) One process also keeps the switch's checks
+// as they were: one stat check, under the same watchdog. "$1" is
+// STAT_FORMAT, "$2" the mount table, the rest the paths; nothing but the cap
+// is part of the text. It prints the first stat's lines, the line "again",
+// the second stat's lines, the line "mountinfo", then the table and "end",
+// or "over" past MOUNTINFO_MAX_BYTES, or "unread". Every stat line holds a
+// tab (STAT_FORMAT) and no path holds a newline (binaryPathProblem), so
+// neither marker line can come from stat; the table, the only text it does
+// not control, comes last.
+var GATE_SCRIPT = [
+  "f=$1 m=$2",
+  "shift 2",
+  "stat -c \"$f\" -- \"$@\" 2>/dev/null",
+  "if t=$(head -c " + (MOUNTINFO_MAX_BYTES + 1) + " -- \"$m\" && printf x); then r=read; else r=unread; fi",
+  "printf 'again\\n'",
+  "stat -c \"$f\" -- \"$@\" 2>/dev/null",
+  "printf 'mountinfo\\n'",
+  "if [ \"$r\" = read ]; then",
+  "  t=${t%x}",
+  "  if [ \"$(printf '%s' \"$t\" | wc -c)\" -gt " + MOUNTINFO_MAX_BYTES + " ]; then printf 'over\\n'",
+  "  else printf '%send\\n' \"$t\"",
+  "  fi",
+  "else printf 'unread\\n'",
+  "fi"
+].join("\n")
+
+function gateArgv(path) {
+  if (binaryPathProblem(path) !== "") return []
+  return ["bash", "-c", GATE_SCRIPT, "msi-mux-gate", STAT_FORMAT, MOUNTINFO_PATH, String(path)].concat(ancestorDirs(path))
+}
+
+// What parseGateRead puts in `mounts` when the two stats differ: not a
+// table, so every verdict on it refuses (mountProblem).
+var GATE_CHANGED = { changed: true }
+
+function isGateChanged(mounts) {
+  return mounts !== null && typeof mounts === "object" && mounts.changed === true
+}
+
+// The first line of `t` at or after `from` that is exactly `marker`: the
+// index of its first character, or -1.
+function markerLine(t, marker, from) {
+  var at = t.indexOf(marker + "\n", from)
+  while (at > from && t.charAt(at - 1) !== "\n") at = t.indexOf(marker + "\n", at + 1)
+  return at
+}
+
+// { stats: parseStat of the first stat's lines, mounts: the table's text, or
+// null when it was not read whole }. Without both marker lines nothing is
+// taken (the run did not finish). When the second stat's lines are not the
+// first's, byte for byte, nothing is taken either and `mounts` is
+// GATE_CHANGED.
+function parseGateRead(text) {
+  var t = String(text === undefined || text === null ? "" : text)
+  var again = markerLine(t, "again", 0)
+  if (again === -1) return { stats: {}, mounts: null }
+  var sep = markerLine(t, "mountinfo", again + 6)
+  if (sep === -1) return { stats: {}, mounts: null }
+  if (t.slice(0, again) !== t.slice(again + 6, sep)) return { stats: {}, mounts: GATE_CHANGED }
+  var body = t.slice(sep + 10)
+  var ended = body.length >= 4 && body.slice(-4) === "end\n"
+  return { stats: parseStat(t.slice(0, again)), mounts: ended ? body.slice(0, -4) : null }
+}
+
 // Whether the binary may be run at all, by pkexec for the switch or as the
 // user for the debug read (debugReadArgv): { ok, kind, reason }. kind is "ok",
-// "invalid" (the setting), "mount" (under a user mount), "missing",
+// "invalid" (the setting), "mount" (under a user mount, or on a mount
+// another account may control, or the mount table could not be checked:
+// mountProblem on `mounts`, the text of a fresh mountinfo read), "missing",
 // "symlink", "notfile", "owner", "mode" or "ancestor". The binary must be a regular file owned by root with no
 // group or other write bit, and so must every directory above it (a
 // directory the user can write lets the user swap the file).
-function ownershipVerdict(path, stats) {
+function ownershipVerdict(path, stats, mounts) {
   var problem = binaryPathProblem(path)
   if (problem !== "") return { ok: false, kind: "invalid", reason: problem }
   var mount = userMountOf(path)
   if (mount !== "")
     return { ok: false, kind: "mount", reason: String(path) + " is under " + mount
       + ", where a user can mount or replace files. Install msi-mux-switch somewhere like " + DEFAULT_BINARY + "." }
+  var mounted = mountProblem(path, mounts)
+  if (mounted !== "") return { ok: false, kind: "mount", reason: mounted }
   var s = stats || {}
   var p = String(path)
   var b = s[p]
@@ -273,7 +452,8 @@ function ownershipVerdict(path, stats) {
 }
 
 // Set up backend helps with every ownership problem except a bad setting or
-// a user mount (setup.sh refuses those too).
+// a mount (a user mount, a mount another account may control, or a mount
+// table that could not be checked): setup.sh refuses those too.
 function setupHelps(verdict) {
   return !!verdict && !verdict.ok && verdict.kind !== "invalid" && verdict.kind !== "mount" && verdict.kind !== ""
 }
@@ -351,12 +531,13 @@ function debugArgv(path, flags) {
 }
 
 // The debug read as the plugin runs it: debugArgv, or [] unless the binary
-// passes ownershipVerdict for `stats` (parseStat of a stat taken right before
-// it), the same gate as the switch. A binary owned by another account, in a
-// folder a user can write or under a user mount, or a symbolic link, is never
-// run, not even read-only.
-function debugReadArgv(path, stats, flags) {
-  if (!ownershipVerdict(path, stats).ok) return []
+// passes ownershipVerdict for `stats` and `mounts` (parseGateRead of a gate
+// read taken right before it), the same gate as the switch. A binary owned
+// by another account, in a folder a user can write, under a user mount or on
+// a mount another account may control, or a symbolic link, is never run,
+// not even read-only.
+function debugReadArgv(path, stats, mounts, flags) {
+  if (!ownershipVerdict(path, stats, mounts).ok) return []
   return debugArgv(path, flags)
 }
 
@@ -694,6 +875,63 @@ function switchOutcome(run, exitCode, mode, staged) {
   return { kind: "error", message: why + notes, warning: warning, offerShutdown: false }
 }
 
+// ------------------------------------------------------- the leftover flag
+
+// The leftover-flag refusal (FIRMWARE_FLAG_TEXT) comes from a switch run, and
+// the panel clears a run's outcome when it opens; so the refusal is
+// remembered as { bootId, current, target }: this boot, and the modes the
+// debug read showed at the refusal. While a later read still shows those
+// modes in the same boot (flagActive), the panel acts as while staged: the
+// flag's lock line with Shut down now, no Switch button. The flag stays set
+// until a full shutdown, which is a new boot.
+var BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+
+function bootIdArgv() {
+  return ["head", "-c", "64", "--", BOOT_ID_PATH]
+}
+
+function isBootId(value) {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value)
+}
+
+// The boot id from the read's output, or "" for anything but one UUID line.
+function parseBootId(text) {
+  if (typeof text !== "string") return ""
+  var t = text.charAt(text.length - 1) === "\n" ? text.slice(0, -1) : text
+  return isBootId(t) ? t : ""
+}
+
+// The record to keep after a finished run, or null: only for the
+// leftover-flag refusal, with a boot id and a read that showed nothing
+// staged. Without a boot id nothing is remembered (the line then shows only
+// until the panel opens again, as before).
+function flagMemoryAtRefusal(outcome, bootId, debug) {
+  if (!outcome || outcome.lock !== true || outcome.message !== FIRMWARE_FLAG_TEXT) return null
+  if (!isBootId(bootId) || !debug || debug.ok !== true || debug.pending === true) return null
+  return { bootId: bootId, current: debug.current, target: debug.target }
+}
+
+// The record after a new read (debug) or boot id read: kept only while the
+// boot id is the record's and the read is one (ok) showing the same current
+// and target. Any other read, a refused gate (debug emptied) included, or a
+// boot id that differs or cannot be read, drops it.
+function flagMemoryAfterRead(record, bootId, debug) {
+  if (!record) return null
+  if (!isBootId(bootId) || bootId !== record.bootId) return null
+  if (!debug || debug.ok !== true) return null
+  if (debug.current !== record.current || debug.target !== record.target) return null
+  return record
+}
+
+// Whether a remembered flag (st.flag) holds for the read shown (st.debug).
+// A staged switch wins over it.
+function flagActive(s) {
+  var st = s || {}
+  var r = st.flag
+  var d = st.debug
+  return !!r && !!d && d.ok === true && d.pending !== true && d.current === r.current && d.target === r.target
+}
+
 // ---------------------------------------------------------------------- AC
 
 // Every power supply whose type is Mains, with its online value, then "end".
@@ -951,6 +1189,7 @@ function switchBlocker(s) {
   var st = s || {}
   if (st.unavailableReason) return st.unavailableReason
   if (!st.debug || !st.debug.ok) return st.debug && st.debug.error ? st.debug.error : "Reading the GPU mode…"
+  if (flagActive(st)) return FIRMWARE_FLAG_TEXT
   if (st.busy) return "A switch is in progress."
   if (st.ac !== true) return st.ac === false ? AC_REQUIRED_TEXT : AC_UNKNOWN_TEXT
   return ""
@@ -979,11 +1218,13 @@ function rowReason(st) {
 // "switch" | "", buttonText, enabled, reason }. reason is set whenever the
 // row has no enabled button for a reason the user can act on or should know
 // (not for the current or the staged mode, which say so in status). While a
-// switch is staged no row has a button: the tool refuses any further mode
-// run until a full shutdown (STAGED_LOCK_TEXT, shown once by the panel).
+// switch is staged, or the leftover firmware flag is remembered (flagActive),
+// no row has a button: the tool refuses any further mode run until a full
+// shutdown (STAGED_LOCK_TEXT or FIRMWARE_FLAG_TEXT, shown once by the panel).
 function modeRows(s) {
   var st = s || {}
   var d = st.debug || emptyDebug()
+  var locked = d.ok === true && (d.pending === true || flagActive(st))
   var blocker = switchBlocker(st)
   var why = rowReason(st)
   var rows = []
@@ -1005,7 +1246,7 @@ function modeRows(s) {
       row.action = ""
       row.enabled = false
       row.reason = ""
-    } else if (d.ok && d.pending) {
+    } else if (locked) {
       row.action = ""
       row.enabled = false
       row.reason = ""
@@ -1038,14 +1279,20 @@ function shutdownMessage(kind) {
 // The line under the mode rows that offers Shut down now: { kind, text,
 // urgent }. kind "staged" while the debug read shows a switch staged,
 // "flag" after an apply-ready refusal with nothing staged (the leftover
-// firmware flag), else "" (no line). urgent: it answers a refused switch.
+// firmware flag) and for as long as it is remembered (flagActive), else ""
+// (no line). urgent: it answers a refused switch. None while switching is
+// unavailable (st.unavailableReason): the binary or the hardware is refused,
+// and nothing an earlier run said is shown.
 function lockNotice(s) {
   var st = s || {}
   var d = st.debug || emptyDebug()
+  var none = { kind: "", text: "", urgent: false }
+  if (st.unavailableReason) return none
   var refused = st.busy !== true && !!st.outcome && st.outcome.lock === true
   if (d.ok && d.pending) return { kind: "staged", text: STAGED_LOCK_TEXT, urgent: refused }
   if (refused) return { kind: "flag", text: FIRMWARE_FLAG_TEXT, urgent: true }
-  return { kind: "", text: "", urgent: false }
+  if (st.busy !== true && flagActive(st)) return { kind: "flag", text: FIRMWARE_FLAG_TEXT, urgent: false }
+  return none
 }
 
 // After a switch this widget asked for: whether the shutdown dialog opens by

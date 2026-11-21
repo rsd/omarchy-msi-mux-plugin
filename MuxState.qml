@@ -14,17 +14,22 @@ import "Model.js" as Model
 //   - DMI read (Model.dmiArgv): once, when the first widget attaches.
 //     Decides hidden / available / unavailable and the override flags
 //     (Model.hardwareDecision).
-//   - stat of the binary and every directory above it (Model.statArgv):
-//     after the DMI read, when the binary path changes, on a panel opening,
-//     before every debug read, and again right before a switch
-//     (Model.ownershipVerdict).
+//   - the gate read (Model.gateArgv): stat of the binary and every
+//     directory above it, the mount table (/proc/self/mountinfo, bounded)
+//     and the same stat again, in one run: after the DMI read, when the
+//     binary path changes, on a panel opening, before every debug read, and
+//     again right before a switch (Model.ownershipVerdict, which also
+//     refuses a FUSE or user_id mount on the binary's way, and a read whose
+//     two stats differ).
 //   - the read-only state read, `<binary> --debug --json [flags]` as the
-//     user (Model.debugReadArgv): only at the end of a stat (checkBinary),
-//     on available hardware, and only if that stat passes the same ownership
-//     gate as the switch; otherwise the binary is never run and no earlier
-//     read's state is kept. A read asked for while another runs or a switch
-//     is being checked, and the read after each switch, start a new stat
-//     first. Never on a timer: only this tool changes the mode. Bounded:
+//     user (Model.debugReadArgv): only at the end of a gate read
+//     (checkBinary), on available hardware, and only if that read passes the
+//     same ownership gate as the switch; otherwise the binary is never run
+//     and no earlier read's state is kept. With each read, the boot id
+//     (Model.bootIdArgv), for the remembered leftover flag. A read asked for
+//     while another runs or a switch is being checked, and the read after
+//     each switch, start a new gate read first. Never on a timer: only this
+//     tool changes the mode. Bounded:
 //     under a timeout, and at most Model.DEBUG_MAX_BYTES of each stream is
 //     read (Model.DEBUG_SCRIPT).
 //   - AC (Model.acArgv): at startup, on a panel opening, every
@@ -69,11 +74,13 @@ Singleton {
   readonly property var hardware: Model.hardwareDecision(root.dmi)
   readonly property bool hidden: !root.dmiRead || root.hardware.state === "hidden"
 
-  // The last stat and what it means.
+  // The last gate read (stat and the mount table's text, Model.parseGateRead)
+  // and what it means.
   property bool statRead: false
   property var stats: ({})
+  property var mounts: null
   readonly property var ownership: root.statRead
-    ? Model.ownershipVerdict(root.binaryPath, root.stats)
+    ? Model.ownershipVerdict(root.binaryPath, root.stats, root.mounts)
     : { ok: false, kind: "", reason: "Checking the backend…" }
   // No debug read can run: the hardware is not validated, or the last stat
   // refused the binary (the panel shows the mode as unknown).
@@ -90,6 +97,16 @@ Singleton {
   // The last debug read (Model.parseDebugRead); empty while the binary is
   // refused.
   property var debug: Model.emptyDebug()
+
+  // The boot id read with the last debug read ("" when it could not be),
+  // and the leftover firmware flag remembered from a refusal
+  // (Model.flagMemoryAtRefusal), or null. Every new debug read or boot id
+  // decides again whether it still holds (Model.flagMemoryAfterRead), so an
+  // emptied read (a refused gate) drops it too.
+  property string bootId: ""
+  property var flagRecord: null
+  onDebugChanged: root.flagRecord = Model.flagMemoryAfterRead(root.flagRecord, root.bootId, root.debug)
+  onBootIdChanged: root.flagRecord = Model.flagMemoryAfterRead(root.flagRecord, root.bootId, root.debug)
 
   // AC: true, false or null (unknown).
   property var ac: null
@@ -146,6 +163,7 @@ Singleton {
     root.binaryPath = p
     root.statRead = false
     root.stats = ({})
+    root.mounts = null
     root.debug = Model.emptyDebug()
     if (root.started && !startDelay.running) root.checkBinary()
   }
@@ -208,9 +226,10 @@ Singleton {
   function checkBinary() {
     if (!root.dmiRead || root.hardware.state !== "available") return
     if (statProc.running) { root.statAgain = true; return }
-    var argv = Model.statArgv(root.binaryPath)
+    var argv = Model.gateArgv(root.binaryPath)
     if (argv.length === 0) {
       root.stats = ({})
+      root.mounts = null
       root.statRead = true
       root.debug = Model.emptyDebug()
       return
@@ -227,9 +246,11 @@ Singleton {
       waitForEnd: true
       onStreamFinished: {
         if (statProc.path !== root.binaryPath) return
-        root.stats = Model.parseStat(text)
+        var gate = Model.parseGateRead(text)
+        root.mounts = gate.mounts
+        root.stats = gate.stats
         root.statRead = true
-        root.readDebug(root.stats)
+        root.readDebug(root.stats, root.mounts)
       }
     }
     onRunningChanged: {
@@ -244,13 +265,13 @@ Singleton {
   // of the next one started meanwhile.
   property int debugRuns: 0
 
-  // Called only by the stat that just finished, with its result: the binary
-  // runs only if that stat passes the switch's ownership gate
+  // Called only by the gate read that just finished, with its result: the
+  // binary runs only if that read passes the switch's ownership gate
   // (Model.debugReadArgv). A read that has to wait is asked for again
-  // through checkBinary, so it too follows a fresh stat.
-  function readDebug(stats) {
+  // through checkBinary, so it too follows a fresh gate read.
+  function readDebug(stats, mounts) {
     if (root.hardware.state !== "available") return
-    var argv = Model.debugReadArgv(root.binaryPath, stats, root.hardware.flags)
+    var argv = Model.debugReadArgv(root.binaryPath, stats, mounts, root.hardware.flags)
     if (argv.length === 0) {
       root.debug = Model.emptyDebug()
       return
@@ -268,6 +289,23 @@ Singleton {
     debugProc.exited = false
     debugProc.command = argv
     debugProc.running = true
+    root.readBootId()
+  }
+
+  // Cheap, and within one shell process it does not change: belt and braces
+  // for the remembered flag, which a new boot drops.
+  function readBootId() {
+    if (bootProc.running) return
+    bootProc.command = Model.bootIdArgv()
+    bootProc.running = true
+  }
+
+  Process {
+    id: bootProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.bootId = Model.parseBootId(text)
+    }
   }
 
   // Finished only when both streams and the exit status are in, in whatever
@@ -370,7 +408,8 @@ Singleton {
       root.refused(ending)
       return false
     }
-    if (Model.switchBlocker({ unavailableReason: root.unavailableReason, debug: root.debug, busy: false, ac: root.ac }) !== "")
+    if (Model.switchBlocker({ unavailableReason: root.unavailableReason, debug: root.debug, busy: false, ac: root.ac,
+        flag: root.flagRecord }) !== "")
       return false
     root.phase = "checking"
     root.switchMode = mode
@@ -380,7 +419,7 @@ Singleton {
     checkStat.result = null
     checkAc.result = undefined
     checkRunning.result = undefined
-    checkStat.command = Model.statArgv(root.binaryPath)
+    checkStat.command = Model.gateArgv(root.binaryPath)
     checkStat.path = root.binaryPath
     checkAc.command = Model.acArgv()
     checkRunning.command = Model.pgrepArgv()
@@ -436,11 +475,13 @@ Singleton {
     if (root.phase !== "checking" || checkStat.result === null || checkAc.result === undefined
         || checkRunning.result === undefined) return
     if (checkStat.path !== root.binaryPath) return root.refused("The binary path changed; nothing was run.")
-    // The fresh stat becomes the last one, so a refusal also blocks the debug
-    // read (debugBlocked) and drops the earlier read: its mode came from a
-    // binary no longer trusted.
-    root.stats = checkStat.result
-    var verdict = Model.ownershipVerdict(root.binaryPath, checkStat.result)
+    // The fresh gate read becomes the last one, so a refusal also blocks the
+    // debug read (debugBlocked) and drops the earlier read: its mode came
+    // from a binary no longer trusted.
+    var gate = checkStat.result
+    root.mounts = gate.mounts
+    root.stats = gate.stats
+    var verdict = Model.ownershipVerdict(root.binaryPath, gate.stats, gate.mounts)
     if (!verdict.ok) {
       root.debug = Model.emptyDebug()
       return root.refused(verdict.reason + " Nothing was run.")
@@ -467,7 +508,7 @@ Singleton {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        checkStat.result = Model.parseStat(text)
+        checkStat.result = Model.parseGateRead(text)
         root.startSwitch()
       }
     }
@@ -515,6 +556,10 @@ Singleton {
     if (tail !== null) root.ingest(tail)
     var outcome = Model.switchOutcome(root.switchRun, switchProc.exitCode, root.switchMode,
       root.debug.ok && root.debug.pending)
+    // The leftover-flag refusal is remembered past the panel clearing the
+    // outcome; the read after the switch keeps or drops it.
+    var flag = Model.flagMemoryAtRefusal(outcome, root.bootId, root.debug)
+    if (flag !== null) root.flagRecord = flag
     // The mode is read again after the switch, through finish.
     root.debugAgain = true
     root.finish(outcome)

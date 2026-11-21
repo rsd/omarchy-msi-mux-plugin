@@ -1,0 +1,8 @@
+22 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:5 - proc proc rw
+23 1 0:22 / /sys rw,nosuid,nodev,noexec,relatime shared:6 - sysfs sysfs rw
+1 0 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw
+42 23 0:40 / /sys/fs/fuse/connections rw,nosuid,nodev,noexec,relatime shared:17 - fusectl fusectl rw
+60 1 0:30 / /run/user/1000 rw,nosuid,nodev,relatime shared:300 - tmpfs tmpfs rw,size=3000000k,mode=700,uid=1000,gid=1000
+61 60 0:93 / /run/user/1000/doc rw,nosuid,nodev,relatime shared:301 - fuse.portal portal rw,user_id=1000,group_id=1000
+70 1 0:31 / /tmp rw,nosuid,nodev shared:30 - tmpfs tmpfs rw,size=8000000k
+83 1 0:53 / /opt rw,relatime shared:401 - tmpfs tmpfs rw,user_id=1000

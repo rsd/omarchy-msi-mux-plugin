@@ -146,7 +146,11 @@ const ROOT_OK = [
   st(0, "41ed", "root", "/opt"),
   st(0, "416d", "root", "/")                // directory 0555
 ].join("\n") + "\n"
-const verdict = (text) => M.ownershipVerdict(BIN, M.parseStat(text))
+// A plain mount table (ext4 at /, nothing another account controls on the
+// binary's way), as the gate reads it with every stat.
+const MI = (name) => read("tests/fixtures/mountinfo-" + name)
+const MI_OK = MI("ext4-root")
+const verdict = (text) => M.ownershipVerdict(BIN, M.parseStat(text), MI_OK)
 const replaceLine = (text, name, line) => text.split("\n").map(l => l.endsWith("\t" + name) ? line : l).join("\n")
 
 test("stat output parses into type, uid, mode and owner", () => {
@@ -186,7 +190,7 @@ test("ownership: a symlink is refused, even root-owned", () => {
   const v = verdict(replaceLine(ROOT_OK, BIN, st(0, "a1ff", "root", BIN)))
   assert.strictEqual(v.kind, "symlink")
   assert.strictEqual(v.ok, false)
-  assert.deepStrictEqual(M.debugReadArgv(BIN, M.parseStat(replaceLine(ROOT_OK, BIN, st(0, "a1ff", "root", BIN))), FLAGS), [])
+  assert.deepStrictEqual(M.debugReadArgv(BIN, M.parseStat(replaceLine(ROOT_OK, BIN, st(0, "a1ff", "root", BIN))), MI_OK, FLAGS), [])
 })
 
 test("ownership: a writable or user-owned ancestor is refused, naming it", () => {
@@ -209,16 +213,16 @@ test("ownership: the machine as it is today (file and folder owned by raul)", ()
   const today = [st(1000, "81ed", "raul", BIN), st(1000, "41ed", "raul", "/opt/msi-mux-switch"), st(0, "41ed", "root", "/opt"), st(0, "416d", "root", "/")].join("\n")
   const v = verdict(today)
   assert.strictEqual(v.reason, BIN + " is owned by raul, not root.")
-  assert.deepStrictEqual(M.debugReadArgv(BIN, M.parseStat(today), FLAGS), [], "not even the read-only debug read runs it")
+  assert.deepStrictEqual(M.debugReadArgv(BIN, M.parseStat(today), MI_OK, FLAGS), [], "not even the read-only debug read runs it")
 })
 
 test("ownership: missing binary, not a file, and a bad setting", () => {
   const missing = ROOT_OK.split("\n").filter(l => !l.endsWith("\t" + BIN)).join("\n")
   assert.deepStrictEqual(verdict(missing), { ok: false, kind: "missing", reason: "msi-mux-switch was not found at " + BIN + "." })
   assert.ok(M.setupHelps(verdict(missing)))
-  assert.deepStrictEqual(M.debugReadArgv(BIN, M.parseStat(missing), FLAGS), [])
+  assert.deepStrictEqual(M.debugReadArgv(BIN, M.parseStat(missing), MI_OK, FLAGS), [])
   assert.strictEqual(verdict(replaceLine(ROOT_OK, BIN, st(0, "41ed", "root", BIN))).kind, "notfile")
-  const bad = M.ownershipVerdict("relative", {})
+  const bad = M.ownershipVerdict("relative", {}, MI_OK)
   assert.strictEqual(bad.kind, "invalid")
   assert.strictEqual(M.setupHelps(bad), false, "setup.sh cannot fix a bad setting")
   assert.strictEqual(M.setupHelps({ ok: true, kind: "ok", reason: "" }), false)
@@ -228,16 +232,219 @@ test("ownership: a binary under a user mount is refused, whatever stat says", ()
   for (const m of ["/mnt", "/media", "/run/media", "/run/user"]) {
     const p = m + "/x/msi-mux-switch"
     const all = [st(0, "81ed", "root", p)].concat(M.ancestorDirs(p).map(d => st(0, "41ed", "root", d))).join("\n")
-    const v = M.ownershipVerdict(p, M.parseStat(all))
+    const v = M.ownershipVerdict(p, M.parseStat(all), MI_OK)
     assert.strictEqual(v.kind, "mount", p)
     assert.ok(v.reason.startsWith(p + " is under " + m + ", where a user can mount"), v.reason)
     assert.strictEqual(M.setupHelps(v), false, "setup.sh refuses it too")
   }
-  assert.strictEqual(M.ownershipVerdict("/run/user/1000/msi-mux-switch", {}).kind, "mount")
+  assert.strictEqual(M.ownershipVerdict("/run/user/1000/msi-mux-switch", {}, MI_OK).kind, "mount")
   // Only whole path segments: /mntx and /run/username are not mounts.
   assert.strictEqual(M.userMountOf("/mntx/msi-mux-switch"), "")
   assert.strictEqual(M.userMountOf("/run/username/msi-mux-switch"), "")
   assert.strictEqual(M.userMountOf(BIN), "")
+})
+
+// Root-owned stat lines for a path and every folder above it.
+const rootStats = (p) => M.parseStat([st(0, "81ed", "root", p)].concat(M.ancestorDirs(p).map(d => st(0, "41ed", "root", d))).join("\n"))
+const mountVerdict = (mounts, p) => M.ownershipVerdict(p || BIN, rootStats(p || BIN), mounts)
+
+test("mounts: mountinfo lines parse, the optional fields skipped up to the lone -", () => {
+  const m = M.parseMountinfo(MI_OK)
+  assert.ok(Array.isArray(m) && m.length === 7)
+  assert.deepStrictEqual(m[2], { mountPoint: "/", fstype: "ext4", options: ["rw", "relatime"], superOptions: ["rw"] })
+  // No optional field, and several.
+  assert.strictEqual(M.parseMountinfo("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n")[0].fstype, "ext4")
+  assert.strictEqual(M.parseMountinfo("1 0 8:1 / / rw shared:1 master:2 propagate_from:3 unbindable - xfs /dev/sda1 rw\n")[0].fstype, "xfs")
+  // The kernel's four escapes in the mount point.
+  assert.strictEqual(M.parseMountinfo("1 0 8:1 / /a\\040b\\011c\\012d\\134e rw - ext4 x rw\n")[0].mountPoint, "/a b\tc\nd\\e")
+  assert.strictEqual(M.parseMountinfo(MI("space"))[7].mountPoint, "/opt/msi mux-switch")
+  assert.strictEqual(M.decodeMountPath("/a\\040b"), "/a b")
+  // Any backslash and three octal digits is that byte; anything else after
+  // a backslash is unparseable (setup.sh's parser applies the same rule).
+  assert.strictEqual(M.decodeMountPath("/a\\041b"), "/a!b")
+  assert.strictEqual(M.decodeMountPath("/a\\043b\\1770"), "/a#b\u007f0", "three digits only, the rest is text")
+  assert.strictEqual(M.decodeMountPath("/a\\377"), "/a\u00ff")
+  assert.strictEqual(M.decodeMountPath("/a\\777"), "/a\u00ff", "one byte, as bash's printf %b")
+  for (const bad of ["/a\\b", "/a\\", "/a\\04", "/a\\08x", "/a\\8000", "/a\\x41", "/a\\\\", "/a\\n"])
+    assert.strictEqual(M.decodeMountPath(bad), null, bad)
+  assert.strictEqual(M.parseMountinfo("1 0 8:1 / / rw - ext4 x rw\n2 1 8:2 / /a\\041 rw - ext4 x rw\n")[1].mountPoint, "/a!")
+  assert.strictEqual(M.parseMountinfo("1 0 8:1 / / rw - ext4 x rw\n2 1 8:2 / /a\\x41 rw - ext4 x rw\n"), null, "a non-octal escape")
+  // Malformed: no -, too few fields on either side, an empty line inside,
+  // a non-absolute mount point, a bad escape, no final newline.
+  for (const bad of [
+    "", "\n",
+    "1 0 8:1 / / rw ext4 /dev/sda1 rw\n",
+    "1 0 8:1 / / rw - ext4 /dev/sda1\n",
+    "1 0 8:1 / / rw - ext4 /dev/sda1 rw extra\n",
+    "1 0 8:1 / - ext4 /dev/sda1 rw\n",
+    "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n\n2 1 8:2 / /opt rw - ext4 /dev/sda2 rw\n",
+    "x 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+    "1 x 8:1 / / rw - ext4 /dev/sda1 rw\n",
+    "-1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+    "1 0x1 8:1 / / rw - ext4 /dev/sda1 rw\n",
+    "1 0 8-1 / / rw - ext4 /dev/sda1 rw\n",
+    "1 0 8: / / rw - ext4 /dev/sda1 rw\n",
+    ":1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+    "1 0 a:1 / / rw - ext4 /dev/sda1 rw\n",
+    "1 0 8:1:2 / / rw - ext4 /dev/sda1 rw\n",
+    "1 0 8:1 / opt rw - ext4 /dev/sda1 rw\n",
+    "1 0 8:1 / /a\\9 rw - ext4 /dev/sda1 rw\n",
+    "1 0 8:1 / / rw - ext4 /dev/sda1 rw",
+    MI("malformed"), MI("empty"), null, undefined, 42
+  ]) assert.strictEqual(M.parseMountinfo(bad), null, JSON.stringify(bad))
+  assert.strictEqual(M.parseMountinfo("1 0 8:1 / / rw - ext4  rw\n")[0].fstype, "ext4", "an empty source is a field")
+})
+
+test("mounts: a FUSE or user_id mount at or above the binary is refused, whatever stat says", () => {
+  assert.deepStrictEqual(mountVerdict(MI_OK), { ok: true, kind: "ok", reason: "" }, "plain ext4 root; a FUSE mount elsewhere and fusectl do not count")
+  const refused = {
+    "fuse-ancestor": ["/opt", "fuse.sshfs"],
+    "fuseblk-folder": ["/opt/msi-mux-switch", "fuseblk"],
+    "fuse-exact": [BIN, "fuse"]
+  }
+  for (const [fx, [at, type]] of Object.entries(refused)) {
+    const v = mountVerdict(MI(fx))
+    assert.strictEqual(v.ok, false, fx)
+    assert.strictEqual(v.kind, "mount", fx)
+    assert.strictEqual(v.reason, BIN + " is on a " + type + " mount at " + at
+      + ", which another account may control. Install msi-mux-switch somewhere like " + M.DEFAULT_BINARY + ".", fx)
+    assert.strictEqual(M.setupHelps(v), false, fx + ": setup.sh cannot fix a mount")
+    assert.deepStrictEqual(M.debugReadArgv(BIN, rootStats(BIN), MI(fx), FLAGS), [], fx + ": the status read never runs it")
+  }
+  // Not FUSE, but a mount another user's id owns.
+  const u = mountVerdict(MI("user-id"))
+  assert.deepStrictEqual([u.ok, u.kind, M.setupHelps(u)], [false, "mount", false])
+  assert.strictEqual(u.reason, BIN + " is on a mount at /opt owned by user_id 1000, which another account may control. Install msi-mux-switch somewhere like " + M.DEFAULT_BINARY + ".")
+  const line = (mp, opts, type, sup) => "90 1 0:60 / " + mp + " " + opts + " - " + type + " src " + sup
+  const withLine = (l) => MI_OK + l + "\n"
+  assert.strictEqual(mountVerdict(withLine(line("/opt", "rw", "tmpfs", "rw,user_id=0"))).ok, true, "user_id=0 is root's")
+  assert.strictEqual(mountVerdict(withLine(line("/opt", "rw,user_id=1000", "tmpfs", "rw"))).ok, false, "user_id in the mount options too")
+  assert.strictEqual(mountVerdict(withLine(line("/opt", "rw", "tmpfs", "rw,user_id=00"))).ok, true, "user_id=00 is a decimal 0")
+  // Anything but one or more decimal digits is refused, as is any number
+  // but 0 (setup.sh's parser applies the same rule).
+  for (const [v, shown] of [["x", "x"], ["", "(empty)"], ["-0", "-0"], ["+0", "+0"], ["0x0", "0x0"], [" 0", null], ["1", "1"], ["01", "01"]]) {
+    if (shown === null) continue
+    const r = mountVerdict(withLine(line("/opt", "rw", "tmpfs", "rw,user_id=" + v)))
+    assert.deepStrictEqual([r.ok, r.kind], [false, "mount"], "user_id=" + JSON.stringify(v))
+    assert.strictEqual(r.reason, BIN + " is on a mount at /opt owned by user_id " + shown + ", which another account may control. Install msi-mux-switch somewhere like " + M.DEFAULT_BINARY + ".")
+  }
+  assert.strictEqual(mountVerdict(withLine(line("/opt", "rw,user_id=", "tmpfs", "rw"))).ok, false, "an empty user_id in the mount options")
+  assert.strictEqual(mountVerdict(withLine(line("/opt", "rw", "tmpfs", "rw,user_id=0,user_id=1000"))).ok, false, "every user_id counts")
+  assert.strictEqual(mountVerdict(withLine(line("/opt", "rw", "tmpfs", "rw,group_id=1000,xuser_id=5"))).ok, true, "only the user_id option counts")
+  assert.strictEqual(mountVerdict(withLine(line("/", "rw", "fuse.sshfs", "rw"))).ok, false, "a FUSE mount at / covers everything")
+  assert.strictEqual(mountVerdict(withLine(line("/opt", "rw", "fusectl", "rw"))).ok, true, "fusectl is not FUSE")
+  assert.strictEqual(mountVerdict(withLine(line("/opt", "rw", "fuse2", "rw"))).ok, true, "only fuse, fuseblk and fuse.*")
+  // Stacked mounts at one point: refused in either order.
+  const ext = line("/opt", "rw", "ext4", "rw"), fuse = line("/opt", "rw", "fuse.sshfs", "rw,user_id=1000")
+  assert.strictEqual(mountVerdict(MI_OK + ext + "\n" + fuse + "\n").ok, false, "FUSE stacked over ext4")
+  assert.strictEqual(mountVerdict(MI_OK + fuse + "\n" + ext + "\n").ok, false, "ext4 stacked over FUSE")
+  // A mount point with a space: it covers the path with the space only.
+  assert.strictEqual(mountVerdict(MI("space")).ok, true, "/opt/msi mux-switch does not cover " + BIN)
+  const spaced = "/opt/msi mux-switch/msi-mux-switch"
+  const sv = mountVerdict(MI("space"), spaced)
+  assert.strictEqual(sv.ok, false)
+  assert.ok(sv.reason.startsWith(spaced + " is on a fuse.sshfs mount at /opt/msi mux-switch,"), sv.reason)
+  // Whole path components only.
+  assert.strictEqual(mountVerdict(MI("sibling")).ok, true, "/opt/msi-mux-switchX does not cover " + BIN)
+  // The existing prefix check still comes first.
+  assert.ok(mountVerdict(MI_OK, "/mnt/x/msi-mux-switch").reason.includes("is under /mnt"))
+})
+
+test("mounts: an unread, empty, malformed or uncovering mount table refuses (fail safe)", () => {
+  const cases = [
+    [null, BIN + " could not be checked: /proc/self/mountinfo could not be read."],
+    [undefined, BIN + " could not be checked: /proc/self/mountinfo could not be read."],
+    [MI("empty"), BIN + " could not be checked: /proc/self/mountinfo could not be parsed."],
+    [MI("malformed"), BIN + " could not be checked: /proc/self/mountinfo could not be parsed."],
+    ["2 1 8:2 / /opt rw - ext4 /dev/sda2 rw\n", BIN + " could not be checked: /proc/self/mountinfo has no entry for /."],
+    ["2 1 8:2 / /home rw - ext4 /dev/sda2 rw\n", BIN + " could not be checked: /proc/self/mountinfo has no entry for /."]
+  ]
+  for (const [mounts, reason] of cases) {
+    const v = mountVerdict(mounts)
+    assert.deepStrictEqual(v, { ok: false, kind: "mount", reason: reason }, JSON.stringify(mounts))
+    assert.strictEqual(M.setupHelps(v), false)
+    assert.deepStrictEqual(M.debugReadArgv(BIN, rootStats(BIN), mounts, FLAGS), [])
+  }
+  // The table is checked before stat's answer: a FUSE mount can claim any owner.
+  assert.strictEqual(M.ownershipVerdict(BIN, {}, MI("fuse-ancestor")).kind, "mount")
+})
+
+test("gate read: stat, the mount table, stat again in one run, the paths as arguments, the table framed and capped", () => {
+  assert.deepStrictEqual(M.gateArgv(BIN), ["bash", "-c", M.GATE_SCRIPT, "msi-mux-gate", M.STAT_FORMAT, "/proc/self/mountinfo",
+    BIN, "/opt/msi-mux-switch", "/opt", "/"])
+  assert.deepStrictEqual(M.gateArgv("relative"), [])
+  assert.deepStrictEqual(M.gateArgv("/opt//x"), [])
+  // Nothing but the cap is spliced into the script; stat never follows a link.
+  const spliced = M.GATE_SCRIPT.replace(/head -c 1048577/g, "").replace(/-gt 1048576/g, "")
+  assert.ok(!/\d{3,}/.test(spliced) && !/\//.test(spliced.replace(/\/dev\/null/g, "")), "no path or other number in the script")
+  assert.ok(!/-L/.test(M.GATE_SCRIPT))
+  assert.ok(!/\beval\b|\$\*/.test(M.GATE_SCRIPT))
+  assert.strictEqual(M.MOUNTINFO_MAX_BYTES, 1048576)
+  // The order the script runs them in: stat, the table read, stat again
+  // (the same format and paths), and only then the framing of the table.
+  const lines = M.GATE_SCRIPT.split("\n")
+  const stats = lines.map((l, i) => [l, i]).filter(([l]) => l === 'stat -c "$f" -- "$@" 2>/dev/null').map(([, i]) => i)
+  const read = lines.findIndex(l => /head -c 1048577 -- "\$m"/.test(l))
+  assert.strictEqual(stats.length, 2, "two identical stat runs")
+  assert.ok(stats[0] < read && read < stats[1], "stat, then the table, then stat again")
+  assert.ok(lines.indexOf("printf 'again\\n'") > read && lines.indexOf("printf 'again\\n'") < stats[1])
+  assert.ok(lines.indexOf("printf 'mountinfo\\n'") > stats[1], "the table is printed last")
+  // What the script prints: stat's lines, "again", the same lines,
+  // "mountinfo", the table, "end".
+  const read2 = (a, b, tail) => M.parseGateRead(a + "again\n" + b + "mountinfo\n" + tail)
+  const g = read2(ROOT_OK, ROOT_OK, MI_OK + "end\n")
+  assert.deepStrictEqual(g.stats, M.parseStat(ROOT_OK))
+  assert.strictEqual(g.mounts, MI_OK)
+  assert.deepStrictEqual(M.ownershipVerdict(BIN, g.stats, g.mounts), { ok: true, kind: "ok", reason: "" })
+  assert.strictEqual(read2(ROOT_OK, ROOT_OK, "end\n").mounts, "", "an empty table (refused by the verdict)")
+  // Both stats empty (nothing there): the same answer, the binary missing.
+  assert.strictEqual(M.ownershipVerdict(BIN, read2("", "", MI_OK + "end\n").stats, MI_OK).kind, "missing")
+  for (const tail of ["over\n", "unread\n", MI_OK, MI_OK + "en", ""]) {
+    const r = read2(ROOT_OK, ROOT_OK, tail)
+    assert.strictEqual(r.mounts, null, JSON.stringify(tail.slice(-8)))
+    assert.strictEqual(M.ownershipVerdict(BIN, r.stats, r.mounts).ok, false)
+  }
+  // No separator, or only one of the two: nothing is taken from it at all.
+  for (const t of [ROOT_OK, "", undefined, null, ROOT_OK + "mountinfo\n" + MI_OK + "end\n", ROOT_OK + "again\n" + ROOT_OK,
+    ROOT_OK + "mountinfo\nagain\n" + ROOT_OK + MI_OK + "end\n"])
+    assert.deepStrictEqual(M.parseGateRead(t), { stats: {}, mounts: null }, JSON.stringify(t))
+  // A marker only counts as a whole line.
+  assert.deepStrictEqual(M.parseGateRead(ROOT_OK + "xagain\n" + ROOT_OK + "mountinfo\n" + MI_OK + "end\n"), { stats: {}, mounts: null })
+})
+
+test("gate read: two stats that differ in any byte refuse the binary (a FUSE mount detached between them)", () => {
+  // The lazy-unmount race: the first stat is a FUSE daemon's forged root
+  // answer, the table read after the detach shows no FUSE mount, the second
+  // stat reaches the real, user-owned file.
+  const forged = ROOT_OK
+  const real = replaceLine(ROOT_OK, BIN, st(1000, "81ed", "raul", BIN))
+  const changed = [
+    [forged, real],
+    [real, forged],
+    [ROOT_OK, ROOT_OK.replace("\t/opt\n", "\t/opt \n")],
+    [ROOT_OK, ""],
+    ["", ROOT_OK],
+    [ROOT_OK, ROOT_OK + st(0, "41ed", "root", "/") + "\n"],
+    [ROOT_OK, replaceLine(ROOT_OK, BIN, st(0, "81ed", "UNKNOWN", BIN))],
+    [ROOT_OK, replaceLine(ROOT_OK, "/opt", st(0, "41ec", "root", "/opt"))]
+  ]
+  const reason = BIN + " or a folder above it changed while it was being checked (stat gave two different answers)."
+  for (const [a, b] of changed) {
+    const g = M.parseGateRead(a + "again\n" + b + "mountinfo\n" + MI_OK + "end\n")
+    assert.deepStrictEqual(g.stats, {}, "nothing of either stat is kept")
+    assert.strictEqual(g.mounts, M.GATE_CHANGED)
+    const v = M.ownershipVerdict(BIN, g.stats, g.mounts)
+    assert.deepStrictEqual(v, { ok: false, kind: "mount", reason: reason }, JSON.stringify([a, b]))
+    assert.strictEqual(M.setupHelps(v), false, "setup.sh cannot fix a race")
+    assert.deepStrictEqual(M.debugReadArgv(BIN, g.stats, g.mounts, FLAGS), [], "the status read never runs it")
+    // Even with the first stat's answer taken as it stands.
+    assert.strictEqual(M.ownershipVerdict(BIN, M.parseStat(a), g.mounts).ok, false)
+    assert.deepStrictEqual(M.debugReadArgv(BIN, M.parseStat(a), g.mounts, FLAGS), [])
+  }
+  // The changed marker is not a table, whatever else holds it.
+  assert.strictEqual(M.parseMountinfo(M.GATE_CHANGED), null)
+  assert.ok(M.mountProblem(BIN, { changed: true }).includes("changed while it was being checked"))
+  assert.ok(M.mountProblem(BIN, { changed: 1 }).includes("could not be read"))
 })
 
 // ---------------------------------------------------------------- commands
@@ -271,8 +478,8 @@ test("argv: the debug read, as the user, with the hardware's flags, under a time
 
 test("argv: the debug read runs the binary only when it passes the switch's ownership gate", () => {
   const ok = M.parseStat(ROOT_OK)
-  assert.deepStrictEqual(M.debugReadArgv(BIN, ok, FLAGS), M.debugArgv(BIN, FLAGS), "root-owned: the usual argv")
-  assert.deepStrictEqual(M.debugReadArgv(BIN, ok, []), M.debugArgv(BIN, []))
+  assert.deepStrictEqual(M.debugReadArgv(BIN, ok, MI_OK, FLAGS), M.debugArgv(BIN, FLAGS), "root-owned: the usual argv")
+  assert.deepStrictEqual(M.debugReadArgv(BIN, ok, MI_OK, []), M.debugArgv(BIN, []))
   const refused = {
     "owned by uid 1000": replaceLine(ROOT_OK, BIN, st(1000, "81ed", "raul", BIN)),
     "group-writable binary": replaceLine(ROOT_OK, BIN, st(0, "81fd", "root", BIN)),
@@ -284,17 +491,19 @@ test("argv: the debug read runs the binary only when it passes the switch's owne
     "missing binary": ROOT_OK.split("\n").filter(l => !l.endsWith("\t" + BIN)).join("\n")
   }
   for (const [why, text] of Object.entries(refused)) {
-    assert.strictEqual(M.ownershipVerdict(BIN, M.parseStat(text)).ok, false, why)
-    assert.deepStrictEqual(M.debugReadArgv(BIN, M.parseStat(text), FLAGS), [], why)
+    assert.strictEqual(M.ownershipVerdict(BIN, M.parseStat(text), MI_OK).ok, false, why)
+    assert.deepStrictEqual(M.debugReadArgv(BIN, M.parseStat(text), MI_OK, FLAGS), [], why)
   }
   for (const m of M.USER_MOUNTS) {
     const p = m + "/x/msi-mux-switch"
     const all = M.parseStat([st(0, "81ed", "root", p)].concat(M.ancestorDirs(p).map(d => st(0, "41ed", "root", d))).join("\n"))
-    assert.deepStrictEqual(M.debugReadArgv(p, all, FLAGS), [], p + ": a user mount, whatever stat says")
+    assert.deepStrictEqual(M.debugReadArgv(p, all, MI_OK, FLAGS), [], p + ": a user mount, whatever stat says")
   }
-  assert.deepStrictEqual(M.debugReadArgv(BIN, {}, FLAGS), [], "no stat, no read")
-  assert.deepStrictEqual(M.debugReadArgv(BIN, undefined, FLAGS), [])
-  assert.deepStrictEqual(M.debugReadArgv("relative/msi-mux-switch", ok, FLAGS), [])
+  assert.deepStrictEqual(M.debugReadArgv(BIN, {}, MI_OK, FLAGS), [], "no stat, no read")
+  assert.deepStrictEqual(M.debugReadArgv(BIN, undefined, MI_OK, FLAGS), [])
+  assert.deepStrictEqual(M.debugReadArgv(BIN, ok, null, FLAGS), [], "no mount table, no read")
+  assert.deepStrictEqual(M.debugReadArgv(BIN, ok, MI("fuse-ancestor"), FLAGS), [], "a FUSE mount on the way, no read")
+  assert.deepStrictEqual(M.debugReadArgv("relative/msi-mux-switch", ok, MI_OK, FLAGS), [])
 })
 
 test("argv: pkexec switch, exact array, no shell", () => {
@@ -885,6 +1094,115 @@ test("lock line: staged, leftover firmware flag, or nothing", () => {
   assert.deepStrictEqual(M.lockNotice({ debug: Object.assign({}, staged, { ok: false }), outcome: null }), none, "an unread state shows no line")
 })
 
+const BOOT = "bfa1d4ca-d977-4e70-82fe-09170e0bb41e"
+const BOOT2 = "0b6c7e0e-1f43-4d2b-9a8e-3c5d6e7f8a9b"
+const FLAG_OUT = { kind: "error", message: M.FIRMWARE_FLAG_TEXT, warning: "", offerShutdown: false, lock: true }
+
+test("boot id: read with an argv, bounded; only a lowercase UUID counts", () => {
+  assert.deepStrictEqual(M.bootIdArgv(), ["head", "-c", "64", "--", "/proc/sys/kernel/random/boot_id"])
+  assert.strictEqual(M.parseBootId(BOOT + "\n"), BOOT)
+  assert.strictEqual(M.parseBootId(BOOT), BOOT)
+  for (const bad of ["", "\n", BOOT.toUpperCase() + "\n", BOOT + "\n\n", " " + BOOT + "\n", BOOT + "0\n", BOOT.replace(/-/g, "") + "\n",
+    BOOT.slice(0, -1) + "g\n", BOOT + "\nx", null, undefined, 42])
+    assert.strictEqual(M.parseBootId(bad), "", JSON.stringify(bad))
+  assert.ok(M.isBootId(BOOT) && !M.isBootId("") && !M.isBootId(undefined))
+})
+
+test("flag memory: taken at the leftover-flag refusal only, with the boot id and the read's modes", () => {
+  const clean = M.parseDebug(CAPTURE, "", 0)
+  const staged = M.parseDebug(withFirmware({ selected_target_mode: "ms-hybrid" }), "", 0)
+  assert.deepStrictEqual(M.flagMemoryAtRefusal(FLAG_OUT, BOOT, clean), { bootId: BOOT, current: "discrete", target: "discrete" })
+  const stagedOut = Object.assign({}, FLAG_OUT, { message: M.STAGED_LOCK_TEXT })
+  assert.strictEqual(M.flagMemoryAtRefusal(stagedOut, BOOT, staged), null, "the staged refusal is not the flag")
+  assert.strictEqual(M.flagMemoryAtRefusal(FLAG_OUT, BOOT, staged), null, "a staged read wins")
+  assert.strictEqual(M.flagMemoryAtRefusal(Object.assign({}, FLAG_OUT, { lock: false }), BOOT, clean), null)
+  assert.strictEqual(M.flagMemoryAtRefusal({ kind: "error", message: "x", warning: "", offerShutdown: false }, BOOT, clean), null)
+  assert.strictEqual(M.flagMemoryAtRefusal(null, BOOT, clean), null)
+  for (const bad of ["", "nope", undefined]) assert.strictEqual(M.flagMemoryAtRefusal(FLAG_OUT, bad, clean), null, "no boot id, nothing remembered")
+  assert.strictEqual(M.flagMemoryAtRefusal(FLAG_OUT, BOOT, M.emptyDebug()), null, "no read, nothing remembered")
+  assert.strictEqual(M.flagMemoryAtRefusal(FLAG_OUT, BOOT, null), null)
+})
+
+test("flag memory: kept while the boot and the read match it, dropped otherwise", () => {
+  const clean = M.parseDebug(CAPTURE, "", 0)
+  const rec = M.flagMemoryAtRefusal(FLAG_OUT, BOOT, clean)
+  assert.strictEqual(M.flagMemoryAfterRead(rec, BOOT, M.parseDebug(CAPTURE, "", 0)), rec, "the same read again: kept")
+  assert.strictEqual(M.flagMemoryAfterRead(rec, BOOT2, clean), null, "another boot (a full shutdown): dropped")
+  assert.strictEqual(M.flagMemoryAfterRead(rec, "", clean), null, "a boot id that cannot be read: dropped")
+  assert.strictEqual(M.flagMemoryAfterRead(rec, BOOT, M.parseDebug(withFirmware({ selected_target_mode: "ms-hybrid" }), "", 0)), null,
+    "the target changed: dropped")
+  assert.strictEqual(M.flagMemoryAfterRead(rec, BOOT, M.parseDebug(withFirmware({ current_mode: "integrated", selected_target_mode: "integrated" }), "", 0)), null,
+    "the current mode changed: dropped")
+  assert.strictEqual(M.flagMemoryAfterRead(rec, BOOT, M.emptyDebug()), null, "the gate refused (no read kept): dropped")
+  assert.strictEqual(M.flagMemoryAfterRead(rec, BOOT, M.parseDebug("{", "", 0)), null, "a failed read: dropped")
+  assert.strictEqual(M.flagMemoryAfterRead(null, BOOT, clean), null)
+  assert.strictEqual(M.flagMemoryAfterRead(undefined, BOOT, clean), null)
+})
+
+test("flag memory: while it holds, the panel acts as staged: the flag line, no Switch button, no request", () => {
+  const clean = M.parseDebug(CAPTURE, "", 0)
+  const flag = M.flagMemoryAtRefusal(FLAG_OUT, BOOT, clean)
+  const v = view({ flag: flag })
+  assert.deepStrictEqual(M.lockNotice({ debug: clean, outcome: null, busy: false, flag: flag }), { kind: "flag", text: M.FIRMWARE_FLAG_TEXT, urgent: false },
+    "a reopened panel still offers Shut down now")
+  assert.deepStrictEqual(M.lockNotice({ debug: clean, outcome: FLAG_OUT, busy: false, flag: flag }), { kind: "flag", text: M.FIRMWARE_FLAG_TEXT, urgent: true },
+    "urgent only right after the refusal")
+  assert.strictEqual(M.shutdownMessage(M.lockNotice({ debug: clean, flag: flag }).kind), M.SHUTDOWN_FLAG_MESSAGE)
+  const rows = M.modeRows(v)
+  for (const r of rows) assert.deepStrictEqual([r.action, r.enabled, r.reason], ["", false, ""], r.mode)
+  assert.strictEqual(rowOf(rows, "discrete").status, "Current mode.")
+  assert.strictEqual(rowOf(rows, "mshybrid").status, "")
+  assert.strictEqual(M.switchBlocker(v), M.FIRMWARE_FLAG_TEXT, "requestSwitch is refused")
+  assert.deepStrictEqual(M.cursorStops(rows, { canShutDown: true }), ["shutdown", "env"])
+  assert.ok(M.flagActive(v))
+  // A staged switch still wins; a read that no longer matches lifts it.
+  const staged = M.parseDebug(withFirmware({ selected_target_mode: "ms-hybrid" }), "", 0)
+  assert.deepStrictEqual(M.lockNotice({ debug: staged, outcome: null, busy: false, flag: flag }), { kind: "staged", text: M.STAGED_LOCK_TEXT, urgent: false })
+  assert.strictEqual(M.flagActive(view({ debug: staged, flag: flag })), false)
+  assert.strictEqual(rowOf(M.modeRows(view({ debug: staged, flag: flag })), "mshybrid").status, "Staged: takes effect after a full shutdown.")
+  const other = M.parseDebug(withFirmware({ current_mode: "integrated", selected_target_mode: "integrated" }), "", 0)
+  assert.strictEqual(M.flagActive(view({ debug: other, flag: flag })), false)
+  assert.strictEqual(rowOf(M.modeRows(view({ debug: other, flag: flag })), "discrete").action, "switch")
+  assert.deepStrictEqual(M.lockNotice({ debug: M.emptyDebug(), outcome: null, flag: flag }), { kind: "", text: "", urgent: false })
+  // Without a record nothing changes.
+  assert.strictEqual(M.switchBlocker(view({ flag: null })), "")
+  assert.strictEqual(rowOf(M.modeRows(view({ flag: null })), "mshybrid").action, "switch")
+})
+
+// What a refused gate leaves: the binary refused (by stat, by the mount
+// table, before a switch, or a read ending after it) empties the debug read;
+// unvalidated hardware never had one. Nothing of an earlier read shows.
+test("refused gate: mode unknown and the reason; no mode, status, env status, badge or lock line from an earlier read", () => {
+  const staged = M.parseDebug(withFirmware({ selected_target_mode: "ms-hybrid" }), "", 0)
+  const flag = M.flagMemoryAtRefusal(FLAG_OUT, BOOT, M.parseDebug(CAPTURE, "", 0))
+  const reasons = {
+    "stat": BIN + " is owned by raul, not root.",
+    "mount": BIN + " is on a fuse.sshfs mount at /opt, which another account may control.",
+    "switch": BIN + " is owned by raul, not root. Nothing was run.",
+    "hardware": M.hardwareDecision({ vendor: "MSI", model: "x", board: "y", bios: "z" }).reason
+  }
+  for (const [why, reason] of Object.entries(reasons)) {
+    // The record is dropped with the read (flagMemoryAfterRead), but even a
+    // stale one or a lock outcome left from before changes nothing here.
+    const st = { available: false, unavailableReason: reason, busy: false, ac: true, debug: M.emptyDebug(),
+      flag: M.flagMemoryAfterRead(flag, BOOT, M.emptyDebug()) }
+    assert.strictEqual(st.flag, null, why)
+    assert.strictEqual(M.summary(st.debug, true), "GPU mode unknown", why)
+    assert.strictEqual(M.summary(staged, true), "GPU mode unknown", why + ": blocked wins over any read")
+    for (const r of M.modeRows(st)) {
+      assert.deepStrictEqual([r.status, r.enabled, r.reason], ["", false, "Unavailable: see above."], why + " " + r.mode)
+    }
+    assert.strictEqual(M.envStatusText(st.debug), M.ENV_INERT_TEXT, why)
+    assert.deepStrictEqual(M.barState(st), { icon: M.ICON.unknown, dimmed: true, badge: false }, why)
+    assert.strictEqual(M.tooltipText(st), "MSI GPU MUX: mode unknown\n" + reason, why)
+    assert.strictEqual(M.switchBlocker(st), reason, why)
+    for (const outcome of [null, FLAG_OUT, { kind: "error", message: reason, warning: "", offerShutdown: false }])
+      assert.deepStrictEqual(M.lockNotice(Object.assign({}, st, { outcome: outcome, flag: flag })), { kind: "", text: "", urgent: false },
+        why + " " + JSON.stringify(outcome && outcome.message))
+    assert.deepStrictEqual(M.cursorStops(M.modeRows(st), { canShutDown: M.lockNotice(st).kind !== "" }), ["env"], why)
+  }
+})
+
 test("wording: shut down, never an instruction to reboot", () => {
   const strings = [...source.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map(m => m[1])
   for (const s of strings) {
@@ -909,7 +1227,7 @@ test("cursor: stops in screen order, disabled buttons skipped", () => {
   // Shut down now on the lock line sits between the modes and the dropdown.
   assert.deepStrictEqual(M.cursorStops(pending, { canSetUp: true, canShutDown: true }), ["setup", "shutdown", "env"])
   assert.deepStrictEqual(M.cursorStops(rows, { canShutDown: true }), ["mode|mshybrid", "mode|integrated", "shutdown", "env"],
-    "a leftover firmware flag: Switch buttons and Shut down now")
+    "a leftover-flag refusal with no record kept (no boot id): Switch buttons and Shut down now")
   assert.deepStrictEqual(M.cursorStops(pending, { canShutDown: "yes" }), ["env"])
 })
 
@@ -1213,7 +1531,8 @@ test("panel: keyboard cursor, the staged lock line, per-row reasons, stale resul
   const confirmBody = confirm.slice(0, confirm.indexOf("\n  }\n"))
   assert.ok(/if \(!row \|\| row\.action !== "switch" \|\| !row\.enabled\) return/.test(confirmBody))
   assert.ok(confirmBody.indexOf("root.rows.find(") < confirmBody.indexOf("MuxState.requestSwitch("))
-  assert.ok(/readonly property var lockNotice: Model\.lockNotice\(\{ debug: MuxState\.debug, outcome: MuxState\.outcome, busy: MuxState\.busy \}\)/.test(bar))
+  assert.ok(/readonly property var lockNotice: Model\.lockNotice\(\{ debug: MuxState\.debug, outcome: MuxState\.outcome, busy: MuxState\.busy,\s*unavailableReason: MuxState\.unavailableReason, flag: MuxState\.flagRecord \}\)/.test(bar))
+  assert.ok(/ac: MuxState\.ac,\s*flag: MuxState\.flagRecord\s*\}\)/.test(bar), "the rows and the bar see the remembered flag")
   const lock = bar.indexOf("text: root.lockNotice.text")
   assert.ok(lock > bar.indexOf("model: root.rows"), "the lock line follows the mode rows")
   const lockRow = bar.slice(bar.lastIndexOf("RowLayout {", lock), bar.indexOf("onClicked:", lock) + 80)
@@ -1510,10 +1829,10 @@ test("debug read: only through the ownership gate, on the stat taken right befor
   for (const file of qmlFiles) {
     assert.ok(!/Model\.debugArgv\(|Model\.debugCommand\(|Model\.binaryPresent\(/.test(qmlCode(file)), file + " builds an ungated debug read")
   }
-  const fn = state.slice(state.indexOf("function readDebug(stats)"))
+  const fn = state.slice(state.indexOf("function readDebug(stats, mounts)"))
   const body = fn.slice(0, fn.indexOf("\n  }\n"))
-  assert.ok(body.length > 0 && fn.length > 0, "readDebug(stats)")
-  assert.ok(/var argv = Model\.debugReadArgv\(root\.binaryPath, stats, root\.hardware\.flags\)\s*if \(argv\.length === 0\) \{\s*root\.debug = Model\.emptyDebug\(\)\s*return\s*\}/.test(body),
+  assert.ok(body.length > 0 && state.indexOf("function readDebug(stats, mounts)") !== -1, "readDebug(stats, mounts)")
+  assert.ok(/var argv = Model\.debugReadArgv\(root\.binaryPath, stats, mounts, root\.hardware\.flags\)\s*if \(argv\.length === 0\) \{\s*root\.debug = Model\.emptyDebug\(\)\s*return\s*\}/.test(body),
     "gated first; a refused binary leaves no earlier read's state")
   assert.ok(body.indexOf("Model.debugReadArgv") < body.indexOf("debugProc.running = true"))
   assert.ok(body.indexOf("Model.debugReadArgv") < body.indexOf("root.debugAgain = true"), "a read waits only once it passed")
@@ -1521,7 +1840,12 @@ test("debug read: only through the ownership gate, on the stat taken right befor
   assert.strictEqual((state.match(/debugProc\.running = true/g) || []).length, 1, "the debug read starts in one place")
   // Called from one place: the end of the stat, with that stat's result.
   assert.strictEqual((state.match(/root\.readDebug\(/g) || []).length, 1, "readDebug has one caller")
-  assert.ok(/root\.stats = Model\.parseStat\(text\)\s*root\.statRead = true\s*root\.readDebug\(root\.stats\)/.test(state))
+  assert.ok(/var gate = Model\.parseGateRead\(text\)\s*root\.mounts = gate\.mounts\s*root\.stats = gate\.stats\s*root\.statRead = true\s*root\.readDebug\(root\.stats, root\.mounts\)/.test(state))
+  // Both gate reads are the one stat-and-mounts run, fresh every time.
+  assert.ok(!/Model\.statArgv\(|Model\.parseStat\(/.test(state), "no stat without the mount table")
+  assert.strictEqual((state.match(/Model\.gateArgv\(root\.binaryPath\)/g) || []).length, 2, "the status read and the switch")
+  assert.ok(/checkStat\.result = Model\.parseGateRead\(text\)/.test(state))
+  assert.ok(/readonly property var ownership: root\.statRead\s*\? Model\.ownershipVerdict\(root\.binaryPath, root\.stats, root\.mounts\)/.test(state))
   // Every read asked for again goes through a new stat.
   assert.ok(/root\.debugAgain = false\s*root\.checkBinary\(\)\s*\}\)/.test(state), "after a read ends")
   const fin = state.slice(state.indexOf("function finish(outcome)"))
@@ -1536,12 +1860,31 @@ test("debug read: only through the ownership gate, on the stat taken right befor
   // The switch's own stat refusing the binary drops the earlier read too.
   const ss = state.slice(state.indexOf("function startSwitch()"))
   const ssBody = ss.slice(0, ss.indexOf("\n  }\n"))
-  assert.ok(/root\.stats = checkStat\.result\s*var verdict = Model\.ownershipVerdict\(root\.binaryPath, checkStat\.result\)\s*if \(!verdict\.ok\) \{\s*root\.debug = Model\.emptyDebug\(\)\s*return root\.refused\(/.test(ssBody),
+  assert.ok(/var gate = checkStat\.result\s*root\.mounts = gate\.mounts\s*root\.stats = gate\.stats\s*var verdict = Model\.ownershipVerdict\(root\.binaryPath, gate\.stats, gate\.mounts\)\s*if \(!verdict\.ok\) \{\s*root\.debug = Model\.emptyDebug\(\)\s*return root\.refused\(/.test(ssBody),
     "a refused pre-switch stat clears the debug read")
   assert.ok(!/\bpresent\b/.test(state), "no ungated presence flag")
   const bar = qmlCode("BarWidget.qml")
   assert.ok(/meta: Model\.summary\(MuxState\.debug, MuxState\.debugBlocked\)/.test(bar))
   assert.ok(/readonly property bool debugBlocked: root\.hardware\.state === "unavailable" \|\| \(root\.statRead && !root\.ownership\.ok\)/.test(state))
+})
+
+test("flag memory: remembered at the refusal, decided again on every read and boot id, read by argv", () => {
+  const state = qmlCode("MuxState.qml")
+  assert.ok(/onDebugChanged: root\.flagRecord = Model\.flagMemoryAfterRead\(root\.flagRecord, root\.bootId, root\.debug\)/.test(state))
+  assert.ok(/onBootIdChanged: root\.flagRecord = Model\.flagMemoryAfterRead\(root\.flagRecord, root\.bootId, root\.debug\)/.test(state))
+  assert.strictEqual((state.match(/root\.flagRecord = /g) || []).length, 3, "set at the refusal, decided again on a read or a boot id")
+  const exited = state.slice(state.indexOf("function switchExited()"))
+  const exitBody = exited.slice(0, exited.indexOf("\n  }\n"))
+  assert.ok(/var flag = Model\.flagMemoryAtRefusal\(outcome, root\.bootId, root\.debug\)\s*if \(flag !== null\) root\.flagRecord = flag/.test(exitBody))
+  assert.ok(exitBody.indexOf("Model.flagMemoryAtRefusal") < exitBody.indexOf("root.finish(outcome)"))
+  assert.ok(/bootProc\.command = Model\.bootIdArgv\(\)/.test(state))
+  assert.ok(/onStreamFinished: root\.bootId = Model\.parseBootId\(text\)/.test(state))
+  // Read again with every debug read.
+  const fn = state.slice(state.indexOf("function readDebug(stats, mounts)"))
+  const body = fn.slice(0, fn.indexOf("\n  }\n"))
+  assert.ok(body.indexOf("debugProc.running = true") < body.indexOf("root.readBootId()"))
+  const req = state.slice(state.indexOf("function requestSwitch("))
+  assert.ok(/flag: root\.flagRecord \}\) !== ""\)/.test(req.slice(0, req.indexOf("\n  }\n"))), "a request is refused while it holds")
 })
 
 // ---------------------------------------------------- manifest and layout
@@ -1552,7 +1895,7 @@ test("manifest: identity, version and the settings schema", () => {
   assert.strictEqual(m.id, "io.github.rsd.msi-mux")
   assert.strictEqual(m.id, M.PLUGIN_ID)
   assert.strictEqual(m.name, "MSI GPU MUX")
-  assert.strictEqual(m.version, "0.2.8")
+  assert.strictEqual(m.version, "0.2.9")
   assert.strictEqual(m.license, "MIT")
   assert.deepStrictEqual(m.kinds, ["bar-widget"])
   assert.deepStrictEqual(m.entryPoints, { barWidget: "BarWidget.qml" })
@@ -1575,7 +1918,10 @@ test("manifest: identity, version and the settings schema", () => {
 const SHIPPED = ["BarWidget.qml", "LICENSE", "Model.js", "MuxState.qml", "README.md", "manifest.json", "preview.png",
   "qmldir", "setup.sh", "tests/debug-read-test.sh", "tests/debug-read-text.js", "tests/env-file-test.sh",
   "tests/env-file-text.js", "tests/fixtures/debug-discrete.json", "tests/fixtures/fake-msi-mux-switch",
-  "tests/fixtures/fake-msi-mux-switch-flood", "tests/fixtures/fake-msi-mux-switch-hang", "tests/model-test.js", "tests/qmllint-check.js", "tests/run.sh", "tests/setup-test.sh"]
+  "tests/fixtures/fake-msi-mux-switch-flood", "tests/fixtures/fake-msi-mux-switch-hang",
+  ...["empty", "ext4-root", "fuse-ancestor", "fuse-exact", "fuseblk-folder", "malformed", "sibling", "space", "user-id"]
+    .map(n => "tests/fixtures/mountinfo-" + n),
+  "tests/model-test.js", "tests/qmllint-check.js", "tests/run.sh", "tests/setup-test.sh"]
 
 test("layout: every shipped file is there, none a symlink; tests/ holds only them", () => {
   for (const f of SHIPPED) {

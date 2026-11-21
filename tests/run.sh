@@ -274,7 +274,8 @@ qml_load_selftest() {
 # its binaryPath setting (its panel is never opened, no switch is asked for,
 # no env file is written), waits for the DMI read, the stat and the AC read
 # (and a while longer, for a debug read that should not come), and reports
-# them. The real DMI decides the hardware: on a machine that is not an MSI
+# them. The real mount table is read with the stat and must pass for the
+# temporary folder. The real DMI decides the hardware: on a machine that is not an MSI
 # the widget must be hidden and nothing else is read. Checks that the
 # singleton is the widget's (one instance), that the temporary binary fails
 # the ownership gate (it is not root-owned) and is therefore never run, not
@@ -349,6 +350,8 @@ ShellRoot {
       + " modes " + s.debug.modes.join(",") + " rows " + w.rows.length + " env " + s.envChoice
       + " busy " + s.busy + " flags " + s.hardware.flags.join(","))
     console.log("MMLIVE ac " + (s.ac === true || s.ac === false || s.ac === null))
+    console.log("MMLIVE mounts read " + (typeof s.mounts === "string" && s.mounts.length > 0)
+      + " parsed " + (Model.parseMountinfo(s.mounts) !== null) + " pass " + (Model.mountProblem(s.binaryPath, s.mounts) === ""))
     console.log("MMLIVE panel reason " + (s.unavailableReason !== "" && s.unavailableReason === s.ownership.reason)
       + " setup " + s.canSetUp + " meta " + Model.summary(s.debug, s.debugBlocked))
     w.destroy()
@@ -387,6 +390,12 @@ EOF
     else
       echo "ok   the refused fake binary was never run, not even with --debug --json"
     fi
+    if grep -q 'MMLIVE mounts read true parsed true pass true$' "$cfg/log"; then
+      echo "ok   the real mount table was read with the stat and passes for the scratch folder (on $(findmnt -no FSTYPE -T "$cfg" 2>/dev/null || echo '?'))"
+    else
+      echo "FAIL mount table: $(grep -o 'MMLIVE mounts.*' "$cfg/log" | head -1)"
+      ok=1
+    fi
     if grep -q 'MMLIVE panel reason true setup true meta GPU mode unknown$' "$cfg/log"; then
       echo "ok   the panel shows the gate's reason, offers Set up backend, and the mode as unknown"
     else
@@ -421,8 +430,10 @@ EOF
 # The switch and env-file flow for real, in a scratch Quickshell with a
 # temporary HOME and PATH starting with fakes: `stat` (reports every path
 # root-owned, mode 755, so the ownership gate passes), `pkexec` (checks
-# --disable-internal-agent, logs its argv and runs the rest) and the fake
-# msi-mux-switch with switching enabled. No real pkexec can be reached: with
+# --disable-internal-agent, logs its argv and runs the rest), `head` (the
+# real one, but serving a FUSE mount table or another boot's id when asked
+# to) and the fake msi-mux-switch with switching enabled. The real mount
+# table must pass the gate for the scratch folder. No real pkexec can be reached: with
 # the real stat the temporary binary fails the gate before any pkexec runs.
 # The singleton is driven directly, and the panel's window never maps (its
 # visible binding is replaced first; any sign of mapping ends the run), so
@@ -444,7 +455,11 @@ EOF
 # Integrated is staged and reset the same way (the RTX file is still there
 # after the round trip); MSHybrid is staged with the fake printing a line of
 # about 300 KB first and its success line without a "\n" (the long line is
-# counted as unread, the events are all read, success; then reset); RTX
+# counted as unread, the events are all read, success; then reset); the
+# leftover flag's refusal is remembered: no Switch button, also after the
+# panel is closed and opened again by the user (a direct request is
+# refused), until another boot id drops it; refused again, a read showing a
+# staged target drops it; RTX
 # then Auto while RTX is written ends in Auto (no file); a write that fails
 # (env.d made read-only) shows the error and puts the widget's dropdown
 # back on Auto, the state on disk; a write that fails
@@ -452,8 +467,11 @@ EOF
 # removal that fails shows its error and puts the dropdown back on Intel; a
 # switch while a process named msi-mux-switch runs (a copy of sleep) is
 # refused before pkexec; a switch after the fake stat turns the binary
-# foreign-owned is refused by its own stat before pkexec, and the earlier
-# read is dropped (no mode, the read blocked, the header "GPU mode unknown").
+# foreign-owned, or after a FUSE mount another account owns appears over
+# its folder, is refused by its own gate read before pkexec, and the
+# earlier read is dropped (no mode, no row status, no badge, no mode in the
+# tooltip, no lock line, the header "GPU mode unknown"); the status read
+# refuses the FUSE mount too, without running the binary.
 # Skipped on hardware that is not available or on battery (the real AC is
 # read).
 switch_flow_live() {
@@ -466,21 +484,33 @@ switch_flow_live() {
     echo "skipped: plugin path contains a quote or backslash"
     return $SKIP
   fi
-  local cfg home bin fake ok=0 real_stat
+  local cfg home bin fake ok=0 real_stat real_head
+  # The flow lasts longer than a load check.
+  local LOAD_TIMEOUT_S=40
   real_stat=$(command -v stat) || return 1
+  real_head=$(command -v head) || return 1
   cfg=$(mktemp -d) || return 1
   home=$cfg/home fake=$cfg/fakebin bin=$cfg/bin/msi-mux-switch
   mkdir -p "$home" "$fake" "$cfg/bin" "$cfg/run"
   cp "$PLUGIN_DIR/tests/fixtures/fake-msi-mux-switch" "$bin"
   cp "$(command -v sleep)" "$cfg/run/msi-mux-switch"
+  # The FUSE fixture moved over the scratch folder: a fuse.sshfs mount
+  # another account owns, on the fake binary's way.
+  sed "s| /opt | $cfg |" -- "$PLUGIN_DIR/tests/fixtures/mountinfo-fuse-ancestor" >"$cfg/mountinfo-fuse"
   chmod 755 "$bin"
   cat >"$fake/stat" <<EOF
 #!/bin/bash
 # Called as: stat -c <format> -- <paths...>; every path reads as root:root 755,
-# or, once $cfg/stat.foreign exists, as owned by uid 1000.
+# or, once $cfg/stat.foreign exists, as owned by uid 1000. Once $cfg/stat.flip
+# exists, the first call from a gate run (its parent bash) reads as root and
+# the second as owned by uid 1000: a FUSE daemon's forged answer, then the
+# real file after a lazy unmount.
 [[ \$1 == -c && \$3 == -- ]] || exit 1
 uid=0 user=root
 [[ -e "$cfg/stat.foreign" ]] && uid=1000 user=someone
+if [[ -e "$cfg/stat.flip" ]]; then
+  if [[ -e "$cfg/stat.count.\$PPID" ]]; then uid=1000 user=someone; else : >"$cfg/stat.count.\$PPID"; fi
+fi
 "$real_stat" -c '%u	%f	%U	%n' -- "\${@:4}" | while IFS=\$'\t' read -r _ raw _ name; do
   printf '%s\t%x\t%s\t%s\n' "\$uid" "\$(( (16#\$raw & 16#F000) | 8#755 ))" "\$user" "\$name"
 done
@@ -498,10 +528,25 @@ EOF
 #!/bin/bash
 printf '%s\n' "\$*" >>"$cfg/shutdown.log"
 EOF
-  chmod 755 "$fake/stat" "$fake/pkexec" "$fake/omarchy-system"
+  # head as the gate and the boot id reads call it: the real one, except the
+  # mount table once $cfg/mounts.fuse exists (the FUSE fixture) and the boot
+  # id once $cfg/boot.other exists (another boot's).
+  cat >"$fake/head" <<EOF
+#!/bin/bash
+if [[ \$# == 4 && \$1 == -c && \$3 == -- && \$4 == /proc/self/mountinfo && -e "$cfg/mounts.fuse" ]]; then
+  exec cat -- "$cfg/mountinfo-fuse"
+fi
+if [[ \$# == 4 && \$1 == -c && \$3 == -- && \$4 == /proc/sys/kernel/random/boot_id && -e "$cfg/boot.other" ]]; then
+  printf '%s\n' 0b6c7e0e-1f43-4d2b-9a8e-3c5d6e7f8a9b
+  exit 0
+fi
+exec "$real_head" "\$@"
+EOF
+  chmod 755 "$fake/stat" "$fake/pkexec" "$fake/omarchy-system" "$fake/head"
   if [[ $(PATH="$fake:$PATH" command -v pkexec) != "$fake/pkexec" ||
-    $(PATH="$fake:$PATH" command -v omarchy-system) != "$fake/omarchy-system" ]]; then
-    echo "FAIL pkexec or omarchy-system does not resolve to the fake; not running"
+    $(PATH="$fake:$PATH" command -v omarchy-system) != "$fake/omarchy-system" ||
+    $(PATH="$fake:$PATH" command -v head) != "$fake/head" ]]; then
+    echo "FAIL pkexec, omarchy-system or head does not resolve to the fake; not running"
     rm -rf "$cfg"
     return 1
   fi
@@ -682,13 +727,62 @@ ShellRoot {
         if (!shell.outcome || s.busy) return
         shell.logReopened("flag", "esc")
         if (!shell.unmapped()) return
-        shell.log("flag refused pending " + s.debug.pending)
+        shell.log("flag refused pending " + s.debug.pending + " record " + (s.flagRecord !== null))
         shell.logPanel("flag refused")
         shell.logLock("flag refused")
+        // Opened again by the user: the outcome is cleared, the modes are
+        // read again, and the remembered flag still holds.
+        shell.debugReads = 0
+        shell.ticks = 0
+        shell.widget.open()
+        shell.step = 44
+      } else if (shell.step === 44) {
+        if (shell.debugReads === 0 || s.busy || ++shell.ticks < 5) return
+        var w44 = shell.widget
+        shell.log("flag reopened outcome " + (s.outcome === null) + " record " + (s.flagRecord !== null && s.flagRecord.bootId === s.bootId)
+          + " lock " + w44.lockNotice.kind + " urgent " + w44.lockNotice.urgent + " stops " + w44.cursorStops.join(",")
+          + " request " + s.requestSwitch(holder, "integrated") + " busy " + s.busy)
+        shell.logPanel("flag reopened")
+        shell.logLock("flag reopened")
+        w44.close()
+        bootSet.running = true
+        shell.step = 45
+      } else if (shell.step === 45) {
+        if (bootSet.running) return
+        s.checkBinary()
+        shell.step = 46
+      } else if (shell.step === 46) {
+        if (s.bootId !== "0b6c7e0e-1f43-4d2b-9a8e-3c5d6e7f8a9b" || s.busy) return
+        shell.log("flag other boot record " + (s.flagRecord !== null) + " lock '" + shell.widget.lockNotice.kind + "'")
+        shell.logPanel("flag other boot")
+        // Refused again (the flag is still set), now in the other boot.
+        shell.outcome = null
+        shell.log("flag again request " + s.requestSwitch(holder, "integrated"))
+        shell.step = 47
+      } else if (shell.step === 47) {
+        if (!shell.outcome || s.busy) return
+        shell.log("flag again record " + (s.flagRecord !== null && s.flagRecord.bootId === "0b6c7e0e-1f43-4d2b-9a8e-3c5d6e7f8a9b")
+          + " lock " + shell.widget.lockNotice.kind)
+        // A switch staged meanwhile (the read now shows a target): dropped.
+        stageSet.running = true
+        shell.step = 48
+      } else if (shell.step === 48) {
+        if (stageSet.running) return
+        s.checkBinary()
+        shell.step = 49
+      } else if (shell.step === 49) {
+        if (!s.debug.pending || s.busy) return
+        shell.log("flag staged record " + (s.flagRecord !== null) + " pending " + s.debug.pending + " lock " + shell.widget.lockNotice.kind)
         flagClear.running = true
         shell.step = 43
       } else if (shell.step === 43) {
         if (flagClear.running) return
+        s.checkBinary()
+        shell.step = 50
+      } else if (shell.step === 50) {
+        if (s.debug.pending || !s.debug.ok || s.bootId === "0b6c7e0e-1f43-4d2b-9a8e-3c5d6e7f8a9b") return
+        shell.log("flag cleared record " + (s.flagRecord !== null) + " pending " + s.debug.pending)
+        shell.logPanel("flag cleared")
         s.setEnvChoice("intel")
         shell.step = 4
       } else if (shell.step === 4) {
@@ -793,6 +887,70 @@ ShellRoot {
         if (!s.debug.ok || ++shell.ticks < 10) return
         shell.log("before foreign ok " + s.debug.ok + " blocked " + s.debugBlocked
           + " meta " + Model.summary(s.debug, s.debugBlocked))
+        // A FUSE mount another account owns appears over the binary's
+        // folder before the next switch's own gate read.
+        fuseSet.running = true
+        shell.step = 21
+      } else if (shell.step === 21) {
+        if (fuseSet.running) return
+        shell.outcome = null
+        shell.runs = s.debugRuns
+        shell.log("fuse request " + s.requestSwitch(holder, "integrated"))
+        shell.step = 22
+      } else if (shell.step === 22) {
+        if (!shell.outcome || s.busy) return
+        shell.log("fuse switch refused ok " + s.debug.ok + " blocked " + s.debugBlocked + " kind " + s.ownership.kind
+          + " setup " + s.canSetUp + " :: " + shell.outcome.message)
+        shell.logRefused("fuse switch")
+        // The status read through the same gate: refused, nothing run.
+        shell.ticks = 0
+        s.checkBinary()
+        shell.step = 23
+      } else if (shell.step === 23) {
+        if (++shell.ticks < 10) return
+        shell.log("fuse status runs " + (s.debugRuns === shell.runs) + " kind " + s.ownership.kind + " ok " + s.debug.ok
+          + " meta " + Model.summary(s.debug, s.debugBlocked))
+        fuseClear.running = true
+        shell.step = 24
+      } else if (shell.step === 24) {
+        if (fuseClear.running) return
+        s.checkBinary()
+        shell.step = 25
+      } else if (shell.step === 25) {
+        if (!s.debug.ok) return
+        shell.log("fuse cleared ok " + s.debug.ok + " kind " + s.ownership.kind + " meta " + Model.summary(s.debug, s.debugBlocked))
+        // The binary's stat changes between the gate's two stats (a FUSE
+        // daemon's forged root answer, then the real file after a lazy
+        // unmount): refused, and the fake binary is never run.
+        flipSet.running = true
+        shell.step = 60
+      } else if (shell.step === 60) {
+        if (flipSet.running) return
+        shell.outcome = null
+        shell.runs = s.debugRuns
+        shell.log("flip request " + s.requestSwitch(holder, "integrated"))
+        shell.step = 61
+      } else if (shell.step === 61) {
+        if (!shell.outcome || s.busy) return
+        shell.log("flip switch refused ok " + s.debug.ok + " blocked " + s.debugBlocked + " kind " + s.ownership.kind
+          + " setup " + s.canSetUp + " :: " + shell.outcome.message)
+        shell.logRefused("flip switch")
+        shell.ticks = 0
+        s.checkBinary()
+        shell.step = 62
+      } else if (shell.step === 62) {
+        if (++shell.ticks < 10) return
+        shell.log("flip status runs " + (s.debugRuns === shell.runs) + " kind " + s.ownership.kind + " ok " + s.debug.ok
+          + " meta " + Model.summary(s.debug, s.debugBlocked))
+        flipClear.running = true
+        shell.step = 63
+      } else if (shell.step === 63) {
+        if (flipClear.running) return
+        s.checkBinary()
+        shell.step = 64
+      } else if (shell.step === 64) {
+        if (!s.debug.ok) return
+        shell.log("flip cleared ok " + s.debug.ok + " kind " + s.ownership.kind + " meta " + Model.summary(s.debug, s.debugBlocked))
         foreignSet.running = true
         shell.step = 13
       } else if (shell.step === 13) {
@@ -804,6 +962,7 @@ ShellRoot {
         if (!shell.outcome || s.busy) return
         shell.log("foreign refused ok " + s.debug.ok + " current '" + s.debug.current + "' blocked " + s.debugBlocked
           + " meta " + Model.summary(s.debug, s.debugBlocked))
+        shell.logRefused("foreign")
         shell.widget.destroy()
         shell.done()
       }
@@ -816,7 +975,28 @@ ShellRoot {
   Process { id: flagSet; command: ["touch", "--", "$cfg/state.apply-ready"] }
   Process { id: floodSet; command: ["touch", "--", "$cfg/state.flood"] }
   Process { id: floodReset; command: ["rm", "-f", "--", "$cfg/state", "$cfg/state.flood"] }
-  Process { id: flagClear; command: ["rm", "-f", "--", "$cfg/state.apply-ready"] }
+  Process { id: flagClear; command: ["rm", "-f", "--", "$cfg/state.apply-ready", "$cfg/state", "$cfg/boot.other"] }
+  Process { id: bootSet; command: ["touch", "--", "$cfg/boot.other"] }
+  Process { id: stageSet; command: ["bash", "-c", "printf ms-hybrid >\"\$1\"", "stage", "$cfg/state"] }
+  Process { id: fuseSet; command: ["touch", "--", "$cfg/mounts.fuse"] }
+  Process { id: fuseClear; command: ["rm", "-f", "--", "$cfg/mounts.fuse"] }
+  // The fake binary's log is copied when the stat starts to flip and when it
+  // stops: the two copies must be the same (it never ran meanwhile).
+  Process { id: flipSet; command: ["bash", "-c", "cp -- \"\$1\" \"\$1.flip-before\" && touch -- \"\$2\"", "flip", "$cfg/fake.log", "$cfg/stat.flip"] }
+  Process { id: flipClear; command: ["bash", "-c", "cp -- \"\$1\" \"\$1.flip-after\" && rm -f -- \"\$2\" \"\$3\".*", "flip", "$cfg/fake.log", "$cfg/stat.flip", "$cfg/stat.count"] }
+  property int runs: 0
+  property int debugReads: 0
+  // What a refused gate leaves on show: every row's status and enabled
+  // buttons, the bar glyph, its tooltip's first line, the lock line, the
+  // env status line's text and the header.
+  function logRefused(when) {
+    var w = shell.widget, s = Plugin.MuxState
+    shell.log("refused " + when + " status [" + w.rows.map(function(r) { return r.status }).join("|") + "] enabled "
+      + w.rows.filter(function(r) { return r.enabled }).length + " icon unknown " + (w.glyph.icon === Model.ICON.unknown)
+      + " dimmed " + w.glyph.dimmed + " badge " + w.glyph.badge + " tooltip " + Model.tooltipText(w.view).split("\n")[0]
+      + " lock '" + w.lockNotice.kind + "' env " + (Model.envStatusText(s.debug) === Model.ENV_INERT_TEXT)
+      + " record " + (s.flagRecord !== null) + " meta " + Model.summary(s.debug, s.debugBlocked))
+  }
   // The lock line (its text, shown or not), its Shut down now button and
   // cursor stop; then the button is pressed through the cursor: the shutdown
   // dialog opens with its text and is dismissed (Later). Nothing shuts down.
@@ -1059,8 +1239,9 @@ ShellRoot {
   Connections {
     target: Plugin.MuxState
     function onEnvRead() { shell.reads++ }
+    function onDebugChanged() { shell.debugReads++ }
   }
-  Timer { interval: 20000; running: true; onTriggered: { shell.log("TIMEOUT step " + shell.step); shell.done() } }
+  Timer { interval: 35000; running: true; onTriggered: { shell.log("TIMEOUT step " + shell.step); shell.done() } }
 }
 EOF
   scratch_qs "$cfg" MMFLOW "HOME=$home" "PATH=$fake:$PATH" "MM_FAKE_SWITCH=1" "MM_FAKE_STATE=$cfg/state" \
@@ -1107,10 +1288,20 @@ EOF
   expect_flow "lockline flag before kind  text false button false stop false :: " "no lock line before the refusal"
   expect_flow "flag request true" "a switch is asked for with the flag left set"
   expect_flow "finished owner widget kind error offer false warning false :: The firmware still has a switch in progress. A full shutdown clears it." "the refusal with nothing staged reads as the leftover flag"
-  expect_flow "reopened flag open true inert true target inert focus true blocked true offered false cursor false stops mode|mshybrid,mode|integrated,shutdown,env keys 40 swallowed 40 after open true inert true cursor false offered false confirm '' dialog false env true busy false esc open false inert false" "after the refused switch the panel reopened key-inert: the keys reach neither the switch nor the shutdown dialog; Esc closes it"
-  expect_flow "flag refused pending false" "nothing staged after the refusal"
-  expect_flow "panel flag refused rows 3 buttons 2 [Switch,Switch] lock false" "the staged sentence is not shown for the leftover flag"
+  expect_flow "reopened flag open true inert true target inert focus true blocked true offered false cursor false stops shutdown,env keys 40 swallowed 40 after open true inert true cursor false offered false confirm '' dialog false env true busy false esc open false inert false" "after the refused switch the panel reopened key-inert, with no mode stop (as while staged): the keys reach neither a switch nor the shutdown dialog; Esc closes it"
+  expect_flow "flag refused pending false record true" "nothing staged after the refusal; the leftover flag is remembered"
+  expect_flow "panel flag refused rows 3 buttons 0 [] lock false" "no Switch button while the flag is remembered; the staged sentence is not shown"
   expect_flow "lockline flag refused kind flag text true button true stop true offered true dialog flag open true :: The firmware still has a switch in progress. Shut down now to clear it?" "the leftover flag: its sentence once, Shut down now, a cursor stop, the shutdown dialog's own text"
+  expect_flow "flag reopened outcome true record true lock flag urgent false stops shutdown,env request false busy false" "closed and opened again by the user (the outcome cleared, the mode read again): still the flag's line, not urgent; no mode stop; a switch asked for directly is refused before anything runs"
+  expect_flow "panel flag reopened rows 3 buttons 0 [] lock false" "reopened: still no Switch button"
+  expect_flow "lockline flag reopened kind flag text true button true stop true offered true dialog flag open true :: The firmware still has a switch in progress. Shut down now to clear it?" "reopened: the flag's sentence, Shut down now and its own dialog text"
+  expect_flow "flag other boot record false lock ''" "a boot id that differs (another boot) drops it: no lock line"
+  expect_flow "panel flag other boot rows 3 buttons 2 [Switch,Switch] lock false" "another boot: the Switch buttons are back"
+  expect_flow "flag again request true" "a switch is asked for again with the flag still set"
+  expect_flow "flag again record true lock flag" "refused again: remembered with the new boot id"
+  expect_flow "flag staged record false pending true lock staged" "a read showing a target staged drops it; the staged line takes over"
+  expect_flow "flag cleared record false pending false" "after the shutdown (state cleared) nothing is remembered or pending"
+  expect_flow "panel flag cleared rows 3 buttons 2 [Switch,Switch] lock false" "and the Switch buttons are back"
   expect_flow "env intel" "Intel writes the plugin's exact text"
   expect_flow "env auto" "Auto removes it"
   expect_flow "queued busy true next auto" "Auto picked while RTX is written waits in the queue"
@@ -1124,13 +1315,30 @@ EOF
   expect_flow "finished owner holder kind error offer false warning false :: msi-mux-switch is already running" "it is refused before pkexec"
   expect_flow "before foreign ok true blocked false meta Current: Discrete" "after that refusal the mode is read again (Discrete)"
   expect_flow "foreign request true" "a switch is asked for after the binary turned foreign-owned"
+  expect_flow "fuse request true" "a switch is asked for after a FUSE mount another account owns appeared over the binary's folder"
+  expect_flow "fuse switch refused ok false blocked true kind mount setup false :: $bin is on a fuse.sshfs mount at $cfg, which another account may control." "the switch's own gate read (a fresh mount table) refuses it before pkexec and drops the earlier read; Set up backend is not offered for a mount"
+  expect_flow "refused fuse switch status [||] enabled 0 icon unknown true dimmed true badge false tooltip MSI GPU MUX: mode unknown lock '' env true record false meta GPU mode unknown" "after that refusal nothing of the earlier read shows: no row status, no enabled button, the unknown glyph, no badge, no mode in the tooltip, no lock line, the env line's neutral text, the header unknown"
+  expect_flow "fuse status runs true kind mount ok false meta GPU mode unknown" "the status read refuses the binary on the FUSE mount too: no debug read ran meanwhile"
+  expect_flow "fuse cleared ok true kind ok meta Current: Discrete" "the mount gone, the real-format table passes again and the mode is read"
+  expect_flow "flip request true" "a switch is asked for while the binary's stat changes between the gate's two stats"
+  expect_flow "flip switch refused ok false blocked true kind mount setup false :: $bin or a folder above it changed while it was being checked (stat gave two different answers). Nothing was run." "the switch's gate read refuses it before pkexec (the two stats differ) and drops the earlier read; Set up backend is not offered"
+  expect_flow "refused flip switch status [||] enabled 0 icon unknown true dimmed true badge false tooltip MSI GPU MUX: mode unknown lock '' env true record false meta GPU mode unknown" "after that refusal nothing of the earlier read shows"
+  expect_flow "flip status runs true kind mount ok false meta GPU mode unknown" "the status read refuses it too: no debug read ran meanwhile"
+  expect_flow "flip cleared ok true kind ok meta Current: Discrete" "the stat steady again, the gate passes and the mode is read"
+  if [[ -s $cfg/fake.log.flip-before ]] && cmp -s -- "$cfg/fake.log.flip-before" "$cfg/fake.log.flip-after"; then
+    echo "ok   the fake binary never ran while its stat changed between the gate's two stats"
+  else
+    echo "FAIL the fake binary's log changed while its stat flipped (or was not copied)"
+    ok=1
+  fi
   expect_flow "foreign refused ok false current '' blocked true meta GPU mode unknown" "the switch's own stat refuses the binary before pkexec and drops the earlier read: no mode, the read blocked, the header says the mode is unknown"
+  expect_flow "refused foreign status [||] enabled 0 icon unknown true dimmed true badge false tooltip MSI GPU MUX: mode unknown lock '' env true record false meta GPU mode unknown" "and nothing of the earlier read shows anywhere in the panel or the bar"
   # The flags are the ones the debug read got (the hardware's).
   local flags want_pk
   flags=$(sed -n '1s/^--debug --json//p' "$cfg/fake.log" 2>/dev/null)
   want_pk=$(printf '%s\n' "--disable-internal-agent $bin mshybrid --json$flags" "--disable-internal-agent $bin integrated --json$flags" \
     "--disable-internal-agent $bin integrated --json$flags" "--disable-internal-agent $bin mshybrid --json$flags" \
-    "--disable-internal-agent $bin integrated --json$flags")
+    "--disable-internal-agent $bin integrated --json$flags" "--disable-internal-agent $bin integrated --json$flags")
   if [[ -e $cfg/shutdown.log ]]; then
     echo "FAIL the shutdown command was run: $(tr '\n' '|' <"$cfg/shutdown.log")"
     ok=1
@@ -1138,7 +1346,7 @@ EOF
     echo "ok   the shutdown command never ran"
   fi
   if [[ $(cat "$cfg/pkexec.log" 2>/dev/null) == "$want_pk" ]]; then
-    echo "ok   pkexec ran five times (the refused re-stage, the flood run and the leftover-flag refusal included), with exactly the argv arrays expected"
+    echo "ok   pkexec ran six times (the refused re-stage, the flood run and both leftover-flag refusals included; never on the FUSE mount or a flipping stat), with exactly the argv arrays expected"
   else
     echo "FAIL pkexec log: $(tr '\n' '|' <"$cfg/pkexec.log" 2>/dev/null)"
     ok=1
