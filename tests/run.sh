@@ -183,6 +183,28 @@ scratch_qs() {
   trap - INT TERM
 }
 
+# The live tests do not depend on this machine's /etc/fuse.conf: each puts a
+# fake `head` first on PATH that serves the gate's read of it
+# (fuse_conf_head) from tests/fixtures/fuse-conf-off, or fuse-conf-on once
+# the given toggle file exists. The gate only runs head when the name exists
+# (a file or a link of any kind); with no /etc/fuse.conf at all it takes it
+# as off without one, so the flows still pass and only a step that turns
+# user_allow_other on cannot be driven (host_fuse_conf_missing).
+host_fuse_conf_missing() {
+  [[ ! -e /etc/fuse.conf && ! -L /etc/fuse.conf ]]
+}
+
+# The fuse.conf lines of a fake head script: <toggle> picks the fixture.
+fuse_conf_head() {
+  local toggle=$1
+  cat <<EOF
+if [[ \$# == 4 && \$1 == -c && \$3 == -- && \$4 == /etc/fuse.conf ]]; then
+  if [[ -e "$toggle" ]]; then exec cat -- "$PLUGIN_DIR/tests/fixtures/fuse-conf-on"; fi
+  exec cat -- "$PLUGIN_DIR/tests/fixtures/fuse-conf-off"
+fi
+EOF
+}
+
 qml_load() {
   local dir=${1:-$PLUGIN_DIR}
   if ! have_qs_load; then
@@ -281,7 +303,8 @@ qml_load_selftest() {
 # the ownership gate (it is not root-owned) and is therefore never run, not
 # even for the read-only debug read (the fake logs every run), that the
 # panel shows the gate's reason, offers Set up backend and says the mode is
-# unknown, and that no binding throws or the engine warns.
+# unknown, and that no binding throws or the engine warns. A fake `head`
+# serves fuse.conf as off (fuse_conf_head).
 widget_live() {
   local dir=${1:-$PLUGIN_DIR}
   if ! have_qs_load; then
@@ -292,13 +315,22 @@ widget_live() {
     echo "skipped: plugin path contains a quote or backslash"
     return $SKIP
   fi
-  local cfg home bin ok=0 line
+  local cfg home bin fake ok=0 line real_head
+  real_head=$(command -v head) || return 1
   cfg=$(mktemp -d) || return 1
-  home=$cfg/home
-  mkdir -p "$home" "$cfg/bin"
+  home=$cfg/home fake=$cfg/fakebin
+  mkdir -p "$home" "$cfg/bin" "$fake"
   bin=$cfg/bin/msi-mux-switch
   cp "$PLUGIN_DIR/tests/fixtures/fake-msi-mux-switch" "$bin"
   chmod 755 "$bin"
+  # fuse.conf as the off fixture, whatever this machine's says.
+  { printf '#!/bin/bash\n'; fuse_conf_head "$cfg/fuseconf.on"; printf 'exec "%s" "$@"\n' "$real_head"; } >"$fake/head"
+  chmod 755 "$fake/head"
+  if [[ $(PATH="$fake:$PATH" command -v head) != "$fake/head" ]]; then
+    echo "FAIL head does not resolve to the fake; not running"
+    rm -rf "$cfg"
+    return 1
+  fi
   ln -s "$SHELL_DIR/Commons" "$cfg/Commons"
   ln -s "$SHELL_DIR/Ui" "$cfg/Ui"
   cat >"$cfg/shell.qml" <<EOF
@@ -361,7 +393,7 @@ ShellRoot {
   Timer { interval: 8000; running: true; onTriggered: shell.report() }
 }
 EOF
-  scratch_qs "$cfg" MMLIVE "HOME=$home" "MM_FAKE_LOG=$cfg/fake.log" \
+  scratch_qs "$cfg" MMLIVE "HOME=$home" "PATH=$fake:$PATH" "MM_FAKE_LOG=$cfg/fake.log" \
     "MM_FAKE_CAPTURE=$PLUGIN_DIR/tests/fixtures/debug-discrete.json"
   if ! grep -q 'MMLIVE instance true shared true' "$cfg/log"; then
     echo "FAIL the script's MuxState is not the widget's singleton instance:"
@@ -431,8 +463,8 @@ EOF
 # temporary HOME and PATH starting with fakes: `stat` (reports every path
 # root-owned, mode 755, so the ownership gate passes), `pkexec` (checks
 # --disable-internal-agent, logs its argv and runs the rest), `head` (the
-# real one, but serving a FUSE mount table or another boot's id when asked
-# to) and the fake msi-mux-switch with switching enabled. The real mount
+# real one, but serving fuse.conf as off (fuse_conf_head), a FUSE mount table
+# or another boot's id when asked to) and the fake msi-mux-switch with switching enabled. The real mount
 # table must pass the gate for the scratch folder. No real pkexec can be reached: with
 # the real stat the temporary binary fails the gate before any pkexec runs.
 # The singleton is driven directly, and the panel's window never maps (its
@@ -471,7 +503,11 @@ EOF
 # its folder, is refused by its own gate read before pkexec, and the
 # earlier read is dropped (no mode, no row status, no badge, no mode in the
 # tooltip, no lock line, the header "GPU mode unknown"); the status read
-# refuses the FUSE mount too, without running the binary.
+# refuses the FUSE mount too, without running the binary. The same once
+# /etc/fuse.conf, as the fake head serves it, turns user_allow_other on (the
+# tests/fixtures/fuse-conf-on text): refused before pkexec with the reason,
+# no Switch button, no Set up backend, and the status read refuses it too
+# (skipped with a note on a machine with no /etc/fuse.conf).
 # Skipped on hardware that is not available or on battery (the real AC is
 # read).
 switch_flow_live() {
@@ -528,11 +564,17 @@ EOF
 #!/bin/bash
 printf '%s\n' "\$*" >>"$cfg/shutdown.log"
 EOF
-  # head as the gate and the boot id reads call it: the real one, except the
-  # mount table once $cfg/mounts.fuse exists (the FUSE fixture) and the boot
-  # id once $cfg/boot.other exists (another boot's).
+  # head as the gate and the boot id reads call it: the real one, except
+  # fuse.conf (the off fixture, or the on one once $cfg/fuseconf.on exists:
+  # fuse_conf_head), the mount table once $cfg/mounts.fuse exists (the FUSE
+  # fixture) and the boot id once $cfg/boot.other exists (another boot's).
+  # With no /etc/fuse.conf at all the gate takes it as off without running
+  # head, and the user_allow_other steps are skipped (confSteps).
+  local conf_steps=true
+  host_fuse_conf_missing && conf_steps=false
   cat >"$fake/head" <<EOF
 #!/bin/bash
+$(fuse_conf_head "$cfg/fuseconf.on")
 if [[ \$# == 4 && \$1 == -c && \$3 == -- && \$4 == /proc/self/mountinfo && -e "$cfg/mounts.fuse" ]]; then
   exec cat -- "$cfg/mountinfo-fuse"
 fi
@@ -566,6 +608,9 @@ ShellRoot {
   property int step: 0
   property var outcome: null
   property int ticks: 0
+  // false: this machine has no /etc/fuse.conf, so the fake head is never
+  // asked for it and user_allow_other cannot be turned on.
+  property bool confSteps: $conf_steps
   function log(s) { console.log("MMFLOW " + s) }
   function done() { shell.log("DONE"); shell.step = 99; Qt.callLater(Qt.quit) }
   Component.onCompleted: {
@@ -919,9 +964,46 @@ ShellRoot {
       } else if (shell.step === 25) {
         if (!s.debug.ok) return
         shell.log("fuse cleared ok " + s.debug.ok + " kind " + s.ownership.kind + " meta " + Model.summary(s.debug, s.debugBlocked))
+        if (!shell.confSteps) {
+          flipSet.running = true
+          shell.step = 60
+          return
+        }
+        // fuse.conf turns user_allow_other on before the next switch's own
+        // gate read.
+        confSet.running = true
+        shell.step = 26
+      } else if (shell.step === 26) {
+        if (confSet.running) return
+        shell.outcome = null
+        shell.runs = s.debugRuns
+        shell.log("fuseconf request " + s.requestSwitch(holder, "integrated"))
+        shell.step = 27
+      } else if (shell.step === 27) {
+        if (!shell.outcome || s.busy) return
+        shell.log("fuseconf switch refused ok " + s.debug.ok + " blocked " + s.debugBlocked + " kind " + s.ownership.kind
+          + " setup " + s.canSetUp + " :: " + shell.outcome.message)
+        shell.logRefused("fuseconf switch")
+        shell.ticks = 0
+        s.checkBinary()
+        shell.step = 28
+      } else if (shell.step === 28) {
+        if (++shell.ticks < 10) return
+        shell.log("fuseconf status runs " + (s.debugRuns === shell.runs) + " kind " + s.ownership.kind + " ok " + s.debug.ok
+          + " setup " + s.canSetUp + " meta " + Model.summary(s.debug, s.debugBlocked) + " :: " + s.unavailableReason)
+        confClear.running = true
+        shell.step = 29
+      } else if (shell.step === 29) {
+        if (confClear.running) return
+        s.checkBinary()
+        shell.step = 30
+      } else if (shell.step === 30) {
+        if (!s.debug.ok) return
+        shell.log("fuseconf cleared ok " + s.debug.ok + " kind " + s.ownership.kind + " meta " + Model.summary(s.debug, s.debugBlocked))
         // The binary's stat changes between the gate's two stats (a FUSE
         // daemon's forged root answer, then the real file after a lazy
-        // unmount): refused, and the fake binary is never run.
+        // unmount): refused, and the fake binary is never run (step 25
+        // comes here directly without the user_allow_other steps).
         flipSet.running = true
         shell.step = 60
       } else if (shell.step === 60) {
@@ -980,6 +1062,8 @@ ShellRoot {
   Process { id: stageSet; command: ["bash", "-c", "printf ms-hybrid >\"\$1\"", "stage", "$cfg/state"] }
   Process { id: fuseSet; command: ["touch", "--", "$cfg/mounts.fuse"] }
   Process { id: fuseClear; command: ["rm", "-f", "--", "$cfg/mounts.fuse"] }
+  Process { id: confSet; command: ["touch", "--", "$cfg/fuseconf.on"] }
+  Process { id: confClear; command: ["rm", "-f", "--", "$cfg/fuseconf.on"] }
   // The fake binary's log is copied when the stat starts to flip and when it
   // stops: the two copies must be the same (it never ran meanwhile).
   Process { id: flipSet; command: ["bash", "-c", "cp -- \"\$1\" \"\$1.flip-before\" && touch -- \"\$2\"", "flip", "$cfg/fake.log", "$cfg/stat.flip"] }
@@ -1320,6 +1404,15 @@ EOF
   expect_flow "refused fuse switch status [||] enabled 0 icon unknown true dimmed true badge false tooltip MSI GPU MUX: mode unknown lock '' env true record false meta GPU mode unknown" "after that refusal nothing of the earlier read shows: no row status, no enabled button, the unknown glyph, no badge, no mode in the tooltip, no lock line, the env line's neutral text, the header unknown"
   expect_flow "fuse status runs true kind mount ok false meta GPU mode unknown" "the status read refuses the binary on the FUSE mount too: no debug read ran meanwhile"
   expect_flow "fuse cleared ok true kind ok meta Current: Discrete" "the mount gone, the real-format table passes again and the mode is read"
+  if $conf_steps; then
+    expect_flow "fuseconf request true" "a switch is asked for after /etc/fuse.conf turned user_allow_other on"
+    expect_flow "fuseconf switch refused ok false blocked true kind mount setup false :: user_allow_other is turned on in /etc/fuse.conf. It lets other accounts fake root-owned folders, so the plugin cannot trust that msi-mux-switch is root's. Turn it off (comment out that line) to use the plugin. Nothing was run." "the switch's own gate read refuses it before pkexec with the reason and drops the earlier read; Set up backend is not offered"
+    expect_flow "refused fuseconf switch status [||] enabled 0 icon unknown true dimmed true badge false tooltip MSI GPU MUX: mode unknown lock '' env true record false meta GPU mode unknown" "after that refusal no Switch button is enabled and nothing of the earlier read shows"
+    expect_flow "fuseconf status runs true kind mount ok false setup false meta GPU mode unknown :: user_allow_other is turned on in /etc/fuse.conf." "the status read refuses it too, shows the reason, offers no Set up backend, and runs no debug read"
+    expect_flow "fuseconf cleared ok true kind ok meta Current: Discrete" "user_allow_other off again, the gate passes and the mode is read"
+  else
+    echo "skipped: the user_allow_other steps (this machine has no /etc/fuse.conf, so the gate never reads it through the fake head)"
+  fi
   expect_flow "flip request true" "a switch is asked for while the binary's stat changes between the gate's two stats"
   expect_flow "flip switch refused ok false blocked true kind mount setup false :: $bin or a folder above it changed while it was being checked (stat gave two different answers). Nothing was run." "the switch's gate read refuses it before pkexec (the two stats differ) and drops the earlier read; Set up backend is not offered"
   expect_flow "refused flip switch status [||] enabled 0 icon unknown true dimmed true badge false tooltip MSI GPU MUX: mode unknown lock '' env true record false meta GPU mode unknown" "after that refusal nothing of the earlier read shows"
@@ -1369,7 +1462,8 @@ EOF
 # The debug read's bounds and the switch checks' watchdog for real, in a
 # scratch Quickshell with a temporary HOME and PATH starting with fakes:
 # `stat` (root-owned, so the gate passes), `pkexec` and `omarchy-system`
-# (logging; neither may run) and `pgrep` (logs, then hangs). The binary runs
+# (logging; neither may run), `pgrep` (logs, then hangs) and `head` (serves
+# fuse.conf as off: fuse_conf_head). The binary runs
 # one of the fixtures, picked by a file: the plain fake (ready), the flooding
 # fake (the read ends at the cap within moments and reads as an error), the
 # plain fake again, then the hanging fake with a switch asked for while its
@@ -1390,10 +1484,11 @@ debug_bounds_live() {
     echo "skipped: plugin path contains a quote or backslash"
     return $SKIP
   fi
-  local cfg home bin fake ok=0 real_stat f log watchdog_text ending_text
+  local cfg home bin fake ok=0 real_stat real_head f log watchdog_text ending_text
   # The flow lasts about CHECK_TIMEOUT_MS after startup.
   local LOAD_TIMEOUT_S=45
   real_stat=$(command -v stat) || return 1
+  real_head=$(command -v head) || return 1
   watchdog_text=$(node -e 'process.stdout.write(require("fs").readFileSync(process.argv[1], "utf8").match(/var CHECK_TIMEOUT_TEXT = "([^"]*)"/)[1])' \
     "$PLUGIN_DIR/Model.js") || return 1
   ending_text=$(node -e 'process.stdout.write(require("fs").readFileSync(process.argv[1], "utf8").match(/var CHECKS_ENDING_TEXT = "([^"]*)"/)[1])' \
@@ -1437,10 +1532,13 @@ sleep 60 &
 c=\$!
 wait "\$c"
 END_PGREP
-  chmod 755 "$bin" "$fake/stat" "$fake/pkexec" "$fake/omarchy-system" "$fake/pgrep"
+  # fuse.conf as the off fixture, whatever this machine's says.
+  { printf '#!/bin/bash\n'; fuse_conf_head "$cfg/fuseconf.on"; printf 'exec "%s" "$@"\n' "$real_head"; } >"$fake/head"
+  chmod 755 "$bin" "$fake/stat" "$fake/pkexec" "$fake/omarchy-system" "$fake/pgrep" "$fake/head"
   if [[ $(PATH="$fake:$PATH" command -v pkexec) != "$fake/pkexec" ||
     $(PATH="$fake:$PATH" command -v omarchy-system) != "$fake/omarchy-system" ||
-    $(PATH="$fake:$PATH" command -v pgrep) != "$fake/pgrep" ]]; then
+    $(PATH="$fake:$PATH" command -v pgrep) != "$fake/pgrep" ||
+    $(PATH="$fake:$PATH" command -v head) != "$fake/head" ]]; then
     echo "FAIL a fake does not resolve first on PATH; not running"
     rm -rf "$cfg"
     return 1

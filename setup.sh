@@ -31,6 +31,10 @@
 # not replaced, and the script exits with an error.
 #
 # It changes nothing else. It refuses (and changes nothing) when:
+#   - /etc/fuse.conf turns on user_allow_other (another account could then
+#     FUSE-mount over a folder it owns and report every file there as
+#     root's), or exists but cannot be read, is larger than 64 KiB or holds a
+#     NUL byte, so that cannot be checked;
 #   - the path is relative, a symbolic link, or not a regular file;
 #   - the binary is not owned by you or root, or is writable by group or
 #     others;
@@ -68,6 +72,9 @@ README_HINT="See the plugin's README (Backend setup) for building and installing
 # descriptor opened earlier survives it.
 REBUILD_HINT="Rebuild or re-download msi-mux-switch into a folder only you can write, under folders owned by root and not writable by group or others (e.g. $DEFAULT_BINARY; a fresh build from the upstream source, see the README), then run setup again on that fresh file."
 SUDO=sudo
+# Read once, before the mount check; there is no way to point it elsewhere.
+FUSE_CONF=/etc/fuse.conf
+FUSE_CONF_MAX_BYTES=65536
 
 say() { printf '%s\n' "$*"; }
 
@@ -170,22 +177,17 @@ mi_decode() {
   MI_DECODED=$out$s
 }
 
-# mount_problem <path>: why the path sits on a mount another account may
-# control, or nothing. With user_allow_other in /etc/fuse.conf, an account can
+# mount_problem <path> <mountinfo text>: why the path sits on a mount
+# another account may control, or nothing. With user_allow_other in /etc/fuse.conf, an account can
 # FUSE-mount over a folder it owns and report every file there as root's, so
 # the owner and mode checks cannot see it. Every mount at the path or at a
 # directory above it counts, not only the last one stacked there: a FUSE
 # mount (fuse, fuseblk, fuse.*) or one made for a user (user_id= other than
-# 0) refuses it. Status 1 for such a mount, 2 when mountinfo cannot be read
-# or parsed, or has no entry for / (it then cannot be checked: refuse too).
+# 0) refuses it. Status 1 for such a mount, 2 when the text cannot be
+# parsed or has no entry for / (it then cannot be checked: refuse too).
 mount_problem() {
-  local path=$1 text line rest mp fstype opts o sep i covered=0 parsed=0
+  local path=$1 text=$2 line rest mp fstype opts o sep i covered=0 parsed=0
   local -a f
-  # Through cat so the tests can serve a fixture (as they fake stat).
-  if ! text=$(cat -- /proc/self/mountinfo 2>/dev/null); then
-    say "$path could not be checked: /proc/self/mountinfo could not be read."
-    return 2
-  fi
   while IFS= read -r line; do
     # Split on single spaces: an empty source leaves an empty field.
     f=()
@@ -236,27 +238,91 @@ mount_problem() {
   fi
 }
 
-# checked_mounts: the mount check (mount_problem) between two stats of the
-# binary and every directory above it, which must be the same. A FUSE daemon
-# can answer the first stat with a forged root owner and then lazily unmount
+# checked_mounts: two stats of the binary and every directory above it,
+# which must be the same, with only the read of /proc/self/mountinfo between
+# them; the text is parsed and judged (mount_problem) after the second stat,
+# so the window between the stats is as short as it can be. A FUSE daemon can
+# answer the first stat with a forged root owner and then lazily unmount
 # (fusermount3 -u -z) before mountinfo is read: the second stat then sees
 # what is really there. The checks after it read these stat lines.
 # Sets MOUNT_MSG to why it fails; status 1 for a FUSE or user mount, 2 when
-# mountinfo cannot be checked, 3 when the two stats differ.
+# mountinfo cannot be read or checked, 3 when the two stats differ (that wins
+# over the rest).
 MOUNT_MSG=""
 checked_mounts() {
-  local before status
+  local before text read_ok=1 status
   take_snapshot
   before=$SNAP
-  MOUNT_MSG=$(mount_problem "$bin")
-  status=$?
+  # Through cat so the tests can serve a fixture (as they fake stat).
+  text=$(cat -- /proc/self/mountinfo 2>/dev/null) || read_ok=0
   take_snapshot
   if [[ $SNAP != "$before" ]]; then
     MOUNT_MSG="$bin, or a directory above it, changed while it was being checked."
     return 3
   fi
+  if ((!read_ok)); then
+    MOUNT_MSG="$bin could not be checked: /proc/self/mountinfo could not be read."
+    return 2
+  fi
+  MOUNT_MSG=$(mount_problem "$bin" "$text")
+  status=$?
   if ((status == 0)) && [[ -n $MOUNT_MSG ]]; then status=2; fi
   return "$status"
+}
+
+# fuse_conf_problem: why /etc/fuse.conf rules setup out, or nothing. With
+# user_allow_other on, another account can FUSE-mount over a folder it owns
+# and report every file there as root's, which no stat can tell apart, so
+# setup refuses. Each line counts from its first "#" cut off; its first word
+# (after spaces, tabs, \r, \v or \f) being exactly user_allow_other turns it
+# on (stricter than fuse, which wants the word alone on its line). A missing
+# file is off; a symbolic link there is not missing, even one whose target
+# cannot be reached (dangling, a loop, an unsearchable folder): fusermount
+# may still read it, so it counts as unread. Status 1 when it is on, 2 when it exists but cannot be read,
+# is larger than FUSE_CONF_MAX_BYTES or holds a NUL byte (it then cannot be
+# checked: refuse too). Only root can write it, so it is read once.
+fuse_conf_problem() {
+  local conf=$FUSE_CONF dir=${FUSE_CONF%/*} out text line word ws=$' \t\r\v\f'
+  # Bytes, not characters, for the size and the parse.
+  local LC_ALL=C
+  # Through head so the tests can serve a fixture. One read: `read -d ''`
+  # stops at a NUL byte (which bash cannot hold) and succeeds only then; the
+  # rest is then drained, so head does not die of SIGPIPE and a NUL is
+  # reported as one, not as a file that could not be read.
+  if ! out=$(
+    set -o pipefail
+    head -c "$((FUSE_CONF_MAX_BYTES + 1))" -- "$conf" 2>/dev/null |
+      {
+        if IFS= read -r -d '' text; then
+          printf N
+          while IFS= read -r -d '' _; do :; done
+        else
+          printf 'T%s.' "$text"
+        fi
+      }
+  ); then
+    # Missing only when nothing is there, not even a link (whose target
+    # fusermount may reach): lstat fails in a folder this account can
+    # search. The probe goes through stat so the tests can serve it too.
+    if [[ -d $dir && -x $dir ]] && ! stat -c %i -- "$conf" >/dev/null 2>&1; then return 0; fi
+    say "$conf exists but could not be read, so setup cannot check that user_allow_other is off (it lets other accounts fake root-owned folders)."
+    return 2
+  fi
+  text=${out#T}
+  text=${text%.}
+  if [[ $out == N ]] || ((${#text} > FUSE_CONF_MAX_BYTES)); then
+    say "$conf could not be checked for user_allow_other (it is too large or not plain text)."
+    return 2
+  fi
+  while IFS= read -r line; do
+    line=${line%%#*}
+    line=${line#"${line%%[!"$ws"]*}"}
+    word=${line%%["$ws"]*}
+    if [[ $word == user_allow_other ]]; then
+      say "user_allow_other is turned on in $conf. It lets other accounts fake root-owned folders, so setup cannot trust that msi-mux-switch is root's. Turn it off (comment out that line) and run setup again."
+      return 1
+    fi
+  done <<<"$text"
 }
 
 # Every directory above <path>, nearest first, ending with /.
@@ -298,6 +364,15 @@ done
 dir=${bin%/*}
 [[ -z $dir ]] && dir=/
 mapfile -t dirs < <(ancestors "$bin")
+
+# Other accounts may fake root-owned folders when fuse lets them.
+fuse_msg=$(fuse_conf_problem)
+fuse_status=$?
+if ((fuse_status != 0)) || [[ -n $fuse_msg ]]; then
+  say "Refusing to set up $bin:"
+  indent "$fuse_msg"
+  refuse
+fi
 
 # The same for a FUSE or user mount anywhere at or above it.
 checked_mounts

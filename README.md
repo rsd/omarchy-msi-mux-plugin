@@ -79,6 +79,12 @@ Notes:
   [github.com/steelbrain/msi-gpu-mux-switch](https://github.com/steelbrain/msi-gpu-mux-switch)
   (MIT, by its own author; the plugin was written against commit `223ca06`).
   The plugin only calls it; it never builds, bundles, downloads or updates it.
+- **`user_allow_other` must be off** in `/etc/fuse.conf`, meaning commented out
+  or absent (a missing file counts as off). It is off by default on Arch and
+  Omarchy. With it on, another account can mount a FUSE filesystem over a
+  folder it owns and report its files as owned by root. The plugin and
+  `setup.sh` both refuse while it is on (see
+  [Make it root-owned](#2-make-it-root-owned)).
 
 ## Install, update, remove
 
@@ -144,18 +150,27 @@ can change the binary. The plugin refuses to switch unless:
   something that then runs as root);
 - it is not under `/media`, `/mnt`, `/run/media` or `/run/user`, where a user
   can mount a disk or owns the files;
+- `user_allow_other` is not turned on in `/etc/fuse.conf`. With it on, an
+  account can mount a FUSE filesystem with `allow_other` over a folder it owns
+  and report every file there as owned by root, which `stat` cannot tell apart
+  from the real thing. A line counts as turning it on when its first word is
+  `user_allow_other` (leading whitespace allowed, everything from a `#` on
+  ignored). Comments and blank lines do not count, and a missing file counts as
+  off. If the file exists but cannot be read (a symlink whose target cannot be
+  reached included), is larger than 64 KiB or holds a NUL byte, the check
+  refuses too, because it cannot tell. To fix it, comment out the
+  `user_allow_other` line in `/etc/fuse.conf` as root, then reopen the panel;
 - no mount at the binary's path or at any folder above it is a FUSE
   filesystem (`fuse`, `fuseblk`, `fuse.*`) or carries `user_id=` other than 0,
-  as `/proc/self/mountinfo` lists it. An account that may use FUSE with
-  `allow_other` (`user_allow_other` in `/etc/fuse.conf`) could mount a
-  filesystem over a folder it owns and report every file there as owned by
-  root, which `stat` cannot tell apart from the real thing. If mountinfo
-  cannot be read, is larger than 1 MiB or does not parse, the check refuses.
+  as `/proc/self/mountinfo` lists it. A FUSE or user mount can report every
+  file under it as owned by root. If mountinfo cannot be read, is larger than
+  1 MiB or does not parse, the check refuses.
 
-The check is one process: it runs `stat`, reads mountinfo, then runs `stat`
-again, and refuses if the two answers differ (a FUSE daemon could unmount
-itself lazily while answering the first `stat`). Every value reaches that
-process as a positional argument, never as part of the script text.
+The check is one process: it reads `/etc/fuse.conf`, runs `stat`, reads
+mountinfo, then runs `stat` again, and refuses if the two answers differ (a
+FUSE daemon could unmount itself lazily while answering the first `stat`).
+Every value reaches that process as a positional argument, never as part of
+the script text.
 
 The same check gates the plugin's automatic read-only `msi-mux-switch --debug
 --json` read, which runs as you: a binary that fails it is never run, not even
@@ -171,8 +186,10 @@ as a failed mount check.
 When the check fails, the panel shows the reason (for example
 "/opt/msi-mux-switch/msi-mux-switch is owned by alice, not root.") and, for
 an ownership or mode problem, a **Set up backend** button. A mount refusal
-(under a user-mount prefix, on a FUSE or user mount, or a mount table that
-could not be checked) gets no such button: moving the binary is the only fix.
+(under a user-mount prefix, on a FUSE or user mount, a mount table that could
+not be checked, or `user_allow_other` turned on or `/etc/fuse.conf` unchecked)
+gets no such button: moving the binary, or for `user_allow_other` turning it
+off, is the only fix.
 **Set up backend** opens a terminal running the plugin's `setup.sh`,
 which checks the binary, shows these commands (only for the binary and its own
 folder), asks, runs them, and checks again. Use it only for a binary you built
@@ -201,6 +218,10 @@ exits with an error. Every command is printed before it runs.
 
 `setup.sh` refuses, and changes nothing, when:
 
+- `/etc/fuse.conf` turns on `user_allow_other` (same rule and same parse as the
+  plugin), or exists but cannot be read, is larger than 64 KiB or holds a NUL
+  byte. The advice is to turn it off (comment out that line) and run setup
+  again. This is checked first, before the mount check;
 - the source binary is not a regular file, is a symbolic link, is not owned by
   you or root, or is writable by group or others;
 - the binary's folder is your home, `/`, or directly under `/` or `/home`, or
@@ -208,7 +229,8 @@ exits with an error. Every command is printed before it runs.
 - the binary or a folder above it is on a FUSE mount (`fuse`, `fuseblk`,
   `fuse.*`) or a mount with `user_id=` other than 0, or `/proc/self/mountinfo`
   cannot be read or parsed. It runs the same stat, mountinfo, stat check as
-  the plugin, and refuses if the two stats differ;
+  the plugin (the two stats with only the mountinfo read between them, parsed
+  after the second stat), and refuses if the two stats differ;
 - the folder is owned by someone other than you or root, has the sticky bit,
   is writable by group or others, or holds anything besides the binary
   (dotfiles included);
@@ -217,8 +239,8 @@ exits with an error. Every command is printed before it runs.
 Where another account could already have changed the binary, `setup.sh` does
 not fix anything in place. That means the binary or any folder above it is
 writable by group or others or owned by another account, it is on a FUSE or
-user mount, or the binary changed while or after it was checked (the stats
-differ, the open file is not the path's file, or the checksums differ). It
+user mount, `user_allow_other` is on, or the binary changed while or after it
+was checked (the stats differ, the open file is not the path's file, or the checksums differ). It
 says to rebuild or re-download msi-mux-switch into a folder only you can write,
 under folders owned by root and not writable by group or others, then run
 setup again on that fresh file.
@@ -372,6 +394,8 @@ Ctrl+Alt+F2, log in on the text console and run the same `rm`.
 | What the panel shows | Meaning and fix |
 |---|---|
 | Greyed, "...is owned by ..., not root", "...writable by group or others", "...is a symbolic link" | The root-ownership check failed. Use **Set up backend**; it tells you to rebuild into a folder only you can write when another account could already have changed the file. |
+| "GPU mode unknown" with "user_allow_other is turned on in /etc/fuse.conf. It lets other accounts fake root-owned folders, so the plugin cannot trust that msi-mux-switch is root's. Turn it off (comment out that line) to use the plugin." | `user_allow_other` is on in `/etc/fuse.conf`. Comment out that line as root, then reopen the panel. No **Set up backend** button. Running `setup.sh` refuses for the same reason until it is off. |
+| "/etc/fuse.conf exists but could not be read, so the plugin cannot check that user_allow_other is off..." or "/etc/fuse.conf could not be checked for user_allow_other (it is too large or not plain text)." (or "...could not be checked for user_allow_other, which lets other accounts fake root-owned folders.") | The plugin could not read `/etc/fuse.conf` whole (unreadable, over 64 KiB, or a NUL byte in it, or the check did not finish), so it refuses. Make the file readable plain text under 64 KiB, make sure `user_allow_other` is off, then reopen the panel. If the file is a symlink, its target must be reachable. No **Set up backend** button. |
 | "GPU mode unknown" with "...is on a fuse mount at ..., which another account may control." or "...is on a mount at ... owned by user_id ..." | A FUSE or user mount sits on the binary's path or a folder above it. Move the binary to a folder like `/opt/msi-mux-switch`. No **Set up backend** button. |
 | "...could not be checked: /proc/self/mountinfo could not be read." (or "...could not be parsed.", "...has no entry for /.") | The mount table could not be read whole (it is limited to 1 MiB), so the plugin refuses. Try again; if it persists, the table is unusual. No **Set up backend** button. |
 | "... or a folder above it changed while it was being checked (stat gave two different answers)." | The binary or a folder above it changed between the two stats. Rebuild into a folder only you can write, then try again. |
@@ -410,7 +434,8 @@ What the plugin runs and writes, and when:
   switch dialog. Right before it, the binary and every folder above it are
   checked again, by the gate read below: root-owned, not writable by group or
   others, not a symlink, not under a user-mount prefix, on no FUSE or user
-  mount (see [Make it root-owned](#2-make-it-root-owned)).
+  mount, with `user_allow_other` off in `/etc/fuse.conf` (see
+  [Make it root-owned](#2-make-it-root-owned)).
 - **With sudo**, only `setup.sh`, opened in a visible terminal when you click
   **Set up backend**. It prints every command before it runs and asks before
   running the first. It refuses a source binary that is not a regular file, is
@@ -423,8 +448,8 @@ What the plugin runs and writes, and when:
   owner, mode and inode. After `sudo install` makes the root-owned staged copy
   it hashes that copy and runs the `mv` only on a match; otherwise it prints
   and runs `sudo rm -f -- <staged>` and replaces nothing. It also runs the
-  mount check (see below) before the first change, after the folder is made
-  root-owned and at the end. At the end the binary and every folder above it
+  fuse.conf check and mount check (see below) before the first change, after
+  the folder is made root-owned and at the end. At the end the binary and every folder above it
   must be owned by root, writable by no one but root and on no FUSE or user
   mount. Wherever another account could already have changed the binary
   (writable or foreign-owned binary or folder above it, a FUSE or user mount,
@@ -433,22 +458,36 @@ What the plugin runs and writes, and when:
   again. It never says to `chmod` and retry: the file may already hold another
   account's content, and a write descriptor opened earlier survives a `chmod`.
 - **The gate read** (the status read and the switch use the same one): one
-  `bash -c` process that runs `stat` on the binary and every folder above it,
-  reads `/proc/self/mountinfo` (at most 1 MiB), and runs the same `stat`
-  again. It refuses when any mount at the binary's path or a folder above it
-  (every such mount, not only the topmost) is `fuse`, `fuseblk` or `fuse.*`
-  or carries `user_id=` other than 0, when mountinfo is unreadable, over
-  1 MiB, malformed or has no entry for `/`, or when the two `stat` answers
-  differ. The paths and format are positional arguments; nothing but the size
-  cap is part of the script text. Each gate decision uses a fresh read; the
-  switch never reuses the status read's. The panel offers no **Set up
-  backend** for a mount refusal.
+  `bash -c` process that reads `/etc/fuse.conf` (at most 64 KiB), runs `stat`
+  on the binary and every folder above it, reads `/proc/self/mountinfo` (at
+  most 1 MiB), and runs the same `stat` again. `/etc/fuse.conf` is read first,
+  before the first `stat`, so the stat, mountinfo, stat window stays as narrow
+  as it was. It is argv-only and size-capped, and it is sent back hex-encoded,
+  so its text can never pass for a marker line or a `stat` line. The gate
+  refuses when `user_allow_other` is on in it (kind "mount", the same verdict
+  for the status read and the switch), when it exists but cannot be read
+  (including a symlink whose target cannot be reached), is over 64 KiB or
+  holds a NUL byte; a missing file counts as off. It also refuses when any
+  mount at the binary's path or a folder above it (every such mount, not only
+  the topmost) is `fuse`, `fuseblk` or `fuse.*` or carries `user_id=` other
+  than 0, when mountinfo is unreadable, over 1 MiB, malformed or has no entry
+  for `/`, or when the two `stat` answers differ. The paths and format are
+  positional arguments; nothing but the size caps is part of the script text.
+  Each gate decision uses a fresh read; the switch never reuses the status
+  read's. The panel offers no **Set up backend** for a mount refusal or for
+  `user_allow_other`.
 - **Residual risk**: a check that runs before `pkexec` cannot be atomic with
-  the exec. An account that can mount FUSE with `allow_other`
-  (`user_allow_other` in `/etc/fuse.conf`) could still try to win a timing
-  race by remounting within the ~1 ms between the mountinfo read and the second
-  `stat`. Without `user_allow_other`, another account's FUSE mount is not
-  traversable by this user or root, the `stat` fails and the gate refuses.
+  the exec. The timing race this left open (an account with `user_allow_other`
+  remounting within the ~1 ms between the mountinfo read and the second
+  `stat`) is closed by refusing `user_allow_other` outright. With it off, an
+  account other than root cannot make its FUSE mount traversable by this user
+  or root, so such a mount makes `stat` fail and the gate refuses. What is left:
+  only root can turn `user_allow_other` on or change `/etc/fuse.conf` (and root
+  is already trusted), and the file is read once per gate read, before the
+  `stat`s, so a change by root in that moment is not seen until the next read.
+  The path checked is the standard `/etc/fuse.conf`. A `fusermount` built with
+  another prefix (for example `/usr/local/etc/fuse.conf`) reads its own file,
+  which is not checked.
 - **Shutdown**: `omarchy-system shutdown` runs only from **Shut down now** in
   the shutdown confirmation dialog.
 - **Files**: it writes only `~/.config/uwsm/env.d/90-msi-mux-gpu` and, for
@@ -466,12 +505,13 @@ What the plugin runs and writes, and when:
   is read. That last read is gated by the same check as the switch (regular
   file, not a symlink, root-owned, not writable by group or others, every
   folder above it root-owned, not writable by group or others and not a
-  symlink, not under a user-mount prefix, on no FUSE or user mount), judged on
+  symlink, not under a user-mount prefix, on no FUSE or user mount, with
+  `user_allow_other` off), judged on
   the gate read taken just before each read. Also read, with each state read:
   `/proc/sys/kernel/random/boot_id`. A binary that fails the gate is never
   run: the panel shows why, the header says "GPU mode unknown", and no earlier
   reading stays on screen. That holds for any refusal (the `stat` or the mount
-  check, at the status read or at the switch): no mode row shows a status, there
+  check or the fuse.conf check, at the status read or at the switch): no mode row shows a status, there
   is no lock line or **Shut down now**, and the environment status is neutral.
 - **Leftover firmware flag**: after a switch that failed, rolled back and
   left the apply-ready flag set with nothing staged, the shell remembers
@@ -505,9 +545,13 @@ runs the manifest validation, QML lint and load checks, the widget live
 against fake binaries (including the dialogs' keys and those of a panel that
 reopened by itself, a flooding and a hanging binary, and a binary that fails
 the ownership or mount check and must never be run, even for the debug read),
-the model tests (including mountinfo fixtures under `tests/fixtures`), the env file sourced by `sh` against fixture trees, `setup.sh` against a
-fake `sudo` (including its source-binary and mount refusals and the checksum
-mismatch path), and shellcheck. It never runs the real
+the model tests (including mountinfo and `fuse-conf-*` fixtures under
+`tests/fixtures`: on, off, commented, indented, inline comment, CRLF, a near
+miss and empty, plus missing, unreadable, oversize, NUL byte and symlink
+cases), the env file sourced by `sh` against fixture trees, `setup.sh` against a
+fake `sudo` (including its source-binary, mount and fuse.conf refusals and the
+checksum mismatch path), and shellcheck. The live tests serve a fake
+`/etc/fuse.conf` (off, then on), so they do not depend on this machine's. It never runs the real
 msi-mux-switch, `pkexec`, `sudo` or a shutdown, and never writes under
 `~/.config`.
 

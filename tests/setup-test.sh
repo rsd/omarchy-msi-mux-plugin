@@ -18,7 +18,11 @@
 # the final check) the fake cat adds the path MM_CAT_FLIP names to the
 # "flipped" list, which the fake stat (checking it before any other) reports
 # as owned by uid 4242: the stat after the mount check then differs from the
-# one before, as when a FUSE mount forges a stat and unmounts lazily. Every run
+# one before, as when a FUSE mount forges a stat and unmounts lazily. The fake
+# head (for setup.sh's read of /etc/fuse.conf only) and the fake stat's
+# existence probe of that file both look at the file MM_FUSE_CONF names
+# instead (the fixture fuse-conf-off when it is unset), so a missing, a
+# chmod-000, a directory or a symbolic link MM_FUSE_CONF is the real case. Every run
 # has PATH starting with the fakes and a temporary HOME; a run is refused if
 # `sudo` would resolve anywhere else.
 
@@ -28,6 +32,8 @@ PLUGIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 SETUP=$PLUGIN_DIR/setup.sh
 REAL_STAT=$(command -v stat)
 REAL_CAT=$(command -v cat)
+REAL_HEAD=$(command -v head)
+FIXTURES=$PLUGIN_DIR/tests/fixtures
 FAILED=0
 CHECKS=0
 
@@ -92,9 +98,13 @@ fi
 exit 1
 EOF
 
-# Called by setup.sh as: stat -c '%u %f %U' -- <path>
+# Called by setup.sh as: stat -c '%u %f %U' -- <path>, and as
+# stat -c %i -- /etc/fuse.conf (served from MM_FUSE_CONF)
 cat >"$FAKE/stat" <<EOF
 #!/bin/bash
+if [[ \$# == 4 && \$1 == -c && \$2 == %i && \$3 == -- && \$4 == /etc/fuse.conf ]]; then
+  exec "$REAL_STAT" -c %i -- "\${MM_FUSE_CONF:-$FIXTURES/fuse-conf-off}"
+fi
 path=\${4:-}
 fake=0
 [[ \${1:-} == -c && \${2:-} == '%u %f %U' && \${3:-} == -- && \$# == 4 ]] && fake=1
@@ -141,7 +151,15 @@ if [[ \$# == 2 && \$1 == -- && \$2 == /proc/self/mountinfo ]]; then
 fi
 exec "$REAL_CAT" "\$@"
 EOF
-chmod 755 "$FAKE/sudo" "$FAKE/stat" "$FAKE/cat"
+# Called by setup.sh as: head -c <bytes> -- /etc/fuse.conf
+cat >"$FAKE/head" <<EOF
+#!/bin/bash
+if [[ \$# == 4 && \$1 == -c && \$3 == -- && \$4 == /etc/fuse.conf ]]; then
+  exec "$REAL_HEAD" -c "\$2" -- "\${MM_FUSE_CONF:-$FIXTURES/fuse-conf-off}"
+fi
+exec "$REAL_HEAD" "\$@"
+EOF
+chmod 755 "$FAKE/sudo" "$FAKE/stat" "$FAKE/cat" "$FAKE/head"
 
 # run_setup <stdin text> <args...>: setup.sh's output in OUT, status in STATUS.
 OUT=""
@@ -539,6 +557,32 @@ MM_MOUNTINFO=$MI MM_SUDO_MV_MOUNTINFO=$T/mountinfo-fuse-fv run_setup "y\n" "$FVB
 expect "a FUSE mount appearing after the move: still not safe" 1 "Still not safe:"
 if grep -qF "  $FVBIN is on a FUSE mount at $(mi_esc "$T/fv")" <<<"$OUT"; then ok "the final check names the mount"; else fail "the final check does not name the mount"; quote "$OUT"; fi
 
+# --- the mount check's window: nothing but the mountinfo read between the
+# two stats; the parse comes after the second.
+
+# The trace of one passing run: the first take_snapshot, the cat, the second
+# take_snapshot, and only then mount_problem (the parse) and mi_decode.
+TRACE=$T/trace
+printf 'n\n' | env PATH="$FAKE:$PATH" HOME="$T/home" bash -x "$SETUP" "$BIN" >/dev/null 2>"$TRACE"
+snaps=$(grep -nE '^\++ take_snapshot$' "$TRACE" | head -n 2 | cut -d: -f1 | tr '\n' ' ')
+read -r snap1 snap2 <<<"$snaps"
+cat_at=$(grep -nE '^\++ cat -- /proc/self/mountinfo$' "$TRACE" | head -n 1 | cut -d: -f1)
+parse_at=$(grep -nE '^\++ (mount_problem|mi_decode) ' "$TRACE" | head -n 1 | cut -d: -f1)
+if [[ -n ${snap1:-} && -n ${snap2:-} && -n $cat_at && -n $parse_at ]] &&
+  ((snap1 < cat_at && cat_at < snap2 && snap2 < parse_at)); then
+  ok "mount check order: stat, read mountinfo, stat, then parse"
+else
+  fail "mount check order (stats at ${snaps:-none}, cat at ${cat_at:-none}, parse at ${parse_at:-none})"
+fi
+# Between the cat and the second stat: no other command than the snapshot's.
+between=$(sed -n "$((cat_at + 1)),$((snap2 - 1))p" "$TRACE" | grep -vE '^\++ (\(\(|\[\[|read_ok=|text=|local |take_snapshot)' || true)
+if [[ -z $between ]]; then ok "nothing runs between the mountinfo read and the second stat"; else fail "between the read and the second stat:"; quote "$between"; fi
+# The read failing still loses to a changed stat: the change is reported.
+make_tree "$T/fu"
+MM_MOUNTINFO=unreadable MM_CAT_FLIP=$T/fu/opt run_setup "y\n" "$T/fu/opt/msi-mux-switch/msi-mux-switch"
+expect "a change across an unreadable mountinfo read: the change wins" 1 "changed while it was being checked."
+no_sudo "change across an unreadable read"
+
 # --- the stats around the mount check must agree (a FUSE mount can forge a
 # stat, then unmount lazily before mountinfo is read)
 
@@ -589,6 +633,92 @@ else
   fail "the final check does not name the change"; quote "$OUT"
 fi
 fresh_copy_hint "change across the final check" "Still not safe:"
+
+# --- /etc/fuse.conf: user_allow_other on refuses, before anything else
+
+FUSE_ON="user_allow_other is turned on in /etc/fuse.conf."
+FUSE_UNREAD="/etc/fuse.conf exists but could not be read, so setup cannot check that user_allow_other is off"
+FUSE_BIG="/etc/fuse.conf could not be checked for user_allow_other (it is too large or not plain text)."
+# fuse_refused <name> <fuse.conf> <pattern>: refused, nothing run, no fix in
+# place, the mount check never reached.
+fuse_refused() {
+  MM_FUSE_CONF=$2 run_setup "y\n" "$BIN"
+  expect "$1" 1 "$3"
+  if grep -qF "Refusing to set up $BIN:" <<<"$OUT" && grep -qF "Nothing was changed." <<<"$OUT"; then
+    ok "$1: refused, nothing was changed"
+  else
+    fail "$1: not refused as setup, or no 'Nothing was changed.'"; quote "$OUT"
+  fi
+  if grep -qiE 'chmod|chown|by hand|run this again' <<<"$OUT"; then fail "$1: advice to fix in place or retry"; quote "$OUT"; else ok "$1: no fix in place, no retry"; fi
+  if [[ -s $CAT_READS ]]; then fail "$1: mountinfo was read"; else ok "$1: refused before the mount check"; fi
+  no_sudo "$1"
+}
+# fuse_passes <name> <fuse.conf>: the run goes on to ask.
+fuse_passes() {
+  MM_FUSE_CONF=$2 run_setup "n\n" "$BIN"
+  expect "$1" 1 "Cancelled."
+  if grep -qF "fuse.conf" <<<"$OUT"; then fail "$1: fuse.conf mentioned"; quote "$OUT"; else ok "$1: fuse.conf not mentioned"; fi
+  no_sudo "$1"
+}
+
+for f in on indented inline-comment crlf; do
+  fuse_refused "fuse.conf $f: refused" "$FIXTURES/fuse-conf-$f" "$FUSE_ON"
+done
+if grep -qF "Turn it off (comment out that line) and run setup again." <<<"$OUT"; then ok "fuse.conf on: the advice is to turn it off"; else fail "fuse.conf on: no advice to turn it off"; quote "$OUT"; fi
+for f in off commented near-miss empty; do
+  fuse_passes "fuse.conf $f: passes" "$FIXTURES/fuse-conf-$f"
+done
+printf 'mount_max = 1000\n\vuser_allow_other' >"$T/fuse-nonl"
+fuse_refused "fuse.conf on without a final newline (after \\v): refused" "$T/fuse-nonl" "$FUSE_ON"
+printf '\fuser_allow_other\t# x\n' >"$T/fuse-ff"
+fuse_refused "fuse.conf on after \\f, before a tab: refused" "$T/fuse-ff" "$FUSE_ON"
+printf 'user_allow_other#x\n' >"$T/fuse-hash"
+fuse_refused "fuse.conf on with # right after the word: refused" "$T/fuse-hash" "$FUSE_ON"
+fuse_passes "fuse.conf missing: passes" "$T/no-such-fuse.conf"
+# A link there is not missing, even when its target cannot be reached.
+ln -s "$T/no-such-target" "$T/fuse-dangling"
+fuse_refused "fuse.conf a dangling link: refused as unread" "$T/fuse-dangling" "$FUSE_UNREAD"
+ln -s "$T/fuse-loop-b" "$T/fuse-loop-a"
+ln -s "$T/fuse-loop-a" "$T/fuse-loop-b"
+fuse_refused "fuse.conf a link loop: refused as unread" "$T/fuse-loop-a" "$FUSE_UNREAD"
+ln -s "$FIXTURES/fuse-conf-off" "$T/fuse-link-ok"
+fuse_passes "fuse.conf a link to an off file: passes" "$T/fuse-link-ok"
+if (($(id -u) == 0)); then
+  echo "skip the unreadable fuse.conf case (running as root, which reads a mode-000 file)"
+else
+  cp -- "$FIXTURES/fuse-conf-off" "$T/fuse-unreadable"
+  chmod 000 "$T/fuse-unreadable"
+  fuse_refused "fuse.conf unreadable: refused" "$T/fuse-unreadable" "$FUSE_UNREAD"
+  mkdir -p "$T/fuse-locked"
+  cp -- "$FIXTURES/fuse-conf-off" "$T/fuse-locked/fuse.conf"
+  chmod 000 "$T/fuse-locked"
+  ln -s "$T/fuse-locked/fuse.conf" "$T/fuse-link-locked"
+  fuse_refused "fuse.conf a link into an unsearchable folder: refused as unread" "$T/fuse-link-locked" "$FUSE_UNREAD"
+  chmod 755 "$T/fuse-locked"
+fi
+mkdir -p "$T/fuse-dir"
+fuse_refused "fuse.conf a directory: refused" "$T/fuse-dir" "$FUSE_UNREAD"
+# 65536 bytes pass, 65537 refuse; multibyte bytes count as bytes.
+head -c 65536 /dev/zero | tr '\0' '#' >"$T/fuse-max"
+fuse_passes "fuse.conf of 65536 bytes: passes" "$T/fuse-max"
+head -c 65537 /dev/zero | tr '\0' '#' >"$T/fuse-big"
+fuse_refused "fuse.conf of 65537 bytes: refused" "$T/fuse-big" "$FUSE_BIG"
+{ printf '# '; for ((i = 0; i < 32768; i++)); do printf '\303\251'; done; } >"$T/fuse-big-utf8"
+fuse_refused "fuse.conf of 65538 bytes in two-byte characters: refused" "$T/fuse-big-utf8" "$FUSE_BIG"
+printf '%s\n\n\n\n' "$(head -c 65534 /dev/zero | tr '\0' '#')" >"$T/fuse-big-nl"
+fuse_refused "fuse.conf over the cap in final newlines: refused" "$T/fuse-big-nl" "$FUSE_BIG"
+printf 'mount_max = 1000\n\0\n' >"$T/fuse-nul"
+fuse_refused "fuse.conf with a NUL byte: refused" "$T/fuse-nul" "$FUSE_BIG"
+printf 'mount_max = 1000\n' >"$T/fuse-nul-end"
+printf '\0' >>"$T/fuse-nul-end"
+fuse_refused "fuse.conf ending in a NUL byte: refused" "$T/fuse-nul-end" "$FUSE_BIG"
+printf '\0user_allow_other\n' >"$T/fuse-nul-on"
+fuse_refused "fuse.conf with a NUL before user_allow_other: refused as unchecked" "$T/fuse-nul-on" "$FUSE_BIG"
+# A NUL then at least 64 KiB more: head is not left to die of SIGPIPE.
+{ printf '\0'; head -c 65536 /dev/zero | tr '\0' '#'; } >"$T/fuse-nul-big"
+fuse_refused "fuse.conf with a NUL then 65536 bytes: refused as not plain text" "$T/fuse-nul-big" "$FUSE_BIG"
+{ printf 'mount_max = 1000\n\0'; head -c 200000 /dev/zero | tr '\0' '#'; } >"$T/fuse-nul-huge"
+fuse_refused "fuse.conf with a NUL then 200000 bytes: refused as not plain text" "$T/fuse-nul-huge" "$FUSE_BIG"
 
 # --- the commands, declined and accepted
 

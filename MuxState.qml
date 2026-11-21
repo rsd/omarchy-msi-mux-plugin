@@ -14,13 +14,15 @@ import "Model.js" as Model
 //   - DMI read (Model.dmiArgv): once, when the first widget attaches.
 //     Decides hidden / available / unavailable and the override flags
 //     (Model.hardwareDecision).
-//   - the gate read (Model.gateArgv): stat of the binary and every
-//     directory above it, the mount table (/proc/self/mountinfo, bounded)
-//     and the same stat again, in one run: after the DMI read, when the
-//     binary path changes, on a panel opening, before every debug read, and
-//     again right before a switch (Model.ownershipVerdict, which also
-//     refuses a FUSE or user_id mount on the binary's way, and a read whose
-//     two stats differ).
+//   - the gate read (Model.gateArgv): /etc/fuse.conf (bounded, sent back as
+//     hex), stat of the binary and every directory above it, the mount
+//     table (/proc/self/mountinfo, bounded) and the same stat again, in one
+//     run: after the DMI read, when the binary path changes, on a panel
+//     opening, before every debug read, and again right before a switch
+//     (Model.ownershipVerdict, which also refuses user_allow_other turned
+//     on in fuse.conf or a fuse.conf that could not be checked, a FUSE or
+//     user_id mount on the binary's way, and a read whose two stats
+//     differ).
 //   - the read-only state read, `<binary> --debug --json [flags]` as the
 //     user (Model.debugReadArgv): only at the end of a gate read
 //     (checkBinary), on available hardware, and only if that read passes the
@@ -74,13 +76,14 @@ Singleton {
   readonly property var hardware: Model.hardwareDecision(root.dmi)
   readonly property bool hidden: !root.dmiRead || root.hardware.state === "hidden"
 
-  // The last gate read (stat and the mount table's text, Model.parseGateRead)
-  // and what it means.
+  // The last gate read (stat, the mount table's text and fuse.conf,
+  // Model.parseGateRead) and what it means.
   property bool statRead: false
   property var stats: ({})
   property var mounts: null
+  property var fuseConf: null
   readonly property var ownership: root.statRead
-    ? Model.ownershipVerdict(root.binaryPath, root.stats, root.mounts)
+    ? Model.ownershipVerdict(root.binaryPath, root.stats, root.mounts, root.fuseConf)
     : { ok: false, kind: "", reason: "Checking the backend…" }
   // No debug read can run: the hardware is not validated, or the last stat
   // refused the binary (the panel shows the mode as unknown).
@@ -164,6 +167,7 @@ Singleton {
     root.statRead = false
     root.stats = ({})
     root.mounts = null
+    root.fuseConf = null
     root.debug = Model.emptyDebug()
     if (root.started && !startDelay.running) root.checkBinary()
   }
@@ -230,6 +234,7 @@ Singleton {
     if (argv.length === 0) {
       root.stats = ({})
       root.mounts = null
+      root.fuseConf = null
       root.statRead = true
       root.debug = Model.emptyDebug()
       return
@@ -248,9 +253,10 @@ Singleton {
         if (statProc.path !== root.binaryPath) return
         var gate = Model.parseGateRead(text)
         root.mounts = gate.mounts
+        root.fuseConf = gate.fuseConf
         root.stats = gate.stats
         root.statRead = true
-        root.readDebug(root.stats, root.mounts)
+        root.readDebug(root.stats, root.mounts, root.fuseConf)
       }
     }
     onRunningChanged: {
@@ -269,9 +275,9 @@ Singleton {
   // binary runs only if that read passes the switch's ownership gate
   // (Model.debugReadArgv). A read that has to wait is asked for again
   // through checkBinary, so it too follows a fresh gate read.
-  function readDebug(stats, mounts) {
+  function readDebug(stats, mounts, fuseConf) {
     if (root.hardware.state !== "available") return
-    var argv = Model.debugReadArgv(root.binaryPath, stats, mounts, root.hardware.flags)
+    var argv = Model.debugReadArgv(root.binaryPath, stats, mounts, fuseConf, root.hardware.flags)
     if (argv.length === 0) {
       root.debug = Model.emptyDebug()
       return
@@ -480,8 +486,9 @@ Singleton {
     // from a binary no longer trusted.
     var gate = checkStat.result
     root.mounts = gate.mounts
+    root.fuseConf = gate.fuseConf
     root.stats = gate.stats
-    var verdict = Model.ownershipVerdict(root.binaryPath, gate.stats, gate.mounts)
+    var verdict = Model.ownershipVerdict(root.binaryPath, gate.stats, gate.mounts, gate.fuseConf)
     if (!verdict.ok) {
       root.debug = Model.emptyDebug()
       return root.refused(verdict.reason + " Nothing was run.")

@@ -337,6 +337,57 @@ function mountProblem(path, mountinfo) {
   return ""
 }
 
+// user_allow_other in /etc/fuse.conf lets every account mount FUSE with
+// allow_other, so another account's mount over a folder it owns can show any
+// owner to this user too: the gate refuses while it is on. The file is read
+// by the gate script (GATE_SCRIPT), before the first stat. setup.sh applies
+// the same rule with the same parse.
+var FUSE_CONF_PATH = "/etc/fuse.conf"
+// The most of it that is read, in bytes. A larger file is not parsed: the
+// gate then refuses (fail safe).
+var FUSE_CONF_MAX_BYTES = 65536
+
+var FUSE_CONF_ON_TEXT = "user_allow_other is turned on in " + FUSE_CONF_PATH + ". It lets other accounts fake root-owned"
+  + " folders, so the plugin cannot trust that msi-mux-switch is root's. Turn it off (comment out that line) to use the plugin."
+var FUSE_CONF_UNREAD_TEXT = FUSE_CONF_PATH + " exists but could not be read, so the plugin cannot check that"
+  + " user_allow_other is off (it lets other accounts fake root-owned folders)."
+var FUSE_CONF_ODD_TEXT = FUSE_CONF_PATH + " could not be checked for user_allow_other (it is too large or not plain text)."
+var FUSE_CONF_UNCHECKED_TEXT = FUSE_CONF_PATH + " could not be checked for user_allow_other, which lets other accounts"
+  + " fake root-owned folders."
+
+// Whether the text of fuse.conf turns user_allow_other on. Per line (split on
+// "\n", a last line without one counts too): everything from the first "#"
+// is dropped (fuse does the same, so an inline comment counts), leading
+// space, \t, \r, \v and \f are skipped, and the first run of other
+// characters is the token; exactly "user_allow_other" is on. Whatever
+// follows the token is ignored, which refuses more than fusermount does.
+function fuseConfAllowsOther(text) {
+  var lines = String(text).split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var l = lines[i]
+    var hash = l.indexOf("#")
+    if (hash !== -1) l = l.slice(0, hash)
+    var token = /^[ \t\r\v\f]*([^ \t\r\v\f]*)/.exec(l)[1]
+    if (token === "user_allow_other") return true
+  }
+  return false
+}
+
+// "" when fuse.conf (parseGateRead's fuseConf) leaves user_allow_other off,
+// else why not. A missing file is off. Anything else that is not a whole,
+// plain-text read refuses (fail safe): a file that could not be read, one
+// over FUSE_CONF_MAX_BYTES or holding a NUL byte, and no answer at all
+// (undefined, null, a gate run that did not finish).
+function fuseConfProblem(fuseConf) {
+  if (!fuseConf || typeof fuseConf !== "object") return FUSE_CONF_UNCHECKED_TEXT
+  if (fuseConf.state === "missing") return ""
+  if (fuseConf.state === "unread") return FUSE_CONF_UNREAD_TEXT
+  if (fuseConf.state === "over") return FUSE_CONF_ODD_TEXT
+  if (fuseConf.state !== "text" || typeof fuseConf.text !== "string") return FUSE_CONF_UNCHECKED_TEXT
+  if (fuseConf.text.length > FUSE_CONF_MAX_BYTES || fuseConf.text.indexOf("\u0000") !== -1) return FUSE_CONF_ODD_TEXT
+  return fuseConfAllowsOther(fuseConf.text) ? FUSE_CONF_ON_TEXT : ""
+}
+
 // The ownership gate's one read, in one run: stat of the binary and every
 // folder above it, then the mount table, then the same stat again, so each
 // gate decision gets all three from the same moment and a fresh table every
@@ -348,16 +399,30 @@ function mountProblem(path, mountinfo) {
 // (Matching device numbers instead does not work: on btrfs stat's device is
 // not the one mountinfo lists.) One process also keeps the switch's checks
 // as they were: one stat check, under the same watchdog. "$1" is
-// STAT_FORMAT, "$2" the mount table, the rest the paths; nothing but the cap
-// is part of the text. It prints the first stat's lines, the line "again",
-// the second stat's lines, the line "mountinfo", then the table and "end",
-// or "over" past MOUNTINFO_MAX_BYTES, or "unread". Every stat line holds a
-// tab (STAT_FORMAT) and no path holds a newline (binaryPathProblem), so
-// neither marker line can come from stat; the table, the only text it does
-// not control, comes last.
+// STAT_FORMAT, "$2" the mount table, "$3" fuse.conf, the rest the paths;
+// nothing but the caps is part of the text. fuse.conf is read first, before
+// the first stat, so the stat-table-stat window stays as narrow as it was.
+// It prints one line for it: "fuseconf missing" (its folder is searchable
+// and the name is neither a file nor a symlink of any kind: a link whose
+// target this account cannot reach, dangling, a loop or into a folder it
+// cannot search, may still be read by fusermount, so it is "unread"),
+// "fuseconf unread", or "fuseconf hex " and its first
+// FUSE_CONF_MAX_BYTES+1 bytes in lowercase hex, so its text, which the
+// script does not control, can never pass for a marker or a stat line. Then
+// the first stat's lines, the line "again", the second stat's lines, the
+// line "mountinfo", then the table and "end", or "over" past
+// MOUNTINFO_MAX_BYTES, or "unread". Every stat line holds a tab
+// (STAT_FORMAT) and no path holds a newline (binaryPathProblem), so neither
+// marker line can come from stat; the table, the only raw text it does not
+// control, comes last.
 var GATE_SCRIPT = [
-  "f=$1 m=$2",
-  "shift 2",
+  "f=$1 m=$2 c=$3",
+  "shift 3",
+  "if [ -d \"${c%/*}\" ] && [ -x \"${c%/*}\" ] && [ ! -e \"$c\" ] && [ ! -L \"$c\" ]; then printf 'fuseconf missing\\n'",
+  "elif h=$(set -o pipefail; head -c " + (FUSE_CONF_MAX_BYTES + 1) + " -- \"$c\" 2>/dev/null | od -An -v -tx1 | tr -d ' \\n'); then",
+  "  printf 'fuseconf hex %s\\n' \"$h\"",
+  "else printf 'fuseconf unread\\n'",
+  "fi",
   "stat -c \"$f\" -- \"$@\" 2>/dev/null",
   "if t=$(head -c " + (MOUNTINFO_MAX_BYTES + 1) + " -- \"$m\" && printf x); then r=read; else r=unread; fi",
   "printf 'again\\n'",
@@ -374,7 +439,8 @@ var GATE_SCRIPT = [
 
 function gateArgv(path) {
   if (binaryPathProblem(path) !== "") return []
-  return ["bash", "-c", GATE_SCRIPT, "msi-mux-gate", STAT_FORMAT, MOUNTINFO_PATH, String(path)].concat(ancestorDirs(path))
+  return ["bash", "-c", GATE_SCRIPT, "msi-mux-gate", STAT_FORMAT, MOUNTINFO_PATH, FUSE_CONF_PATH, String(path)]
+    .concat(ancestorDirs(path))
 }
 
 // What parseGateRead puts in `mounts` when the two stats differ: not a
@@ -393,38 +459,66 @@ function markerLine(t, marker, from) {
   return at
 }
 
+// The gate script's fuse.conf line: "missing", "unread", or the hex of what
+// was read.
+var FUSE_CONF_LINE = /^fuseconf (missing|unread|hex ([0-9a-f]*))$/
+
+// The fuseConf of a gate read from the line's match: { state: "missing" },
+// { state: "unread" }, { state: "over" } past FUSE_CONF_MAX_BYTES, or
+// { state: "text", text } (one character per byte); null for an odd number
+// of hex digits (not the script's output).
+function fuseConfFromLine(match) {
+  if (match[1] === "missing" || match[1] === "unread") return { state: match[1] }
+  var hex = match[2]
+  if (hex.length % 2 !== 0) return null
+  if (hex.length > 2 * FUSE_CONF_MAX_BYTES) return { state: "over" }
+  var text = ""
+  for (var i = 0; i < hex.length; i += 2) text += String.fromCharCode(parseInt(hex.slice(i, i + 2), 16))
+  return { state: "text", text: text }
+}
+
 // { stats: parseStat of the first stat's lines, mounts: the table's text, or
-// null when it was not read whole }. Without both marker lines nothing is
-// taken (the run did not finish). When the second stat's lines are not the
-// first's, byte for byte, nothing is taken either and `mounts` is
-// GATE_CHANGED.
+// null when it was not read whole, fuseConf: fuseConfFromLine of the first
+// line }. Without that first line or both marker lines nothing is taken
+// (the run did not finish). When the second stat's lines are not the
+// first's, byte for byte, no stat is taken either and `mounts` is
+// GATE_CHANGED (fuse.conf, read before both, is kept).
 function parseGateRead(text) {
-  var t = String(text === undefined || text === null ? "" : text)
+  var all = String(text === undefined || text === null ? "" : text)
+  var nl = all.indexOf("\n")
+  var line = nl === -1 ? null : FUSE_CONF_LINE.exec(all.slice(0, nl))
+  var fuseConf = line ? fuseConfFromLine(line) : null
+  if (fuseConf === null) return { stats: {}, mounts: null, fuseConf: null }
+  var t = all.slice(nl + 1)
   var again = markerLine(t, "again", 0)
-  if (again === -1) return { stats: {}, mounts: null }
+  if (again === -1) return { stats: {}, mounts: null, fuseConf: null }
   var sep = markerLine(t, "mountinfo", again + 6)
-  if (sep === -1) return { stats: {}, mounts: null }
-  if (t.slice(0, again) !== t.slice(again + 6, sep)) return { stats: {}, mounts: GATE_CHANGED }
+  if (sep === -1) return { stats: {}, mounts: null, fuseConf: null }
+  if (t.slice(0, again) !== t.slice(again + 6, sep)) return { stats: {}, mounts: GATE_CHANGED, fuseConf: fuseConf }
   var body = t.slice(sep + 10)
   var ended = body.length >= 4 && body.slice(-4) === "end\n"
-  return { stats: parseStat(t.slice(0, again)), mounts: ended ? body.slice(0, -4) : null }
+  return { stats: parseStat(t.slice(0, again)), mounts: ended ? body.slice(0, -4) : null, fuseConf: fuseConf }
 }
 
 // Whether the binary may be run at all, by pkexec for the switch or as the
 // user for the debug read (debugReadArgv): { ok, kind, reason }. kind is "ok",
-// "invalid" (the setting), "mount" (under a user mount, or on a mount
-// another account may control, or the mount table could not be checked:
-// mountProblem on `mounts`, the text of a fresh mountinfo read), "missing",
+// "invalid" (the setting), "mount" (under a user mount; user_allow_other on
+// in fuse.conf or fuse.conf could not be checked: fuseConfProblem on
+// `fuseConf`, a fresh gate read's; or on a mount another account may
+// control, or the mount table could not be checked: mountProblem on
+// `mounts`, the text of a fresh mountinfo read), "missing",
 // "symlink", "notfile", "owner", "mode" or "ancestor". The binary must be a regular file owned by root with no
 // group or other write bit, and so must every directory above it (a
 // directory the user can write lets the user swap the file).
-function ownershipVerdict(path, stats, mounts) {
+function ownershipVerdict(path, stats, mounts, fuseConf) {
   var problem = binaryPathProblem(path)
   if (problem !== "") return { ok: false, kind: "invalid", reason: problem }
   var mount = userMountOf(path)
   if (mount !== "")
     return { ok: false, kind: "mount", reason: String(path) + " is under " + mount
       + ", where a user can mount or replace files. Install msi-mux-switch somewhere like " + DEFAULT_BINARY + "." }
+  var fuse = fuseConfProblem(fuseConf)
+  if (fuse !== "") return { ok: false, kind: "mount", reason: fuse }
   var mounted = mountProblem(path, mounts)
   if (mounted !== "") return { ok: false, kind: "mount", reason: mounted }
   var s = stats || {}
@@ -452,8 +546,9 @@ function ownershipVerdict(path, stats, mounts) {
 }
 
 // Set up backend helps with every ownership problem except a bad setting or
-// a mount (a user mount, a mount another account may control, or a mount
-// table that could not be checked): setup.sh refuses those too.
+// a mount (a user mount, user_allow_other on or fuse.conf unchecked, a mount
+// another account may control, or a mount table that could not be checked):
+// setup.sh refuses those too.
 function setupHelps(verdict) {
   return !!verdict && !verdict.ok && verdict.kind !== "invalid" && verdict.kind !== "mount" && verdict.kind !== ""
 }
@@ -531,13 +626,13 @@ function debugArgv(path, flags) {
 }
 
 // The debug read as the plugin runs it: debugArgv, or [] unless the binary
-// passes ownershipVerdict for `stats` and `mounts` (parseGateRead of a gate
-// read taken right before it), the same gate as the switch. A binary owned
-// by another account, in a folder a user can write, under a user mount or on
-// a mount another account may control, or a symbolic link, is never run,
-// not even read-only.
-function debugReadArgv(path, stats, mounts, flags) {
-  if (!ownershipVerdict(path, stats, mounts).ok) return []
+// passes ownershipVerdict for `stats`, `mounts` and `fuseConf` (parseGateRead
+// of a gate read taken right before it), the same gate as the switch. A
+// binary owned by another account, in a folder a user can write, under a
+// user mount or on a mount another account may control, with
+// user_allow_other on, or a symbolic link, is never run, not even read-only.
+function debugReadArgv(path, stats, mounts, fuseConf, flags) {
+  if (!ownershipVerdict(path, stats, mounts, fuseConf).ok) return []
   return debugArgv(path, flags)
 }
 

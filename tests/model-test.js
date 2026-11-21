@@ -150,7 +150,12 @@ const ROOT_OK = [
 // binary's way), as the gate reads it with every stat.
 const MI = (name) => read("tests/fixtures/mountinfo-" + name)
 const MI_OK = MI("ext4-root")
-const verdict = (text) => M.ownershipVerdict(BIN, M.parseStat(text), MI_OK)
+// fuse.conf as the gate reads it: the fixtures, and the off one (the Arch
+// default, user_allow_other commented out) that every other verdict uses.
+const FC = (name) => read("tests/fixtures/fuse-conf-" + name)
+const FC_OFF = { state: "text", text: FC("off") }
+const FC_LINE_OFF = "fuseconf hex " + Buffer.from(FC("off"), "latin1").toString("hex") + "\n"
+const verdict = (text) => M.ownershipVerdict(BIN, M.parseStat(text), MI_OK, FC_OFF)
 const replaceLine = (text, name, line) => text.split("\n").map(l => l.endsWith("\t" + name) ? line : l).join("\n")
 
 test("stat output parses into type, uid, mode and owner", () => {
@@ -190,7 +195,7 @@ test("ownership: a symlink is refused, even root-owned", () => {
   const v = verdict(replaceLine(ROOT_OK, BIN, st(0, "a1ff", "root", BIN)))
   assert.strictEqual(v.kind, "symlink")
   assert.strictEqual(v.ok, false)
-  assert.deepStrictEqual(M.debugReadArgv(BIN, M.parseStat(replaceLine(ROOT_OK, BIN, st(0, "a1ff", "root", BIN))), MI_OK, FLAGS), [])
+  assert.deepStrictEqual(M.debugReadArgv(BIN, M.parseStat(replaceLine(ROOT_OK, BIN, st(0, "a1ff", "root", BIN))), MI_OK, FC_OFF, FLAGS), [])
 })
 
 test("ownership: a writable or user-owned ancestor is refused, naming it", () => {
@@ -213,16 +218,16 @@ test("ownership: the machine as it is today (file and folder owned by raul)", ()
   const today = [st(1000, "81ed", "raul", BIN), st(1000, "41ed", "raul", "/opt/msi-mux-switch"), st(0, "41ed", "root", "/opt"), st(0, "416d", "root", "/")].join("\n")
   const v = verdict(today)
   assert.strictEqual(v.reason, BIN + " is owned by raul, not root.")
-  assert.deepStrictEqual(M.debugReadArgv(BIN, M.parseStat(today), MI_OK, FLAGS), [], "not even the read-only debug read runs it")
+  assert.deepStrictEqual(M.debugReadArgv(BIN, M.parseStat(today), MI_OK, FC_OFF, FLAGS), [], "not even the read-only debug read runs it")
 })
 
 test("ownership: missing binary, not a file, and a bad setting", () => {
   const missing = ROOT_OK.split("\n").filter(l => !l.endsWith("\t" + BIN)).join("\n")
   assert.deepStrictEqual(verdict(missing), { ok: false, kind: "missing", reason: "msi-mux-switch was not found at " + BIN + "." })
   assert.ok(M.setupHelps(verdict(missing)))
-  assert.deepStrictEqual(M.debugReadArgv(BIN, M.parseStat(missing), MI_OK, FLAGS), [])
+  assert.deepStrictEqual(M.debugReadArgv(BIN, M.parseStat(missing), MI_OK, FC_OFF, FLAGS), [])
   assert.strictEqual(verdict(replaceLine(ROOT_OK, BIN, st(0, "41ed", "root", BIN))).kind, "notfile")
-  const bad = M.ownershipVerdict("relative", {}, MI_OK)
+  const bad = M.ownershipVerdict("relative", {}, MI_OK, FC_OFF)
   assert.strictEqual(bad.kind, "invalid")
   assert.strictEqual(M.setupHelps(bad), false, "setup.sh cannot fix a bad setting")
   assert.strictEqual(M.setupHelps({ ok: true, kind: "ok", reason: "" }), false)
@@ -232,12 +237,12 @@ test("ownership: a binary under a user mount is refused, whatever stat says", ()
   for (const m of ["/mnt", "/media", "/run/media", "/run/user"]) {
     const p = m + "/x/msi-mux-switch"
     const all = [st(0, "81ed", "root", p)].concat(M.ancestorDirs(p).map(d => st(0, "41ed", "root", d))).join("\n")
-    const v = M.ownershipVerdict(p, M.parseStat(all), MI_OK)
+    const v = M.ownershipVerdict(p, M.parseStat(all), MI_OK, FC_OFF)
     assert.strictEqual(v.kind, "mount", p)
     assert.ok(v.reason.startsWith(p + " is under " + m + ", where a user can mount"), v.reason)
     assert.strictEqual(M.setupHelps(v), false, "setup.sh refuses it too")
   }
-  assert.strictEqual(M.ownershipVerdict("/run/user/1000/msi-mux-switch", {}, MI_OK).kind, "mount")
+  assert.strictEqual(M.ownershipVerdict("/run/user/1000/msi-mux-switch", {}, MI_OK, FC_OFF).kind, "mount")
   // Only whole path segments: /mntx and /run/username are not mounts.
   assert.strictEqual(M.userMountOf("/mntx/msi-mux-switch"), "")
   assert.strictEqual(M.userMountOf("/run/username/msi-mux-switch"), "")
@@ -246,7 +251,7 @@ test("ownership: a binary under a user mount is refused, whatever stat says", ()
 
 // Root-owned stat lines for a path and every folder above it.
 const rootStats = (p) => M.parseStat([st(0, "81ed", "root", p)].concat(M.ancestorDirs(p).map(d => st(0, "41ed", "root", d))).join("\n"))
-const mountVerdict = (mounts, p) => M.ownershipVerdict(p || BIN, rootStats(p || BIN), mounts)
+const mountVerdict = (mounts, p) => M.ownershipVerdict(p || BIN, rootStats(p || BIN), mounts, FC_OFF)
 
 test("mounts: mountinfo lines parse, the optional fields skipped up to the lone -", () => {
   const m = M.parseMountinfo(MI_OK)
@@ -309,7 +314,7 @@ test("mounts: a FUSE or user_id mount at or above the binary is refused, whateve
     assert.strictEqual(v.reason, BIN + " is on a " + type + " mount at " + at
       + ", which another account may control. Install msi-mux-switch somewhere like " + M.DEFAULT_BINARY + ".", fx)
     assert.strictEqual(M.setupHelps(v), false, fx + ": setup.sh cannot fix a mount")
-    assert.deepStrictEqual(M.debugReadArgv(BIN, rootStats(BIN), MI(fx), FLAGS), [], fx + ": the status read never runs it")
+    assert.deepStrictEqual(M.debugReadArgv(BIN, rootStats(BIN), MI(fx), FC_OFF, FLAGS), [], fx + ": the status read never runs it")
   }
   // Not FUSE, but a mount another user's id owns.
   const u = mountVerdict(MI("user-id"))
@@ -363,21 +368,25 @@ test("mounts: an unread, empty, malformed or uncovering mount table refuses (fai
     const v = mountVerdict(mounts)
     assert.deepStrictEqual(v, { ok: false, kind: "mount", reason: reason }, JSON.stringify(mounts))
     assert.strictEqual(M.setupHelps(v), false)
-    assert.deepStrictEqual(M.debugReadArgv(BIN, rootStats(BIN), mounts, FLAGS), [])
+    assert.deepStrictEqual(M.debugReadArgv(BIN, rootStats(BIN), mounts, FC_OFF, FLAGS), [])
   }
   // The table is checked before stat's answer: a FUSE mount can claim any owner.
-  assert.strictEqual(M.ownershipVerdict(BIN, {}, MI("fuse-ancestor")).kind, "mount")
+  assert.strictEqual(M.ownershipVerdict(BIN, {}, MI("fuse-ancestor"), FC_OFF).kind, "mount")
 })
 
 test("gate read: stat, the mount table, stat again in one run, the paths as arguments, the table framed and capped", () => {
   assert.deepStrictEqual(M.gateArgv(BIN), ["bash", "-c", M.GATE_SCRIPT, "msi-mux-gate", M.STAT_FORMAT, "/proc/self/mountinfo",
-    BIN, "/opt/msi-mux-switch", "/opt", "/"])
+    "/etc/fuse.conf", BIN, "/opt/msi-mux-switch", "/opt", "/"])
   assert.deepStrictEqual(M.gateArgv("relative"), [])
   assert.deepStrictEqual(M.gateArgv("/opt//x"), [])
   // Nothing but the cap is spliced into the script; stat never follows a link.
-  const spliced = M.GATE_SCRIPT.replace(/head -c 1048577/g, "").replace(/-gt 1048576/g, "")
-  assert.ok(!/\d{3,}/.test(spliced) && !/\//.test(spliced.replace(/\/dev\/null/g, "")), "no path or other number in the script")
-  assert.ok(!/-L/.test(M.GATE_SCRIPT))
+  // ${c%/*} is fuse.conf's folder, not a path.
+  const spliced = M.GATE_SCRIPT.replace(/head -c 1048577/g, "").replace(/-gt 1048576/g, "").replace(/head -c 65537/g, "")
+  assert.ok(!/\d{3,}/.test(spliced) && !/\//.test(spliced.replace(/\/dev\/null/g, "").replace(/\$\{c%\/\*\}/g, "")),
+    "no path or other number in the script")
+  // The one -L is fuse.conf's existence test; stat never follows a link.
+  assert.deepStrictEqual(M.GATE_SCRIPT.match(/-L/g), ["-L"])
+  assert.ok(M.GATE_SCRIPT.includes('[ ! -e "$c" ] && [ ! -L "$c" ]; then'), "missing only when neither a file nor a link")
   assert.ok(!/\beval\b|\$\*/.test(M.GATE_SCRIPT))
   assert.strictEqual(M.MOUNTINFO_MAX_BYTES, 1048576)
   // The order the script runs them in: stat, the table read, stat again
@@ -391,25 +400,28 @@ test("gate read: stat, the mount table, stat again in one run, the paths as argu
   assert.ok(lines.indexOf("printf 'mountinfo\\n'") > stats[1], "the table is printed last")
   // What the script prints: stat's lines, "again", the same lines,
   // "mountinfo", the table, "end".
-  const read2 = (a, b, tail) => M.parseGateRead(a + "again\n" + b + "mountinfo\n" + tail)
+  const read2 = (a, b, tail) => M.parseGateRead(FC_LINE_OFF + a + "again\n" + b + "mountinfo\n" + tail)
   const g = read2(ROOT_OK, ROOT_OK, MI_OK + "end\n")
   assert.deepStrictEqual(g.stats, M.parseStat(ROOT_OK))
   assert.strictEqual(g.mounts, MI_OK)
-  assert.deepStrictEqual(M.ownershipVerdict(BIN, g.stats, g.mounts), { ok: true, kind: "ok", reason: "" })
+  assert.deepStrictEqual(M.ownershipVerdict(BIN, g.stats, g.mounts, g.fuseConf), { ok: true, kind: "ok", reason: "" })
   assert.strictEqual(read2(ROOT_OK, ROOT_OK, "end\n").mounts, "", "an empty table (refused by the verdict)")
   // Both stats empty (nothing there): the same answer, the binary missing.
-  assert.strictEqual(M.ownershipVerdict(BIN, read2("", "", MI_OK + "end\n").stats, MI_OK).kind, "missing")
+  assert.strictEqual(M.ownershipVerdict(BIN, read2("", "", MI_OK + "end\n").stats, MI_OK, FC_OFF).kind, "missing")
   for (const tail of ["over\n", "unread\n", MI_OK, MI_OK + "en", ""]) {
     const r = read2(ROOT_OK, ROOT_OK, tail)
     assert.strictEqual(r.mounts, null, JSON.stringify(tail.slice(-8)))
-    assert.strictEqual(M.ownershipVerdict(BIN, r.stats, r.mounts).ok, false)
+    assert.strictEqual(M.ownershipVerdict(BIN, r.stats, r.mounts, r.fuseConf).ok, false)
   }
   // No separator, or only one of the two: nothing is taken from it at all.
-  for (const t of [ROOT_OK, "", undefined, null, ROOT_OK + "mountinfo\n" + MI_OK + "end\n", ROOT_OK + "again\n" + ROOT_OK,
+  for (const t of [ROOT_OK, "", ROOT_OK + "mountinfo\n" + MI_OK + "end\n", ROOT_OK + "again\n" + ROOT_OK,
     ROOT_OK + "mountinfo\nagain\n" + ROOT_OK + MI_OK + "end\n"])
-    assert.deepStrictEqual(M.parseGateRead(t), { stats: {}, mounts: null }, JSON.stringify(t))
+    assert.deepStrictEqual(M.parseGateRead(FC_LINE_OFF + t), { stats: {}, mounts: null, fuseConf: null }, JSON.stringify(t))
+  for (const t of [undefined, null, ""])
+    assert.deepStrictEqual(M.parseGateRead(t), { stats: {}, mounts: null, fuseConf: null }, JSON.stringify(t))
   // A marker only counts as a whole line.
-  assert.deepStrictEqual(M.parseGateRead(ROOT_OK + "xagain\n" + ROOT_OK + "mountinfo\n" + MI_OK + "end\n"), { stats: {}, mounts: null })
+  assert.deepStrictEqual(M.parseGateRead(FC_LINE_OFF + ROOT_OK + "xagain\n" + ROOT_OK + "mountinfo\n" + MI_OK + "end\n"),
+    { stats: {}, mounts: null, fuseConf: null })
 })
 
 test("gate read: two stats that differ in any byte refuse the binary (a FUSE mount detached between them)", () => {
@@ -430,21 +442,218 @@ test("gate read: two stats that differ in any byte refuse the binary (a FUSE mou
   ]
   const reason = BIN + " or a folder above it changed while it was being checked (stat gave two different answers)."
   for (const [a, b] of changed) {
-    const g = M.parseGateRead(a + "again\n" + b + "mountinfo\n" + MI_OK + "end\n")
+    const g = M.parseGateRead(FC_LINE_OFF + a + "again\n" + b + "mountinfo\n" + MI_OK + "end\n")
     assert.deepStrictEqual(g.stats, {}, "nothing of either stat is kept")
     assert.strictEqual(g.mounts, M.GATE_CHANGED)
-    const v = M.ownershipVerdict(BIN, g.stats, g.mounts)
+    const v = M.ownershipVerdict(BIN, g.stats, g.mounts, g.fuseConf)
     assert.deepStrictEqual(v, { ok: false, kind: "mount", reason: reason }, JSON.stringify([a, b]))
     assert.strictEqual(M.setupHelps(v), false, "setup.sh cannot fix a race")
-    assert.deepStrictEqual(M.debugReadArgv(BIN, g.stats, g.mounts, FLAGS), [], "the status read never runs it")
+    assert.deepStrictEqual(M.debugReadArgv(BIN, g.stats, g.mounts, FC_OFF, FLAGS), [], "the status read never runs it")
     // Even with the first stat's answer taken as it stands.
-    assert.strictEqual(M.ownershipVerdict(BIN, M.parseStat(a), g.mounts).ok, false)
-    assert.deepStrictEqual(M.debugReadArgv(BIN, M.parseStat(a), g.mounts, FLAGS), [])
+    assert.strictEqual(M.ownershipVerdict(BIN, M.parseStat(a), g.mounts, FC_OFF).ok, false)
+    assert.deepStrictEqual(M.debugReadArgv(BIN, M.parseStat(a), g.mounts, FC_OFF, FLAGS), [])
   }
   // The changed marker is not a table, whatever else holds it.
   assert.strictEqual(M.parseMountinfo(M.GATE_CHANGED), null)
   assert.ok(M.mountProblem(BIN, { changed: true }).includes("changed while it was being checked"))
   assert.ok(M.mountProblem(BIN, { changed: 1 }).includes("could not be read"))
+})
+
+// ------------------------------------------------------------- fuse.conf
+
+// What every fixture means, the same as setup.sh's parser on them.
+const FC_FIXTURES = { on: true, off: false, commented: false, indented: true, "inline-comment": true, crlf: true,
+  "near-miss": false, empty: false }
+const fcText = (text) => ({ state: "text", text: text })
+const hexLine = (text) => "fuseconf hex " + Buffer.from(text, "latin1").toString("hex") + "\n"
+
+test("fuse.conf: user_allow_other is on only as a line's first token, before any #", () => {
+  assert.strictEqual(M.FUSE_CONF_PATH, "/etc/fuse.conf")
+  assert.strictEqual(M.FUSE_CONF_MAX_BYTES, 65536)
+  for (const [name, on] of Object.entries(FC_FIXTURES)) {
+    assert.strictEqual(M.fuseConfAllowsOther(FC(name)), on, name)
+    assert.strictEqual(M.fuseConfProblem(fcText(FC(name))), on ? M.FUSE_CONF_ON_TEXT : "", name)
+  }
+  assert.strictEqual(M.fuseConfAllowsOther("user_allow_other"), true, "a last line without a newline counts")
+  assert.strictEqual(M.fuseConfAllowsOther("mount_max = 1000\nuser_allow_other"), true)
+  assert.strictEqual(M.fuseConfAllowsOther("\v\f\r user_allow_other\tx\n"), true, "anything after the token is ignored")
+  assert.strictEqual(M.fuseConfAllowsOther("user_allow_other#x\n"), true, "a # right after the token")
+  for (const off of ["", "\n", "#user_allow_other\n", "x #user_allow_other\n", "user_allow_other_\n", "USER_ALLOW_OTHER\n",
+    "user_allow\n", "\u00a0user_allow_other\n", "user-allow-other\n"])
+    assert.strictEqual(M.fuseConfAllowsOther(off), false, JSON.stringify(off))
+})
+
+test("fuse.conf: missing is off; unread, over the cap, a NUL byte or no answer refuses", () => {
+  assert.strictEqual(M.fuseConfProblem({ state: "missing" }), "")
+  assert.strictEqual(M.fuseConfProblem({ state: "unread" }), M.FUSE_CONF_UNREAD_TEXT)
+  assert.strictEqual(M.fuseConfProblem({ state: "over" }), M.FUSE_CONF_ODD_TEXT)
+  assert.strictEqual(M.fuseConfProblem(fcText("a".repeat(65536))), "", "exactly the cap is read")
+  assert.strictEqual(M.fuseConfProblem(fcText("a".repeat(65537))), M.FUSE_CONF_ODD_TEXT, "one byte over")
+  assert.strictEqual(M.fuseConfProblem(fcText("mount_max = 1000\n\u0000\n")), M.FUSE_CONF_ODD_TEXT, "a NUL byte")
+  for (const bad of [undefined, null, "", "missing", 0, [], {}, { state: "text" }, { state: "text", text: 1 }, { state: "on" }])
+    assert.strictEqual(M.fuseConfProblem(bad), M.FUSE_CONF_UNCHECKED_TEXT, JSON.stringify(bad))
+  // The wording: on names the fix; none tells the user to change modes by hand.
+  assert.ok(M.FUSE_CONF_ON_TEXT.startsWith("user_allow_other is turned on in /etc/fuse.conf."))
+  assert.ok(M.FUSE_CONF_ON_TEXT.includes("comment out that line"))
+  for (const t of [M.FUSE_CONF_ON_TEXT, M.FUSE_CONF_UNREAD_TEXT, M.FUSE_CONF_ODD_TEXT, M.FUSE_CONF_UNCHECKED_TEXT])
+    assert.ok(!/chmod|chown|sudo/.test(t), t)
+})
+
+test("fuse.conf: the verdict refuses it as a mount, before the mount table, and Set up backend is not offered", () => {
+  const ok = rootStats(BIN)
+  assert.deepStrictEqual(M.ownershipVerdict(BIN, ok, MI_OK, FC_OFF), { ok: true, kind: "ok", reason: "" })
+  assert.deepStrictEqual(M.ownershipVerdict(BIN, ok, MI_OK, { state: "missing" }), { ok: true, kind: "ok", reason: "" })
+  const cases = [
+    [fcText(FC("on")), M.FUSE_CONF_ON_TEXT],
+    [fcText(FC("crlf")), M.FUSE_CONF_ON_TEXT],
+    [{ state: "unread" }, M.FUSE_CONF_UNREAD_TEXT],
+    [{ state: "over" }, M.FUSE_CONF_ODD_TEXT],
+    [fcText("\u0000"), M.FUSE_CONF_ODD_TEXT],
+    [undefined, M.FUSE_CONF_UNCHECKED_TEXT],
+    [null, M.FUSE_CONF_UNCHECKED_TEXT]
+  ]
+  for (const [fc, reason] of cases) {
+    const v = M.ownershipVerdict(BIN, ok, MI_OK, fc)
+    assert.deepStrictEqual(v, { ok: false, kind: "mount", reason: reason }, JSON.stringify(fc))
+    assert.strictEqual(M.setupHelps(v), false, "setup.sh refuses it too")
+    assert.deepStrictEqual(M.debugReadArgv(BIN, ok, MI_OK, fc, FLAGS), [], "the status read never runs it")
+  }
+  assert.strictEqual(M.ownershipVerdict(BIN, ok, MI_OK).reason, M.FUSE_CONF_UNCHECKED_TEXT, "a caller that passes none refuses")
+  assert.deepStrictEqual(M.debugReadArgv(BIN, ok, MI_OK, FLAGS), [], "the flags in its place refuse too")
+  // After the setting and the user mounts, before the table and stat.
+  const on = fcText(FC("on"))
+  assert.strictEqual(M.ownershipVerdict("relative", ok, MI_OK, on).kind, "invalid")
+  assert.ok(M.ownershipVerdict("/mnt/x/msi-mux-switch", rootStats("/mnt/x/msi-mux-switch"), MI_OK, on).reason.includes("is under /mnt"))
+  assert.strictEqual(M.ownershipVerdict(BIN, {}, null, on).reason, M.FUSE_CONF_ON_TEXT)
+  assert.strictEqual(M.ownershipVerdict(BIN, ok, MI("fuse-ancestor"), on).reason, M.FUSE_CONF_ON_TEXT)
+})
+
+test("gate read: fuse.conf comes first, as one hex line its text cannot break", () => {
+  const frame = (first) => M.parseGateRead(first + ROOT_OK + "again\n" + ROOT_OK + "mountinfo\n" + MI_OK + "end\n")
+  let g = frame("fuseconf missing\n")
+  assert.deepStrictEqual(g.fuseConf, { state: "missing" })
+  assert.deepStrictEqual(g.stats, M.parseStat(ROOT_OK))
+  assert.strictEqual(g.mounts, MI_OK)
+  assert.deepStrictEqual(frame("fuseconf unread\n").fuseConf, { state: "unread" })
+  assert.deepStrictEqual(frame("fuseconf hex \n").fuseConf, fcText(""), "an empty file")
+  for (const name of Object.keys(FC_FIXTURES)) {
+    g = frame(hexLine(FC(name)))
+    assert.deepStrictEqual(g.fuseConf, fcText(FC(name)), name)
+    assert.strictEqual(M.ownershipVerdict(BIN, g.stats, g.mounts, g.fuseConf).ok, !FC_FIXTURES[name], name)
+  }
+  // Text that holds every marker, a stat line and a fuse.conf line of its own
+  // comes through as text and changes nothing else.
+  const tricky = "fuseconf missing\nagain\nmountinfo\nend\n" + ROOT_OK + "again\nunread\nover\nuser_allow_other\n"
+  g = frame(hexLine(tricky))
+  assert.deepStrictEqual(g.fuseConf, fcText(tricky))
+  assert.deepStrictEqual(g.stats, M.parseStat(ROOT_OK))
+  assert.strictEqual(g.mounts, MI_OK)
+  assert.strictEqual(M.ownershipVerdict(BIN, g.stats, g.mounts, g.fuseConf).reason, M.FUSE_CONF_ON_TEXT)
+  // Bytes as bytes: a NUL and a high byte decode to one character each.
+  assert.deepStrictEqual(frame("fuseconf hex 00ff0a\n").fuseConf, fcText("\u0000\u00ff\n"))
+  // Over the cap, judged by the hex's length.
+  assert.deepStrictEqual(frame("fuseconf hex " + "61".repeat(65536) + "\n").fuseConf, fcText("a".repeat(65536)))
+  assert.deepStrictEqual(frame("fuseconf hex " + "61".repeat(65537) + "\n").fuseConf, { state: "over" })
+  // Kept when the two stats differ; the race still refuses.
+  g = M.parseGateRead("fuseconf missing\n" + ROOT_OK + "again\n" + "mountinfo\n" + MI_OK + "end\n")
+  assert.deepStrictEqual([g.stats, g.mounts, g.fuseConf], [{}, M.GATE_CHANGED, { state: "missing" }])
+  // Without the line, or with anything else in its place, nothing is taken.
+  const none = { stats: {}, mounts: null, fuseConf: null }
+  for (const first of ["", "\n", "fuseconf\n", "fuseconf hex\n", "fuseconf hex 6\n", "fuseconf hex 6G\n", "fuseconf hex 6A\n",
+    "fuseconf hex 61 62\n", "fuseconf missing \n", " fuseconf missing\n", "fuseconf Missing\n", "fuseconf on\n",
+    "fuseconf hex 61\r\n", "xfuseconf missing\n"])
+    assert.deepStrictEqual(frame(first), none, JSON.stringify(first))
+  assert.deepStrictEqual(M.parseGateRead("fuseconf missing"), none, "the line unfinished")
+  assert.deepStrictEqual(M.parseGateRead(ROOT_OK + "fuseconf missing\n" + ROOT_OK + "again\n" + ROOT_OK + "mountinfo\n" + MI_OK + "end\n"), none,
+    "only as the first line")
+})
+
+test("gate read: the script reads fuse.conf first, from its own argument, capped", () => {
+  const lines = M.GATE_SCRIPT.split("\n")
+  assert.deepStrictEqual(lines.slice(0, 2), ["f=$1 m=$2 c=$3", "shift 3"])
+  const fuse = lines.findIndex(l => /head -c 65537 -- "\$c"/.test(l))
+  const firstStat = lines.indexOf('stat -c "$f" -- "$@" 2>/dev/null')
+  assert.ok(fuse !== -1 && fuse < firstStat, "fuse.conf before the first stat: the stat-table-stat window is not widened")
+  assert.ok(lines.slice(0, firstStat).every(l => !/printf '%s/.test(l)), "its text is never printed raw")
+  assert.ok(/od -An -v -tx1 \| tr -d ' \\n'/.test(lines[fuse]) && /set -o pipefail/.test(lines[fuse]))
+  assert.strictEqual(M.gateArgv(BIN)[6], M.FUSE_CONF_PATH)
+  assert.ok(!M.GATE_SCRIPT.includes("fuse.conf"), "the path is an argument, not text")
+})
+
+// The gate script run for real, with fuse.conf's argument pointed at a
+// fixture or a scratch file and the scratch folder's own paths stat'ed.
+test("gate read: the real script on every fuse.conf fixture, a missing, an unreadable and an oversize file", () => {
+  const { spawnSync } = require("child_process")
+  const os = require("os")
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "msi-mux-gate-"))
+  try {
+    const bin = path.join(dir, "msi-mux-switch")
+    fs.writeFileSync(bin, "")
+    const gate = (conf) => {
+      const argv = M.gateArgv(bin)
+      assert.strictEqual(argv[6], M.FUSE_CONF_PATH)
+      argv[6] = conf
+      const r = spawnSync(argv[0], argv.slice(1), { encoding: "latin1", timeout: 20000 })
+      assert.strictEqual(r.status, 0, r.stderr)
+      return M.parseGateRead(r.stdout)
+    }
+    const judged = (conf) => {
+      const g = gate(conf)
+      assert.ok(typeof g.mounts === "string" && g.stats[bin], "the rest of the run is read as before")
+      return M.fuseConfProblem(g.fuseConf)
+    }
+    for (const [name, on] of Object.entries(FC_FIXTURES)) {
+      const conf = path.join(pluginDir, "tests/fixtures/fuse-conf-" + name)
+      assert.deepStrictEqual(gate(conf).fuseConf, fcText(fs.readFileSync(conf, "latin1")), name)
+      assert.strictEqual(judged(conf), on ? M.FUSE_CONF_ON_TEXT : "", name)
+    }
+    const put = (name, data) => { fs.writeFileSync(path.join(dir, name), data); return path.join(dir, name) }
+    assert.strictEqual(judged(put("no-newline", "user_allow_other")), M.FUSE_CONF_ON_TEXT, "no final newline")
+    assert.deepStrictEqual(gate(path.join(dir, "absent")).fuseConf, { state: "missing" })
+    assert.strictEqual(judged(path.join(dir, "absent")), "", "missing is off")
+    // A link whose target cannot be reached is not missing: fusermount may
+    // still read it, so it refuses.
+    fs.symlinkSync(path.join(dir, "nowhere"), path.join(dir, "dangling"))
+    assert.deepStrictEqual(gate(path.join(dir, "dangling")).fuseConf, { state: "unread" }, "a dangling symlink")
+    assert.strictEqual(judged(path.join(dir, "dangling")), M.FUSE_CONF_UNREAD_TEXT, "a dangling symlink refuses")
+    fs.symlinkSync("loop-b", path.join(dir, "loop-a"))
+    fs.symlinkSync("loop-a", path.join(dir, "loop-b"))
+    assert.deepStrictEqual(gate(path.join(dir, "loop-a")).fuseConf, { state: "unread" }, "a symlink loop")
+    assert.strictEqual(judged(path.join(dir, "loop-a")), M.FUSE_CONF_UNREAD_TEXT, "a symlink loop refuses")
+    fs.symlinkSync(path.join(pluginDir, "tests/fixtures/fuse-conf-off"), path.join(dir, "linked"))
+    assert.strictEqual(judged(path.join(dir, "linked")), "", "a reachable link is read through")
+    assert.deepStrictEqual(gate(path.join(dir, "absent", "x")).fuseConf, { state: "unread" }, "its folder is not there: cannot tell")
+    fs.mkdirSync(path.join(dir, "adir"))
+    assert.strictEqual(judged(path.join(dir, "adir")), M.FUSE_CONF_UNREAD_TEXT, "a directory")
+    assert.deepStrictEqual(gate(put("exact", "a".repeat(65536))).fuseConf, fcText("a".repeat(65536)), "exactly the cap")
+    assert.deepStrictEqual(gate(put("big", "a".repeat(65537))).fuseConf, { state: "over" }, "one byte over")
+    assert.strictEqual(judged(put("huge", "#\n".repeat(200000) + "user_allow_other\n")), M.FUSE_CONF_ODD_TEXT, "far over")
+    assert.strictEqual(judged(put("nul", "mount_max = 1000\n\0user_allow_other\n")), M.FUSE_CONF_ODD_TEXT, "a NUL byte")
+    const markers = put("markers", "again\nmountinfo\nend\nfuseconf missing\n")
+    assert.strictEqual(gate(markers).mounts.length > 0 && judged(markers), "", "markers in the file break nothing")
+    if (process.getuid && process.getuid() === 0) {
+      console.log("     (skipped the unreadable case: running as uid 0 reads a mode-000 file)")
+    } else {
+      const locked = put("locked", FC("off"))
+      fs.chmodSync(locked, 0o000)
+      assert.deepStrictEqual(gate(locked).fuseConf, { state: "unread" })
+      assert.strictEqual(judged(locked), M.FUSE_CONF_UNREAD_TEXT, "exists but cannot be read")
+      const shut = path.join(dir, "shut")
+      fs.mkdirSync(shut)
+      fs.writeFileSync(path.join(shut, "fuse.conf"), FC("on"))
+      fs.chmodSync(shut, 0o600)
+      assert.deepStrictEqual(gate(path.join(shut, "fuse.conf")).fuseConf, { state: "unread" }, "an unsearchable folder: cannot tell")
+      fs.symlinkSync(path.join(shut, "fuse.conf"), path.join(dir, "into-shut"))
+      assert.deepStrictEqual(gate(path.join(dir, "into-shut")).fuseConf, { state: "unread" }, "a link into an unsearchable folder")
+      assert.strictEqual(judged(path.join(dir, "into-shut")), M.FUSE_CONF_UNREAD_TEXT, "a link into an unsearchable folder refuses")
+      fs.symlinkSync(path.join(shut, "absent"), path.join(dir, "into-shut-absent"))
+      assert.deepStrictEqual(gate(path.join(dir, "into-shut-absent")).fuseConf, { state: "unread" },
+        "a link to a name that may not exist, in an unsearchable folder")
+      fs.chmodSync(shut, 0o700)
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 // ---------------------------------------------------------------- commands
@@ -478,8 +687,8 @@ test("argv: the debug read, as the user, with the hardware's flags, under a time
 
 test("argv: the debug read runs the binary only when it passes the switch's ownership gate", () => {
   const ok = M.parseStat(ROOT_OK)
-  assert.deepStrictEqual(M.debugReadArgv(BIN, ok, MI_OK, FLAGS), M.debugArgv(BIN, FLAGS), "root-owned: the usual argv")
-  assert.deepStrictEqual(M.debugReadArgv(BIN, ok, MI_OK, []), M.debugArgv(BIN, []))
+  assert.deepStrictEqual(M.debugReadArgv(BIN, ok, MI_OK, FC_OFF, FLAGS), M.debugArgv(BIN, FLAGS), "root-owned: the usual argv")
+  assert.deepStrictEqual(M.debugReadArgv(BIN, ok, MI_OK, FC_OFF, []), M.debugArgv(BIN, []))
   const refused = {
     "owned by uid 1000": replaceLine(ROOT_OK, BIN, st(1000, "81ed", "raul", BIN)),
     "group-writable binary": replaceLine(ROOT_OK, BIN, st(0, "81fd", "root", BIN)),
@@ -491,19 +700,19 @@ test("argv: the debug read runs the binary only when it passes the switch's owne
     "missing binary": ROOT_OK.split("\n").filter(l => !l.endsWith("\t" + BIN)).join("\n")
   }
   for (const [why, text] of Object.entries(refused)) {
-    assert.strictEqual(M.ownershipVerdict(BIN, M.parseStat(text), MI_OK).ok, false, why)
-    assert.deepStrictEqual(M.debugReadArgv(BIN, M.parseStat(text), MI_OK, FLAGS), [], why)
+    assert.strictEqual(M.ownershipVerdict(BIN, M.parseStat(text), MI_OK, FC_OFF).ok, false, why)
+    assert.deepStrictEqual(M.debugReadArgv(BIN, M.parseStat(text), MI_OK, FC_OFF, FLAGS), [], why)
   }
   for (const m of M.USER_MOUNTS) {
     const p = m + "/x/msi-mux-switch"
     const all = M.parseStat([st(0, "81ed", "root", p)].concat(M.ancestorDirs(p).map(d => st(0, "41ed", "root", d))).join("\n"))
-    assert.deepStrictEqual(M.debugReadArgv(p, all, MI_OK, FLAGS), [], p + ": a user mount, whatever stat says")
+    assert.deepStrictEqual(M.debugReadArgv(p, all, MI_OK, FC_OFF, FLAGS), [], p + ": a user mount, whatever stat says")
   }
-  assert.deepStrictEqual(M.debugReadArgv(BIN, {}, MI_OK, FLAGS), [], "no stat, no read")
-  assert.deepStrictEqual(M.debugReadArgv(BIN, undefined, MI_OK, FLAGS), [])
-  assert.deepStrictEqual(M.debugReadArgv(BIN, ok, null, FLAGS), [], "no mount table, no read")
-  assert.deepStrictEqual(M.debugReadArgv(BIN, ok, MI("fuse-ancestor"), FLAGS), [], "a FUSE mount on the way, no read")
-  assert.deepStrictEqual(M.debugReadArgv("relative/msi-mux-switch", ok, MI_OK, FLAGS), [])
+  assert.deepStrictEqual(M.debugReadArgv(BIN, {}, MI_OK, FC_OFF, FLAGS), [], "no stat, no read")
+  assert.deepStrictEqual(M.debugReadArgv(BIN, undefined, MI_OK, FC_OFF, FLAGS), [])
+  assert.deepStrictEqual(M.debugReadArgv(BIN, ok, null, FC_OFF, FLAGS), [], "no mount table, no read")
+  assert.deepStrictEqual(M.debugReadArgv(BIN, ok, MI("fuse-ancestor"), FC_OFF, FLAGS), [], "a FUSE mount on the way, no read")
+  assert.deepStrictEqual(M.debugReadArgv("relative/msi-mux-switch", ok, MI_OK, FC_OFF, FLAGS), [])
 })
 
 test("argv: pkexec switch, exact array, no shell", () => {
@@ -1829,10 +2038,10 @@ test("debug read: only through the ownership gate, on the stat taken right befor
   for (const file of qmlFiles) {
     assert.ok(!/Model\.debugArgv\(|Model\.debugCommand\(|Model\.binaryPresent\(/.test(qmlCode(file)), file + " builds an ungated debug read")
   }
-  const fn = state.slice(state.indexOf("function readDebug(stats, mounts)"))
+  const fn = state.slice(state.indexOf("function readDebug(stats, mounts, fuseConf)"))
   const body = fn.slice(0, fn.indexOf("\n  }\n"))
-  assert.ok(body.length > 0 && state.indexOf("function readDebug(stats, mounts)") !== -1, "readDebug(stats, mounts)")
-  assert.ok(/var argv = Model\.debugReadArgv\(root\.binaryPath, stats, mounts, root\.hardware\.flags\)\s*if \(argv\.length === 0\) \{\s*root\.debug = Model\.emptyDebug\(\)\s*return\s*\}/.test(body),
+  assert.ok(body.length > 0 && state.indexOf("function readDebug(stats, mounts, fuseConf)") !== -1, "readDebug(stats, mounts, fuseConf)")
+  assert.ok(/var argv = Model\.debugReadArgv\(root\.binaryPath, stats, mounts, fuseConf, root\.hardware\.flags\)\s*if \(argv\.length === 0\) \{\s*root\.debug = Model\.emptyDebug\(\)\s*return\s*\}/.test(body),
     "gated first; a refused binary leaves no earlier read's state")
   assert.ok(body.indexOf("Model.debugReadArgv") < body.indexOf("debugProc.running = true"))
   assert.ok(body.indexOf("Model.debugReadArgv") < body.indexOf("root.debugAgain = true"), "a read waits only once it passed")
@@ -1840,12 +2049,12 @@ test("debug read: only through the ownership gate, on the stat taken right befor
   assert.strictEqual((state.match(/debugProc\.running = true/g) || []).length, 1, "the debug read starts in one place")
   // Called from one place: the end of the stat, with that stat's result.
   assert.strictEqual((state.match(/root\.readDebug\(/g) || []).length, 1, "readDebug has one caller")
-  assert.ok(/var gate = Model\.parseGateRead\(text\)\s*root\.mounts = gate\.mounts\s*root\.stats = gate\.stats\s*root\.statRead = true\s*root\.readDebug\(root\.stats, root\.mounts\)/.test(state))
+  assert.ok(/var gate = Model\.parseGateRead\(text\)\s*root\.mounts = gate\.mounts\s*root\.fuseConf = gate\.fuseConf\s*root\.stats = gate\.stats\s*root\.statRead = true\s*root\.readDebug\(root\.stats, root\.mounts, root\.fuseConf\)/.test(state))
   // Both gate reads are the one stat-and-mounts run, fresh every time.
   assert.ok(!/Model\.statArgv\(|Model\.parseStat\(/.test(state), "no stat without the mount table")
   assert.strictEqual((state.match(/Model\.gateArgv\(root\.binaryPath\)/g) || []).length, 2, "the status read and the switch")
   assert.ok(/checkStat\.result = Model\.parseGateRead\(text\)/.test(state))
-  assert.ok(/readonly property var ownership: root\.statRead\s*\? Model\.ownershipVerdict\(root\.binaryPath, root\.stats, root\.mounts\)/.test(state))
+  assert.ok(/readonly property var ownership: root\.statRead\s*\? Model\.ownershipVerdict\(root\.binaryPath, root\.stats, root\.mounts, root\.fuseConf\)/.test(state))
   // Every read asked for again goes through a new stat.
   assert.ok(/root\.debugAgain = false\s*root\.checkBinary\(\)\s*\}\)/.test(state), "after a read ends")
   const fin = state.slice(state.indexOf("function finish(outcome)"))
@@ -1860,7 +2069,7 @@ test("debug read: only through the ownership gate, on the stat taken right befor
   // The switch's own stat refusing the binary drops the earlier read too.
   const ss = state.slice(state.indexOf("function startSwitch()"))
   const ssBody = ss.slice(0, ss.indexOf("\n  }\n"))
-  assert.ok(/var gate = checkStat\.result\s*root\.mounts = gate\.mounts\s*root\.stats = gate\.stats\s*var verdict = Model\.ownershipVerdict\(root\.binaryPath, gate\.stats, gate\.mounts\)\s*if \(!verdict\.ok\) \{\s*root\.debug = Model\.emptyDebug\(\)\s*return root\.refused\(/.test(ssBody),
+  assert.ok(/var gate = checkStat\.result\s*root\.mounts = gate\.mounts\s*root\.fuseConf = gate\.fuseConf\s*root\.stats = gate\.stats\s*var verdict = Model\.ownershipVerdict\(root\.binaryPath, gate\.stats, gate\.mounts, gate\.fuseConf\)\s*if \(!verdict\.ok\) \{\s*root\.debug = Model\.emptyDebug\(\)\s*return root\.refused\(/.test(ssBody),
     "a refused pre-switch stat clears the debug read")
   assert.ok(!/\bpresent\b/.test(state), "no ungated presence flag")
   const bar = qmlCode("BarWidget.qml")
@@ -1880,7 +2089,7 @@ test("flag memory: remembered at the refusal, decided again on every read and bo
   assert.ok(/bootProc\.command = Model\.bootIdArgv\(\)/.test(state))
   assert.ok(/onStreamFinished: root\.bootId = Model\.parseBootId\(text\)/.test(state))
   // Read again with every debug read.
-  const fn = state.slice(state.indexOf("function readDebug(stats, mounts)"))
+  const fn = state.slice(state.indexOf("function readDebug(stats, mounts, fuseConf)"))
   const body = fn.slice(0, fn.indexOf("\n  }\n"))
   assert.ok(body.indexOf("debugProc.running = true") < body.indexOf("root.readBootId()"))
   const req = state.slice(state.indexOf("function requestSwitch("))
@@ -1895,7 +2104,7 @@ test("manifest: identity, version and the settings schema", () => {
   assert.strictEqual(m.id, "io.github.rsd.msi-mux")
   assert.strictEqual(m.id, M.PLUGIN_ID)
   assert.strictEqual(m.name, "MSI GPU MUX")
-  assert.strictEqual(m.version, "0.2.9")
+  assert.strictEqual(m.version, "0.2.10")
   assert.strictEqual(m.license, "MIT")
   assert.deepStrictEqual(m.kinds, ["bar-widget"])
   assert.deepStrictEqual(m.entryPoints, { barWidget: "BarWidget.qml" })
@@ -1921,6 +2130,7 @@ const SHIPPED = ["BarWidget.qml", "LICENSE", "Model.js", "MuxState.qml", "README
   "tests/fixtures/fake-msi-mux-switch-flood", "tests/fixtures/fake-msi-mux-switch-hang",
   ...["empty", "ext4-root", "fuse-ancestor", "fuse-exact", "fuseblk-folder", "malformed", "sibling", "space", "user-id"]
     .map(n => "tests/fixtures/mountinfo-" + n),
+  ...["commented", "crlf", "empty", "indented", "inline-comment", "near-miss", "off", "on"].map(n => "tests/fixtures/fuse-conf-" + n),
   "tests/model-test.js", "tests/qmllint-check.js", "tests/run.sh", "tests/setup-test.sh"]
 
 test("layout: every shipped file is there, none a symlink; tests/ holds only them", () => {
