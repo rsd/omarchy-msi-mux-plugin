@@ -17,12 +17,18 @@ import "Model.js" as Model
 //   - the gate read (Model.gateArgv): /etc/fuse.conf (bounded, sent back as
 //     hex), stat of the binary and every directory above it, the mount
 //     table (/proc/self/mountinfo, bounded) and the same stat again, in one
-//     run: after the DMI read, when the binary path changes, on a panel
-//     opening, before every debug read, and again right before a switch
-//     (Model.ownershipVerdict, which also refuses user_allow_other turned
-//     on in fuse.conf or a fuse.conf that could not be checked, a FUSE or
-//     user_id mount on the binary's way, and a read whose two stats
-//     differ).
+//     run: after the DMI read, when the binary path setting changes, on a
+//     panel opening, before every debug read, and again right before a
+//     switch (Model.ownershipVerdict, through Model.binaryVerdict, which
+//     also refuses user_allow_other turned on in fuse.conf or a fuse.conf
+//     that could not be checked, a FUSE or user_id mount on the binary's
+//     way, and a read whose two stats differ). Which binary: the path set
+//     in the settings, gated alone; with none set (auto), the status read
+//     gates Model.USR_BINARY first and, only when that read says nothing is
+//     there (Model.autoChoice), Model.OPT_BINARY in a second run. binaryPath
+//     becomes the chosen path together with that path's own gate result, so
+//     the binary run is always the one that just passed; the switch gates
+//     binaryPath again and does not choose anew.
 //   - the read-only state read, `<binary> --debug --json [flags]` as the
 //     user (Model.debugReadArgv): only at the end of a gate read
 //     (checkBinary), on available hardware, and only if that read passes the
@@ -67,8 +73,12 @@ Singleton {
   readonly property string pluginDir: Model.pluginDirFromUrl(Qt.resolvedUrl("manifest.json"))
   readonly property string envFilePath: Model.envFilePath(root.home)
 
-  // The binary path from the widget's setting (Model.binaryPathSetting).
-  property string binaryPath: Model.DEFAULT_BINARY
+  // The widget's setting (Model.binaryPathSetting: "" is auto), and the
+  // binary the last finished status read chose and gated: the setting when
+  // one is set, else Model.USR_BINARY or Model.OPT_BINARY; "" until an
+  // auto read has chosen.
+  property string binarySetting: ""
+  property string binaryPath: ""
 
   // DMI and the hardware decision.
   property bool dmiRead: false
@@ -83,7 +93,7 @@ Singleton {
   property var mounts: null
   property var fuseConf: null
   readonly property var ownership: root.statRead
-    ? Model.ownershipVerdict(root.binaryPath, root.stats, root.mounts, root.fuseConf)
+    ? Model.binaryVerdict(root.binarySetting, root.binaryPath, root.stats, root.mounts, root.fuseConf)
     : { ok: false, kind: "", reason: "Checking the backend…" }
   // No debug read can run: the hardware is not validated, or the last stat
   // refused the binary (the panel shows the mode as unknown).
@@ -94,7 +104,7 @@ Singleton {
   readonly property string unavailableReason: root.hardware.state === "unavailable" ? root.hardware.reason
     : (root.ownership.ok ? "" : root.ownership.reason)
   readonly property bool available: root.dmiRead && root.hardware.state === "available" && root.ownership.ok
-  readonly property bool canSetUp: root.hardware.state === "available" && Model.setupHelps(root.ownership)
+  readonly property bool canSetUp: root.hardware.state === "available" && Model.setupHelps(root.ownership, root.binaryPath)
     && root.pluginDir !== ""
 
   // The last debug read (Model.parseDebugRead); empty while the binary is
@@ -160,10 +170,14 @@ Singleton {
     root.releaseOpen(owner)
   }
 
+  // A new setting drops what the last one chose: a set path is the binary
+  // at once; in auto none is until the status read chose one.
   function setBinaryPath(path) {
     var p = Model.binaryPathSetting(path)
-    if (p === root.binaryPath) return
+    if (p === root.binarySetting) return
+    root.binarySetting = p
     root.binaryPath = p
+    root.statNext = ""
     root.statRead = false
     root.stats = ({})
     root.mounts = null
@@ -226,43 +240,86 @@ Singleton {
   }
 
   property bool statAgain: false
+  // The auto read's second path (Model.OPT_BINARY), waiting for the first
+  // run to end; "" for none. A new read or setting drops it.
+  property string statNext: ""
+  // Numbers each status gate run, so only the newest one's end is taken.
+  property int statRuns: 0
 
   function checkBinary() {
     if (!root.dmiRead || root.hardware.state !== "available") return
     if (statProc.running) { root.statAgain = true; return }
-    var argv = Model.gateArgv(root.binaryPath)
+    root.statNext = ""
+    root.gateCandidate(Model.firstCandidate(root.binarySetting))
+  }
+
+  // One status gate run on `path`, a candidate for the current setting.
+  function gateCandidate(path) {
+    var argv = Model.gateArgv(path)
     if (argv.length === 0) {
-      root.stats = ({})
-      root.mounts = null
-      root.fuseConf = null
-      root.statRead = true
-      root.debug = Model.emptyDebug()
+      root.chosen(path, { stats: ({}), mounts: null, fuseConf: null })
       return
     }
-    statProc.path = root.binaryPath
+    statProc.path = path
+    statProc.setting = root.binarySetting
+    statProc.run = ++root.statRuns
     statProc.command = argv
     statProc.running = true
+  }
+
+  // The auto read's second run, once the first has ended (whichever of its
+  // stream end and its exit comes last starts it).
+  function gateNext() {
+    if (root.statNext === "" || statProc.running) return
+    var p = root.statNext
+    root.statNext = ""
+    root.gateCandidate(p)
+  }
+
+  // The chosen path and its own gate read, set together; what was read for
+  // another path is dropped only when the path changes, so a read again of
+  // the same binary does not flash "Checking the backend…".
+  function chosen(path, gate) {
+    if (path !== root.binaryPath) {
+      root.binaryPath = path
+      root.debug = Model.emptyDebug()
+    }
+    root.mounts = gate.mounts
+    root.fuseConf = gate.fuseConf
+    root.stats = gate.stats
+    root.statRead = true
+    root.readDebug(root.stats, root.mounts, root.fuseConf)
   }
 
   Process {
     id: statProc
     property string path: ""
+    property string setting: ""
+    property int run: 0
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        if (statProc.path !== root.binaryPath) return
+        // Stale: the setting changed, or a newer read is asked for.
+        if (statProc.setting !== root.binarySetting || statProc.run !== root.statRuns || root.statAgain) return
         var gate = Model.parseGateRead(text)
-        root.mounts = gate.mounts
-        root.fuseConf = gate.fuseConf
-        root.stats = gate.stats
-        root.statRead = true
-        root.readDebug(root.stats, root.mounts, root.fuseConf)
+        var next = Model.autoChoice(statProc.setting, statProc.path, gate)
+        if (next !== "") {
+          root.statNext = next
+          if (!statProc.running) Qt.callLater(root.gateNext)
+          return
+        }
+        root.chosen(statProc.path, gate)
       }
     }
     onRunningChanged: {
-      if (statProc.running || !root.statAgain) return
-      root.statAgain = false
-      Qt.callLater(root.checkBinary)
+      if (statProc.running) return
+      if (root.statAgain) {
+        root.statAgain = false
+        root.statNext = ""
+        Qt.callLater(root.checkBinary)
+        return
+      }
+      if (root.statNext !== "") Qt.callLater(root.gateNext)
     }
   }
 
@@ -488,7 +545,7 @@ Singleton {
     root.mounts = gate.mounts
     root.fuseConf = gate.fuseConf
     root.stats = gate.stats
-    var verdict = Model.ownershipVerdict(root.binaryPath, gate.stats, gate.mounts, gate.fuseConf)
+    var verdict = Model.binaryVerdict(root.binarySetting, root.binaryPath, gate.stats, gate.mounts, gate.fuseConf)
     if (!verdict.ok) {
       root.debug = Model.emptyDebug()
       return root.refused(verdict.reason + " Nothing was run.")

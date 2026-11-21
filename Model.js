@@ -8,7 +8,13 @@
 
 var PLUGIN_ID = "io.github.rsd.msi-mux"
 var DISPLAY_NAME = "MSI GPU MUX"
-var DEFAULT_BINARY = "/opt/msi-mux-switch/msi-mux-switch"
+// Where msi-mux-switch is looked for when the binaryPath setting is empty
+// ("auto", binaryPathSetting): the msi-gpu-mux-switch(-bin) packages'
+// /usr/bin first, then the /opt folder setup.sh makes safe for a binary
+// built or downloaded by hand (autoChoice).
+var USR_BINARY = "/usr/bin/msi-mux-switch"
+var OPT_BINARY = "/opt/msi-mux-switch/msi-mux-switch"
+var PACKAGE_NAME = "msi-gpu-mux-switch"
 var UPSTREAM_URL = "https://github.com/steelbrain/msi-gpu-mux-switch"
 
 // --------------------------------------------------------------------- modes
@@ -169,10 +175,54 @@ function binaryPathProblem(path) {
   return ""
 }
 
-// The setting as the widget reads it: a non-string or empty value is the
-// default.
+// The setting as the widget reads it: "" (auto: firstCandidate, then
+// autoChoice) for a non-string or empty value, else the value as given, which
+// always wins (a bad one is refused, never replaced).
 function binaryPathSetting(value) {
-  return typeof value === "string" && value !== "" ? value : DEFAULT_BINARY
+  return typeof value === "string" ? value : ""
+}
+
+// The path the status read gates first: the setting, or in auto USR_BINARY.
+function firstCandidate(setting) {
+  return binaryPathSetting(setting) !== "" ? String(setting) : USR_BINARY
+}
+
+// Whether a gate read of USR_BINARY (parseGateRead) says, definitively, that
+// nothing is there: the read finished whole (fuse.conf line, the same stats
+// twice, the mount table read), stat printed every folder above it as a
+// directory owned by root and searchable by others, and printed nothing
+// else: no line for USR_BINARY, and no line for any path that is not one of
+// those folders. stat reports a symlink as itself (never -L), so a link at
+// that name, dangling or not, counts as present, and so does anything else
+// stat printed there. The gate script discards stat's errors, so a folder
+// the user cannot search (EACCES) or a loop (ELOOP) would also print nothing
+// for USR_BINARY: hence the owner and search-bit check on the folders, and
+// doubt counts as present. A read shaped any other way (another path's read
+// credited to this one by a late stream end, garbled, cut short, the stats
+// changed, a folder above it missing, not a directory, not root's or not
+// searchable) is not "absent".
+function autoCandidateAbsent(gate) {
+  if (!gate || gate.fuseConf === null || gate.fuseConf === undefined) return false
+  if (typeof gate.mounts !== "string") return false
+  var s = gate.stats || {}
+  var dirs = ancestorDirs(USR_BINARY)
+  for (var k in s)
+    if (Object.prototype.hasOwnProperty.call(s, k) && dirs.indexOf(k) === -1) return false
+  for (var i = 0; i < dirs.length; i++) {
+    var d = s[dirs[i]]
+    if (!d || d.type !== "dir" || d.uid !== 0 || (d.mode & 0x1) === 0) return false
+  }
+  return true
+}
+
+// After a status gate read of `path` for `setting`: "" when `path` is the
+// one chosen (its verdict stands, whatever it is), else the next path to
+// gate. Only in auto, only from USR_BINARY, and only when it is absent
+// (autoCandidateAbsent) does it move on to OPT_BINARY: a /usr/bin binary
+// that is there but fails the gate is refused, never skipped.
+function autoChoice(setting, path, gate) {
+  if (binaryPathSetting(setting) !== "" || path !== USR_BINARY) return ""
+  return autoCandidateAbsent(gate) ? OPT_BINARY : ""
 }
 
 // Every ancestor directory of a valid path, nearest first, ending with "/".
@@ -234,6 +284,9 @@ function userMountOf(path) {
     if (p === USER_MOUNTS[i] || p.indexOf(USER_MOUNTS[i] + "/") === 0) return USER_MOUNTS[i]
   return ""
 }
+
+// The advice after a mount refusal: the two places auto looks.
+var INSTALL_HINT = "Install msi-mux-switch at " + USR_BINARY + " (the " + PACKAGE_NAME + " package) or " + OPT_BINARY + "."
 
 // The mount table, as the kernel writes it (proc(5)), one line per mount:
 //   id parent maj:min root mountpoint mountopts [optional...] - fstype source superopts
@@ -317,7 +370,7 @@ function foreignUserId(entry) {
 // table without it is not the kernel's).
 function mountProblem(path, mountinfo) {
   var p = String(path)
-  var tail = ", which another account may control. Install msi-mux-switch somewhere like " + DEFAULT_BINARY + "."
+  var tail = ", which another account may control. " + INSTALL_HINT
   if (isGateChanged(mountinfo))
     return p + " or a folder above it changed while it was being checked (stat gave two different answers)."
   if (typeof mountinfo !== "string") return p + " could not be checked: " + MOUNTINFO_PATH + " could not be read."
@@ -516,7 +569,7 @@ function ownershipVerdict(path, stats, mounts, fuseConf) {
   var mount = userMountOf(path)
   if (mount !== "")
     return { ok: false, kind: "mount", reason: String(path) + " is under " + mount
-      + ", where a user can mount or replace files. Install msi-mux-switch somewhere like " + DEFAULT_BINARY + "." }
+      + ", where a user can mount or replace files. " + INSTALL_HINT }
   var fuse = fuseConfProblem(fuseConf)
   if (fuse !== "") return { ok: false, kind: "mount", reason: fuse }
   var mounted = mountProblem(path, mounts)
@@ -545,11 +598,36 @@ function ownershipVerdict(path, stats, mounts, fuseConf) {
   return { ok: true, kind: "ok", reason: "" }
 }
 
+// ownershipVerdict as the panel and the switch show it: the same ok and
+// kind, the reason worded for where the path came from. In auto (`setting`
+// "") a missing OPT_BINARY was reached only because USR_BINARY was absent,
+// so both places are named; a USR_BINARY file with the wrong owner or mode
+// is the package's, fixed by reinstalling it.
+var REINSTALL_HINT = "Reinstall the " + PACKAGE_NAME + " package."
+
+function binaryVerdict(setting, path, stats, mounts, fuseConf) {
+  var v = ownershipVerdict(path, stats, mounts, fuseConf)
+  if (v.kind === "missing" && binaryPathSetting(setting) === "" && String(path) === OPT_BINARY)
+    return { ok: false, kind: "missing", reason: "msi-mux-switch was not found at " + USR_BINARY + " or " + OPT_BINARY + "." }
+  if (String(path) === USR_BINARY && (v.kind === "owner" || v.kind === "mode"))
+    return { ok: false, kind: v.kind, reason: v.reason + " " + REINSTALL_HINT }
+  return v
+}
+
 // Set up backend helps with every ownership problem except a bad setting or
 // a mount (a user mount, user_allow_other on or fuse.conf unchecked, a mount
 // another account may control, or a mount table that could not be checked):
-// setup.sh refuses those too.
-function setupHelps(verdict) {
+// setup.sh refuses those too. Never for a path under /usr/, /bin/ or /sbin/
+// (USR_BINARY included): package-managed system folders, full of other
+// files, that setup.sh refuses to change (on Arch /bin and /sbin are links
+// into /usr, so their verdict is "ancestor", which setup.sh cannot fix
+// either). Still offered for /opt and any other custom folder.
+var SYSTEM_PREFIXES = ["/usr/", "/bin/", "/sbin/"]
+
+function setupHelps(verdict, path) {
+  var p = String(path)
+  for (var i = 0; i < SYSTEM_PREFIXES.length; i++)
+    if (p.indexOf(SYSTEM_PREFIXES[i]) === 0) return false
   return !!verdict && !verdict.ok && verdict.kind !== "invalid" && verdict.kind !== "mount" && verdict.kind !== ""
 }
 

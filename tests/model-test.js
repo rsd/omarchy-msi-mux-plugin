@@ -121,12 +121,19 @@ test("binary path: absolute, no .., no newline, no empty or . segment", () => {
     assert.deepStrictEqual(M.debugArgv(bad, []), [])
     assert.deepStrictEqual(M.switchArgv(bad, "discrete", []), [])
   }
-  assert.strictEqual(M.binaryPathSetting(""), BIN)
-  assert.strictEqual(M.binaryPathSetting(undefined), BIN)
-  assert.strictEqual(M.binaryPathSetting(42), BIN)
+  // "" is auto: firstCandidate and autoChoice pick the path.
+  assert.strictEqual(M.binaryPathSetting(""), "")
+  assert.strictEqual(M.binaryPathSetting(undefined), "")
+  assert.strictEqual(M.binaryPathSetting(null), "")
+  assert.strictEqual(M.binaryPathSetting(42), "")
   assert.strictEqual(M.binaryPathSetting("/usr/local/bin/msi-mux-switch"), "/usr/local/bin/msi-mux-switch")
-  // A bad setting is kept as given (and refused), never replaced by the default.
+  assert.strictEqual(M.binaryPathSetting(BIN), BIN)
+  // A bad setting is kept as given (and refused), never replaced by auto.
   assert.strictEqual(M.binaryPathSetting("relative"), "relative")
+  assert.strictEqual(M.binaryPathSetting(" "), " ")
+  assert.strictEqual(M.USR_BINARY, "/usr/bin/msi-mux-switch")
+  assert.strictEqual(M.OPT_BINARY, BIN)
+  assert.ok(!("DEFAULT_BINARY" in M), "no single default any more")
 })
 
 test("binary path: every ancestor up to /, and stat as an argv array without -L", () => {
@@ -249,6 +256,173 @@ test("ownership: a binary under a user mount is refused, whatever stat says", ()
   assert.strictEqual(M.userMountOf(BIN), "")
 })
 
+// ---------------------------------------------------- choosing the binary
+
+const USR = "/usr/bin/msi-mux-switch"
+// The packages' install: a root-owned 0755 file in root-owned /usr/bin.
+const USR_OK = [
+  st(0, "81ed", "root", USR),
+  st(0, "41ed", "root", "/usr/bin"),
+  st(0, "41ed", "root", "/usr"),
+  st(0, "416d", "root", "/")
+].join("\n") + "\n"
+const without = (text, name) => text.split("\n").filter(l => !l.endsWith("\t" + name)).join("\n")
+// Nothing at /usr/bin/msi-mux-switch, the folders as stat prints them.
+const USR_ABSENT = without(USR_OK, USR)
+const OPT_MISSING = without(ROOT_OK, BIN)
+// A whole gate read (the script's output) of these stat lines.
+const gateRead = (stats, tail) => M.parseGateRead(FC_LINE_OFF + stats + "again\n" + stats + "mountinfo\n" + (tail === undefined ? MI_OK + "end\n" : tail))
+// What the status read does, as MuxState sequences it: gate the first
+// candidate; in auto, move on only when autoChoice says so; the verdict is
+// the chosen path's own read's. `reads` maps a path to its gate read; a path
+// the sequence never reached is never read.
+const choose = (setting, reads) => {
+  const seen = []
+  const gateOf = (p) => { seen.push(p); return reads[p] || gateRead("") }
+  let p = M.firstCandidate(setting)
+  let g = gateOf(p)
+  const next = M.autoChoice(setting, p, g)
+  if (next !== "") { p = next; g = gateOf(p) }
+  const v = M.binaryVerdict(setting, p, g.stats, g.mounts, g.fuseConf)
+  return { path: p, seen, v, setup: M.setupHelps(v, p) }
+}
+
+test("binary choice: a set path is the only one gated; auto starts at /usr/bin", () => {
+  assert.strictEqual(M.firstCandidate(""), USR)
+  assert.strictEqual(M.firstCandidate(undefined), USR)
+  assert.strictEqual(M.firstCandidate(42), USR)
+  assert.strictEqual(M.firstCandidate("/x/msi-mux-switch"), "/x/msi-mux-switch")
+  assert.strictEqual(M.firstCandidate("relative"), "relative", "kept, and refused as invalid")
+  // A set path never moves on, not even a set /usr/bin with nothing there.
+  for (const set of ["/x/msi-mux-switch", USR, BIN, "relative"])
+    assert.strictEqual(M.autoChoice(set, M.firstCandidate(set), gateRead(USR_ABSENT)), "", set)
+  const c = choose(BIN, { [BIN]: gateRead(ROOT_OK), [USR]: gateRead(USR_OK) })
+  assert.deepStrictEqual([c.path, c.seen, c.v.ok], [BIN, [BIN], true], "the setting wins over a passing /usr/bin")
+  const u = choose(USR, { [USR]: gateRead(USR_ABSENT), [BIN]: gateRead(ROOT_OK) })
+  assert.deepStrictEqual([u.path, u.seen, u.v.kind], [USR, [USR], "missing"])
+  assert.strictEqual(u.v.reason, "msi-mux-switch was not found at " + USR + ".", "only the set path is named")
+  // A set /opt path that is missing names only itself too.
+  const o = choose(BIN, { [BIN]: gateRead(OPT_MISSING) })
+  assert.strictEqual(o.v.reason, "msi-mux-switch was not found at " + BIN + ".")
+  assert.strictEqual(o.setup, true)
+})
+
+test("binary choice: auto picks /usr/bin when present, else /opt, and names both when neither is", () => {
+  let c = choose("", { [USR]: gateRead(USR_OK) })
+  assert.deepStrictEqual([c.path, c.seen, c.v], [USR, [USR], { ok: true, kind: "ok", reason: "" }], "/usr/bin only")
+  c = choose("", { [USR]: gateRead(USR_ABSENT), [BIN]: gateRead(ROOT_OK) })
+  assert.deepStrictEqual([c.path, c.seen, c.v.ok], [BIN, [USR, BIN], true], "/opt only")
+  c = choose("", { [USR]: gateRead(USR_OK), [BIN]: gateRead(ROOT_OK) })
+  assert.deepStrictEqual([c.path, c.seen, c.v.ok], [USR, [USR], true], "both: /usr/bin, and /opt is never read")
+  c = choose("", { [USR]: gateRead(USR_ABSENT), [BIN]: gateRead(OPT_MISSING) })
+  assert.deepStrictEqual([c.path, c.seen, c.v], [BIN, [USR, BIN], { ok: false, kind: "missing",
+    reason: "msi-mux-switch was not found at /usr/bin/msi-mux-switch or /opt/msi-mux-switch/msi-mux-switch." }], "neither")
+  assert.strictEqual(c.setup, true, "Set up backend is still offered for /opt")
+  // The chosen /opt is judged on its own read, like any path.
+  c = choose("", { [USR]: gateRead(USR_ABSENT), [BIN]: gateRead(replaceLine(ROOT_OK, BIN, st(1000, "81ed", "raul", BIN))) })
+  assert.deepStrictEqual([c.path, c.v.kind, c.v.reason, c.setup], [BIN, "owner", BIN + " is owned by raul, not root.", true])
+  // The debug read runs only the path whose own read passed.
+  assert.deepStrictEqual(M.debugReadArgv(BIN, gateRead(USR_ABSENT).stats, MI_OK, FC_OFF, FLAGS), [])
+})
+
+test("binary choice: anything at /usr/bin, or any doubt about it, keeps /usr/bin and its refusal", () => {
+  const present = {
+    "user-owned": replaceLine(USR_OK, USR, st(1000, "81ed", "raul", USR)),
+    "group-writable": replaceLine(USR_OK, USR, st(0, "81fd", "root", USR)),
+    "other-writable": replaceLine(USR_OK, USR, st(0, "81ef", "root", USR)),
+    "symlink": replaceLine(USR_OK, USR, st(0, "a1ff", "root", USR)),
+    "dangling symlink": replaceLine(USR_OK, USR, st(1000, "a1ff", "raul", USR)),
+    "a directory": replaceLine(USR_OK, USR, st(0, "41ed", "root", USR)),
+    "a device": replaceLine(USR_OK, USR, st(0, "21b6", "root", USR)),
+    "writable /usr/bin": replaceLine(USR_OK, "/usr/bin", st(0, "41ff", "root", "/usr/bin")),
+    "user-owned /usr": replaceLine(USR_OK, "/usr", st(1000, "41ed", "raul", "/usr"))
+  }
+  const doubt = {
+    "/usr/bin missing from the read": gateRead(without(USR_ABSENT, "/usr/bin")),
+    "/usr/bin a symlink": gateRead(replaceLine(USR_ABSENT, "/usr/bin", st(0, "a1ff", "root", "/usr/bin"))),
+    "/usr/bin not a directory": gateRead(replaceLine(USR_ABSENT, "/usr/bin", st(0, "81ed", "root", "/usr/bin"))),
+    "/ missing from the read": gateRead(without(USR_ABSENT, "/")),
+    "an empty read": M.parseGateRead(""),
+    "garbage": M.parseGateRead("garbage\n"),
+    "cut short before mountinfo": M.parseGateRead(FC_LINE_OFF + USR_ABSENT + "again\n" + USR_ABSENT),
+    "the two stats differ": M.parseGateRead(FC_LINE_OFF + USR_ABSENT + "again\n" + USR_OK + "mountinfo\n" + MI_OK + "end\n"),
+    "mount table unread": gateRead(USR_ABSENT, "unread\n"),
+    "mount table over the cap": gateRead(USR_ABSENT, "over\n"),
+    "mount table cut short": gateRead(USR_ABSENT, MI_OK),
+    "fuse.conf line garbled": M.parseGateRead("fuseconf hex 0\n" + USR_ABSENT + "again\n" + USR_ABSENT + "mountinfo\n" + MI_OK + "end\n"),
+    // stat's errors are discarded: a folder the user cannot search (EACCES)
+    // prints nothing for the name either, so it must not read as absent.
+    "/usr/bin not searchable by others": gateRead(replaceLine(USR_ABSENT, "/usr/bin", st(0, "41e8", "root", "/usr/bin"))),
+    "/usr not searchable by others": gateRead(replaceLine(USR_ABSENT, "/usr", st(0, "41e8", "root", "/usr"))),
+    "/ not searchable by others": gateRead(replaceLine(USR_ABSENT, "/", st(0, "4168", "root", "/"))),
+    "/usr/bin not root's": gateRead(replaceLine(USR_ABSENT, "/usr/bin", st(1000, "41ed", "raul", "/usr/bin"))),
+    "/usr not root's": gateRead(replaceLine(USR_ABSENT, "/usr", st(1000, "41ed", "raul", "/usr"))),
+    "/ not root's": gateRead(replaceLine(USR_ABSENT, "/", st(1000, "416d", "raul", "/"))),
+    // Another path's read credited to this one (a late stream end): never absent.
+    "a read of /usr/bin/foo": gateRead(USR_ABSENT + st(0, "81ed", "root", "/usr/bin/foo") + "\n"),
+    "a read of the /opt path": gateRead(ROOT_OK),
+    "a read of a missing /opt path": gateRead(OPT_MISSING),
+    "an extra line beside the folders": gateRead(USR_ABSENT + st(0, "41ed", "root", "/opt") + "\n")
+  }
+  const reads = Object.assign({}, ...Object.entries(present).map(([k, t]) => ({ [k]: gateRead(t) })), doubt)
+  for (const [name, g] of Object.entries(reads)) {
+    assert.strictEqual(M.autoCandidateAbsent(g), false, name)
+    const c = choose("", { [USR]: g, [BIN]: gateRead(ROOT_OK) })
+    assert.deepStrictEqual([c.path, c.seen], [USR, [USR]], name + ": no fallback to /opt")
+    assert.strictEqual(c.v.ok, false, name + ": refused")
+    assert.strictEqual(c.setup, false, name + ": Set up backend is never offered for /usr/bin")
+    assert.deepStrictEqual(M.debugReadArgv(USR, g.stats, g.mounts, g.fuseConf, FLAGS), [], name + ": never run")
+  }
+  // Its own reason, with the package hint where reinstalling fixes it.
+  const own = (t) => choose("", { [USR]: gateRead(t) }).v
+  assert.deepStrictEqual(own(present["user-owned"]), { ok: false, kind: "owner",
+    reason: USR + " is owned by raul, not root. Reinstall the msi-gpu-mux-switch package." })
+  assert.strictEqual(own(present["group-writable"]).reason, USR + " is writable by group or others. Reinstall the msi-gpu-mux-switch package.")
+  assert.strictEqual(own(present["symlink"]).kind, "symlink")
+  assert.strictEqual(own(present["dangling symlink"]).kind, "symlink")
+  assert.strictEqual(own(present["a directory"]).kind, "notfile")
+  assert.deepStrictEqual(own(present["writable /usr/bin"]), { ok: false, kind: "ancestor", reason: "/usr/bin is writable by group or others." })
+  assert.strictEqual(choose("", { [USR]: doubt["/usr/bin missing from the read"] }).v.reason, "msi-mux-switch was not found at " + USR + ".",
+    "a read that cannot rule /usr/bin out names only /usr/bin")
+  assert.strictEqual(choose("", { [USR]: gateRead(without(USR_OK, "/usr/bin")) }).v.reason, "/usr/bin could not be checked.")
+  assert.strictEqual(choose("", { [USR]: doubt["the two stats differ"] }).v.kind, "mount")
+  // Only a whole read with /usr/bin a folder and nothing at the name is absent.
+  assert.strictEqual(M.autoCandidateAbsent(gateRead(USR_ABSENT)), true)
+  assert.strictEqual(M.autoCandidateAbsent(gateRead(USR_OK)), false)
+  assert.strictEqual(M.autoCandidateAbsent(null), false)
+  assert.strictEqual(M.autoChoice("", BIN, gateRead(USR_ABSENT)), "", "only /usr/bin moves on")
+})
+
+test("binary choice: Set up backend is never offered for /usr/bin, set or auto, and still is for /opt", () => {
+  const ok = { ok: true, kind: "ok", reason: "" }
+  for (const kind of ["missing", "symlink", "notfile", "owner", "mode", "ancestor"]) {
+    const v = { ok: false, kind, reason: "x" }
+    assert.strictEqual(M.setupHelps(v, USR), false, kind)
+    assert.strictEqual(M.setupHelps(v, BIN), true, kind)
+    assert.strictEqual(M.setupHelps(v, "/x/msi-mux-switch"), true, kind)
+    // Package-managed system folders, /bin and /sbin included (links into
+    // /usr on Arch, so "ancestor"): never offered.
+    for (const sys of ["/bin/msi-mux-switch", "/sbin/msi-mux-switch", "/usr/sbin/msi-mux-switch",
+      "/usr/local/bin/msi-mux-switch", "/usr/lib/msi-mux-switch/msi-mux-switch"])
+      assert.strictEqual(M.setupHelps(v, sys), false, kind + " " + sys)
+    // Only those folders: a name that merely starts the same still gets it.
+    for (const custom of ["/usrx/msi-mux-switch", "/binaries/msi-mux-switch", "/home/raul/bin/msi-mux-switch", "/opt/x/msi-mux-switch"])
+      assert.strictEqual(M.setupHelps(v, custom), true, kind + " " + custom)
+  }
+  assert.strictEqual(M.setupHelps(ok, USR), false)
+  assert.strictEqual(M.setupHelps(ok, BIN), false)
+  assert.strictEqual(M.setupHelps({ ok: false, kind: "mount", reason: "x" }, BIN), false)
+  // A set /usr/bin that fails gets the same answer as auto's.
+  const set = choose(USR, { [USR]: gateRead(replaceLine(USR_OK, USR, st(1000, "81ed", "raul", USR))) })
+  assert.deepStrictEqual([set.path, set.v.kind, set.setup], [USR, "owner", false])
+  assert.ok(set.v.reason.endsWith(" Reinstall the msi-gpu-mux-switch package."))
+  // The hint is not added for another path, set or chosen.
+  assert.strictEqual(M.binaryVerdict(BIN, BIN, gateRead(replaceLine(ROOT_OK, BIN, st(1000, "81ed", "raul", BIN))).stats, MI_OK, FC_OFF).reason,
+    BIN + " is owned by raul, not root.")
+  // Mount refusals point at both places.
+  assert.strictEqual(M.INSTALL_HINT, "Install msi-mux-switch at /usr/bin/msi-mux-switch (the msi-gpu-mux-switch package) or /opt/msi-mux-switch/msi-mux-switch.")
+})
+
 // Root-owned stat lines for a path and every folder above it.
 const rootStats = (p) => M.parseStat([st(0, "81ed", "root", p)].concat(M.ancestorDirs(p).map(d => st(0, "41ed", "root", d))).join("\n"))
 const mountVerdict = (mounts, p) => M.ownershipVerdict(p || BIN, rootStats(p || BIN), mounts, FC_OFF)
@@ -312,14 +486,14 @@ test("mounts: a FUSE or user_id mount at or above the binary is refused, whateve
     assert.strictEqual(v.ok, false, fx)
     assert.strictEqual(v.kind, "mount", fx)
     assert.strictEqual(v.reason, BIN + " is on a " + type + " mount at " + at
-      + ", which another account may control. Install msi-mux-switch somewhere like " + M.DEFAULT_BINARY + ".", fx)
+      + ", which another account may control. " + M.INSTALL_HINT, fx)
     assert.strictEqual(M.setupHelps(v), false, fx + ": setup.sh cannot fix a mount")
     assert.deepStrictEqual(M.debugReadArgv(BIN, rootStats(BIN), MI(fx), FC_OFF, FLAGS), [], fx + ": the status read never runs it")
   }
   // Not FUSE, but a mount another user's id owns.
   const u = mountVerdict(MI("user-id"))
   assert.deepStrictEqual([u.ok, u.kind, M.setupHelps(u)], [false, "mount", false])
-  assert.strictEqual(u.reason, BIN + " is on a mount at /opt owned by user_id 1000, which another account may control. Install msi-mux-switch somewhere like " + M.DEFAULT_BINARY + ".")
+  assert.strictEqual(u.reason, BIN + " is on a mount at /opt owned by user_id 1000, which another account may control. " + M.INSTALL_HINT)
   const line = (mp, opts, type, sup) => "90 1 0:60 / " + mp + " " + opts + " - " + type + " src " + sup
   const withLine = (l) => MI_OK + l + "\n"
   assert.strictEqual(mountVerdict(withLine(line("/opt", "rw", "tmpfs", "rw,user_id=0"))).ok, true, "user_id=0 is root's")
@@ -331,7 +505,7 @@ test("mounts: a FUSE or user_id mount at or above the binary is refused, whateve
     if (shown === null) continue
     const r = mountVerdict(withLine(line("/opt", "rw", "tmpfs", "rw,user_id=" + v)))
     assert.deepStrictEqual([r.ok, r.kind], [false, "mount"], "user_id=" + JSON.stringify(v))
-    assert.strictEqual(r.reason, BIN + " is on a mount at /opt owned by user_id " + shown + ", which another account may control. Install msi-mux-switch somewhere like " + M.DEFAULT_BINARY + ".")
+    assert.strictEqual(r.reason, BIN + " is on a mount at /opt owned by user_id " + shown + ", which another account may control. " + M.INSTALL_HINT)
   }
   assert.strictEqual(mountVerdict(withLine(line("/opt", "rw,user_id=", "tmpfs", "rw"))).ok, false, "an empty user_id in the mount options")
   assert.strictEqual(mountVerdict(withLine(line("/opt", "rw", "tmpfs", "rw,user_id=0,user_id=1000"))).ok, false, "every user_id counts")
@@ -2049,12 +2223,39 @@ test("debug read: only through the ownership gate, on the stat taken right befor
   assert.strictEqual((state.match(/debugProc\.running = true/g) || []).length, 1, "the debug read starts in one place")
   // Called from one place: the end of the stat, with that stat's result.
   assert.strictEqual((state.match(/root\.readDebug\(/g) || []).length, 1, "readDebug has one caller")
-  assert.ok(/var gate = Model\.parseGateRead\(text\)\s*root\.mounts = gate\.mounts\s*root\.fuseConf = gate\.fuseConf\s*root\.stats = gate\.stats\s*root\.statRead = true\s*root\.readDebug\(root\.stats, root\.mounts, root\.fuseConf\)/.test(state))
+  // ...through chosen(), which sets the chosen path and its own read together.
+  const ch = state.slice(state.indexOf("function chosen(path, gate)"))
+  const chBody = ch.slice(0, ch.indexOf("\n  }\n"))
+  assert.ok(state.indexOf("function chosen(path, gate)") !== -1)
+  assert.ok(/^function chosen\(path, gate\) \{\s*if \(path !== root\.binaryPath\) \{\s*root\.binaryPath = path\s*root\.debug = Model\.emptyDebug\(\)\s*\}\s*root\.mounts = gate\.mounts\s*root\.fuseConf = gate\.fuseConf\s*root\.stats = gate\.stats\s*root\.statRead = true\s*root\.readDebug\(root\.stats, root\.mounts, root\.fuseConf\)$/.test(chBody),
+    "the path and its read together; earlier state dropped only when the path changes")
+  assert.strictEqual((state.match(/root\.binaryPath = /g) || []).length, 2, "set only by a new setting and by chosen()")
+  assert.ok(/root\.binarySetting = p\s*root\.binaryPath = p\s*root\.statNext = ""\s*root\.statRead = false/.test(state), "a new setting drops the old choice")
+  // The status read: the first candidate, then autoChoice's, each gated on its own path.
+  const cb = state.slice(state.indexOf("function checkBinary()"))
+  const cbBody = cb.slice(0, cb.indexOf("\n  }\n"))
+  assert.ok(/root\.statNext = ""\s*root\.gateCandidate\(Model\.firstCandidate\(root\.binarySetting\)\)$/.test(cbBody))
+  const gc = state.slice(state.indexOf("function gateCandidate(path)"))
+  const gcBody = gc.slice(0, gc.indexOf("\n  }\n"))
+  assert.ok(/var argv = Model\.gateArgv\(path\)\s*if \(argv\.length === 0\) \{\s*root\.chosen\(path, \{ stats: \(\{\}\), mounts: null, fuseConf: null \}\)\s*return\s*\}\s*statProc\.path = path\s*statProc\.setting = root\.binarySetting\s*statProc\.run = \+\+root\.statRuns\s*statProc\.command = argv\s*statProc\.running = true$/.test(gcBody))
+  assert.strictEqual((state.match(/statProc\.running = true/g) || []).length, 1, "the status read starts in one place")
+  assert.strictEqual((state.match(/root\.gateCandidate\(/g) || []).length, 2, "the first candidate and autoChoice's")
+  assert.ok(/if \(statProc\.setting !== root\.binarySetting \|\| statProc\.run !== root\.statRuns \|\| root\.statAgain\) return\s*var gate = Model\.parseGateRead\(text\)\s*var next = Model\.autoChoice\(statProc\.setting, statProc\.path, gate\)\s*if \(next !== ""\) \{\s*root\.statNext = next\s*if \(!statProc\.running\) Qt\.callLater\(root\.gateNext\)\s*return\s*\}\s*root\.chosen\(statProc\.path, gate\)/.test(state),
+    "a stale read is dropped; only the chosen path's read is used")
+  assert.strictEqual((state.match(/root\.chosen\(/g) || []).length, 2)
+  assert.ok(/if \(root\.statAgain\) \{\s*root\.statAgain = false\s*root\.statNext = ""\s*Qt\.callLater\(root\.checkBinary\)\s*return\s*\}\s*if \(root\.statNext !== ""\) Qt\.callLater\(root\.gateNext\)/.test(state),
+    "a newer read drops the pending second candidate")
+  assert.ok(/function gateNext\(\) \{\s*if \(root\.statNext === "" \|\| statProc\.running\) return/.test(state))
   // Both gate reads are the one stat-and-mounts run, fresh every time.
   assert.ok(!/Model\.statArgv\(|Model\.parseStat\(/.test(state), "no stat without the mount table")
-  assert.strictEqual((state.match(/Model\.gateArgv\(root\.binaryPath\)/g) || []).length, 2, "the status read and the switch")
+  assert.strictEqual((state.match(/Model\.gateArgv\(/g) || []).length, 2, "the status read and the switch")
+  assert.strictEqual((state.match(/Model\.gateArgv\(root\.binaryPath\)/g) || []).length, 1, "the switch gates the chosen path, not a new choice")
+  assert.ok(/checkStat\.command = Model\.gateArgv\(root\.binaryPath\)\s*checkStat\.path = root\.binaryPath/.test(state))
   assert.ok(/checkStat\.result = Model\.parseGateRead\(text\)/.test(state))
-  assert.ok(/readonly property var ownership: root\.statRead\s*\? Model\.ownershipVerdict\(root\.binaryPath, root\.stats, root\.mounts, root\.fuseConf\)/.test(state))
+  assert.ok(/readonly property var ownership: root\.statRead\s*\? Model\.binaryVerdict\(root\.binarySetting, root\.binaryPath, root\.stats, root\.mounts, root\.fuseConf\)/.test(state))
+  assert.ok(!/Model\.ownershipVerdict\(/.test(state), "every verdict shown is binaryVerdict's")
+  assert.ok(/Model\.setupHelps\(root\.ownership, root\.binaryPath\)/.test(state), "never for /usr/bin")
+  assert.ok(/property string binaryPath: ""/.test(state) && /property string binarySetting: ""/.test(state))
   // Every read asked for again goes through a new stat.
   assert.ok(/root\.debugAgain = false\s*root\.checkBinary\(\)\s*\}\)/.test(state), "after a read ends")
   const fin = state.slice(state.indexOf("function finish(outcome)"))
@@ -2069,7 +2270,7 @@ test("debug read: only through the ownership gate, on the stat taken right befor
   // The switch's own stat refusing the binary drops the earlier read too.
   const ss = state.slice(state.indexOf("function startSwitch()"))
   const ssBody = ss.slice(0, ss.indexOf("\n  }\n"))
-  assert.ok(/var gate = checkStat\.result\s*root\.mounts = gate\.mounts\s*root\.fuseConf = gate\.fuseConf\s*root\.stats = gate\.stats\s*var verdict = Model\.ownershipVerdict\(root\.binaryPath, gate\.stats, gate\.mounts, gate\.fuseConf\)\s*if \(!verdict\.ok\) \{\s*root\.debug = Model\.emptyDebug\(\)\s*return root\.refused\(/.test(ssBody),
+  assert.ok(/var gate = checkStat\.result\s*root\.mounts = gate\.mounts\s*root\.fuseConf = gate\.fuseConf\s*root\.stats = gate\.stats\s*var verdict = Model\.binaryVerdict\(root\.binarySetting, root\.binaryPath, gate\.stats, gate\.mounts, gate\.fuseConf\)\s*if \(!verdict\.ok\) \{\s*root\.debug = Model\.emptyDebug\(\)\s*return root\.refused\(/.test(ssBody),
     "a refused pre-switch stat clears the debug read")
   assert.ok(!/\bpresent\b/.test(state), "no ungated presence flag")
   const bar = qmlCode("BarWidget.qml")
@@ -2104,15 +2305,18 @@ test("manifest: identity, version and the settings schema", () => {
   assert.strictEqual(m.id, "io.github.rsd.msi-mux")
   assert.strictEqual(m.id, M.PLUGIN_ID)
   assert.strictEqual(m.name, "MSI GPU MUX")
-  assert.strictEqual(m.version, "0.2.10")
+  assert.strictEqual(m.version, "0.2.11")
   assert.strictEqual(m.license, "MIT")
   assert.deepStrictEqual(m.kinds, ["bar-widget"])
   assert.deepStrictEqual(m.entryPoints, { barWidget: "BarWidget.qml" })
-  assert.deepStrictEqual(m.barWidget.defaults, { binaryPath: M.DEFAULT_BINARY, warnBeforeIntegrated: true })
+  // An empty binaryPath is auto (Model.binaryPathSetting).
+  assert.deepStrictEqual(m.barWidget.defaults, { binaryPath: "", warnBeforeIntegrated: true })
   const schema = Object.fromEntries(m.barWidget.schema.map(s => [s.key, s]))
   assert.deepStrictEqual(Object.keys(schema), ["binaryPath", "warnBeforeIntegrated"])
   assert.strictEqual(schema.binaryPath.type, "path")
-  assert.strictEqual(schema.binaryPath.defaultValue, M.DEFAULT_BINARY)
+  assert.strictEqual(schema.binaryPath.defaultValue, "")
+  for (const p of [M.USR_BINARY, M.OPT_BINARY]) assert.ok(schema.binaryPath.description.includes(p), "the description names " + p)
+  assert.strictEqual(M.binaryPathSetting(schema.binaryPath.defaultValue), "")
   assert.strictEqual(schema.warnBeforeIntegrated.type, "boolean")
   assert.strictEqual(schema.warnBeforeIntegrated.defaultValue, true)
   const bar = qmlCode("BarWidget.qml")

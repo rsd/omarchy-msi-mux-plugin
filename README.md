@@ -127,16 +127,46 @@ temporary file `.90-msi-mux-gpu.tmp` beside the env file and renames it over
 `90-msi-mux-gpu` with `mv -fT`; on a failure it removes the temporary file.
 Nothing else is written; after a pick, `90-msi-mux-gpu` is the only one of
 these files left.
-msi-mux-switch and its folder are yours to keep or delete.
+msi-mux-switch and its folder are yours to keep or delete (`yay -R` the
+package if you installed it from the AUR).
 
 ## Backend setup
 
 ### 1. Install msi-mux-switch
 
-Build it by following its own README (it is a Rust program) and put the binary
-in a folder of its own. The plugin looks for
-`/opt/msi-mux-switch/msi-mux-switch`; the **msi-mux-switch path** setting
-changes that.
+From the AUR, either package:
+
+```bash
+yay -S msi-gpu-mux-switch-bin   # upstream's official prebuilt binary
+yay -S msi-gpu-mux-switch       # built from source
+```
+
+Both install `/usr/bin/msi-mux-switch`, owned by root with mode 755: the file
+itself already passes the ownership check below, so step 2 and **Set up
+backend** are not needed. The `fuse.conf` and mount checks still apply to it.
+
+Or build it yourself by following its own README (it is a Rust program), put
+the binary in a folder of its own, `/opt/msi-mux-switch/msi-mux-switch`, and
+make it root-owned with step 2.
+
+Which binary the plugin uses:
+
+1. the **msi-mux-switch path** setting, when it is set: only that path is
+   checked, nothing else is looked for;
+2. with the setting empty (the default), `/usr/bin/msi-mux-switch` when
+   anything is there;
+3. otherwise `/opt/msi-mux-switch/msi-mux-switch`.
+
+If the **msi-mux-switch path** setting was saved with a path (for example the
+old default, `/opt/msi-mux-switch/msi-mux-switch`), that path keeps winning;
+clear the setting (leave it empty) to use the packaged `/usr/bin` binary.
+
+Anything at `/usr/bin/msi-mux-switch` counts as there: a file of any owner,
+a symlink (even a dangling one), a folder. If it fails the check, the plugin
+refuses with its reason; it does not fall back to `/opt`. So does a check
+that cannot tell whether anything is there. With neither present, the panel
+says "msi-mux-switch was not found at /usr/bin/msi-mux-switch or
+/opt/msi-mux-switch/msi-mux-switch."
 
 ### 2. Make it root-owned
 
@@ -185,7 +215,11 @@ as a failed mount check.
 
 When the check fails, the panel shows the reason (for example
 "/opt/msi-mux-switch/msi-mux-switch is owned by alice, not root.") and, for
-an ownership or mode problem, a **Set up backend** button. A mount refusal
+an ownership or mode problem, a **Set up backend** button. The button never
+appears for a path under `/usr/`, `/bin/` or `/sbin/`, folders the package
+manager owns; use `/opt` or another folder of your own. For
+`/usr/bin/msi-mux-switch` the file belongs to the package, so reinstall it (`yay -S msi-gpu-mux-switch-bin` or `yay -S msi-gpu-mux-switch`),
+and the panel's reason says so for a wrong owner or mode. A mount refusal
 (under a user-mount prefix, on a FUSE or user mount, a mount table that could
 not be checked, or `user_allow_other` turned on or `/etc/fuse.conf` unchecked)
 gets no such button: moving the binary, or for `user_allow_other` turning it
@@ -296,7 +330,7 @@ In the bar's widget settings:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| **msi-mux-switch path** (`binaryPath`) | `/opt/msi-mux-switch/msi-mux-switch` | Absolute path to the binary. Must not contain `..`. |
+| **msi-mux-switch path** (`binaryPath`) | empty | Absolute path to the binary. Must not contain `..`. Empty: `/usr/bin/msi-mux-switch` when anything is there, else `/opt/msi-mux-switch/msi-mux-switch` (see [Install msi-mux-switch](#1-install-msi-mux-switch)). A path set here is always the one used. |
 | **Warn about external screens before Integrated** (`warnBeforeIntegrated`) | on | Adds the external-screen warning to the Integrated confirmation. |
 
 ## What this does to your Hyprland config
@@ -393,16 +427,16 @@ Ctrl+Alt+F2, log in on the text console and run the same `rm`.
 
 | What the panel shows | Meaning and fix |
 |---|---|
-| Greyed, "...is owned by ..., not root", "...writable by group or others", "...is a symbolic link" | The root-ownership check failed. Use **Set up backend**; it tells you to rebuild into a folder only you can write when another account could already have changed the file. |
+| Greyed, "...is owned by ..., not root", "...writable by group or others", "...is a symbolic link" | The root-ownership check failed. Use **Set up backend**; it tells you to rebuild into a folder only you can write when another account could already have changed the file. For `/usr/bin/msi-mux-switch` there is no button: reinstall the `msi-gpu-mux-switch` (or `-bin`) package, or, with the path setting empty, remove whatever is at that name so the plugin uses `/opt`. |
 | "GPU mode unknown" with "user_allow_other is turned on in /etc/fuse.conf. It lets other accounts fake root-owned folders, so the plugin cannot trust that msi-mux-switch is root's. Turn it off (comment out that line) to use the plugin." | `user_allow_other` is on in `/etc/fuse.conf`. Comment out that line as root, then reopen the panel. No **Set up backend** button. Running `setup.sh` refuses for the same reason until it is off. |
 | "/etc/fuse.conf exists but could not be read, so the plugin cannot check that user_allow_other is off..." or "/etc/fuse.conf could not be checked for user_allow_other (it is too large or not plain text)." (or "...could not be checked for user_allow_other, which lets other accounts fake root-owned folders.") | The plugin could not read `/etc/fuse.conf` whole (unreadable, over 64 KiB, or a NUL byte in it, or the check did not finish), so it refuses. Make the file readable plain text under 64 KiB, make sure `user_allow_other` is off, then reopen the panel. If the file is a symlink, its target must be reachable. No **Set up backend** button. |
-| "GPU mode unknown" with "...is on a fuse mount at ..., which another account may control." or "...is on a mount at ... owned by user_id ..." | A FUSE or user mount sits on the binary's path or a folder above it. Move the binary to a folder like `/opt/msi-mux-switch`. No **Set up backend** button. |
+| "GPU mode unknown" with "...is on a fuse mount at ..., which another account may control." or "...is on a mount at ... owned by user_id ..." | A FUSE or user mount sits on the binary's path or a folder above it. Install the package (`/usr/bin/msi-mux-switch`) or move the binary to `/opt/msi-mux-switch`. No **Set up backend** button. |
 | "...could not be checked: /proc/self/mountinfo could not be read." (or "...could not be parsed.", "...has no entry for /.") | The mount table could not be read whole (it is limited to 1 MiB), so the plugin refuses. Try again; if it persists, the table is unusual. No **Set up backend** button. |
 | "... or a folder above it changed while it was being checked (stat gave two different answers)." | The binary or a folder above it changed between the two stats. Rebuild into a folder only you can write, then try again. |
-| Greyed, "msi-mux-switch was not found at ..." | Install the binary, or fix the path setting. |
+| Greyed, "msi-mux-switch was not found at ..." | Install the binary (see [Install msi-mux-switch](#1-install-msi-mux-switch)), or fix the path setting. With the setting empty both places are named. |
 | "Not an MSI machine": widget hidden | Expected. |
 | Greyed, "...have not been tested on this machine (model, board, BIOS)" | Not in either table; switching stays off. |
-| "Under /mnt" (or `/media`, `/run/media`, `/run/user`) | Move the binary to a folder like `/opt/msi-mux-switch`. |
+| "Under /mnt" (or `/media`, `/run/media`, `/run/user`) | Install the package (`/usr/bin/msi-mux-switch`) or move the binary to `/opt/msi-mux-switch`. |
 | "Connect AC power" / "On battery" | The firmware switch requires AC. Plug in; the buttons enable by themselves. |
 | "Needs AC power (state unknown)" | The plugin could not find an AC supply under `/sys/class/power_supply`. |
 | "Not offered by this firmware" | That mode is not available on this laptop. |
@@ -474,8 +508,22 @@ What the plugin runs and writes, and when:
   for `/`, or when the two `stat` answers differ. The paths and format are
   positional arguments; nothing but the size caps is part of the script text.
   Each gate decision uses a fresh read; the switch never reuses the status
-  read's. The panel offers no **Set up backend** for a mount refusal or for
-  `user_allow_other`.
+  read's. The panel offers no **Set up backend** for a mount refusal, for
+  `user_allow_other`, or for any path under `/usr/`, `/bin/` or `/sbin/`
+  (package-managed system folders, `/usr/bin/msi-mux-switch` included).
+- **Which binary is gated**: a path set in the settings, alone. With the
+  setting empty, the status read gates `/usr/bin/msi-mux-switch` first, and
+  gates `/opt/msi-mux-switch/msi-mux-switch` in a second run only when the
+  first read finished whole, `stat` printed `/usr/bin`, `/usr` and `/` as
+  root-owned directories searchable by others and printed nothing else, not
+  even the binary (`stat` never follows a
+  symlink, so a link there, dangling or not, counts as present). Any other
+  answer keeps `/usr/bin` and its verdict; a refused `/usr/bin` binary is
+  never skipped. The chosen path and its own gate read are taken together,
+  so the binary the debug read runs is the one whose read just passed; a
+  read started for an earlier setting, or overtaken by a newer read, is
+  dropped. The switch gates that chosen path again right before `pkexec` and
+  refuses if the chosen path changed meanwhile; it does not choose anew.
 - **Residual risk**: a check that runs before `pkexec` cannot be atomic with
   the exec. The timing race this left open (an account with `user_allow_other`
   remounting within the ~1 ms between the mountinfo read and the second

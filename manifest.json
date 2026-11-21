@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.rsd.msi-mux",
   "name": "MSI GPU MUX",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "author": "Raul Dias",
   "license": "MIT",
   "description": "Switch the hardware GPU MUX of supported MSI laptops (Discrete, MSHybrid, Integrated) from the Omarchy bar, through msi-mux-switch and the shell's polkit prompt. Shows the current and the staged mode, and in MSHybrid can choose the GPU Hyprland composites on.",
@@ -19,7 +19,7 @@
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
-      "binaryPath": "/opt/msi-mux-switch/msi-mux-switch",
+      "binaryPath": "",
       "warnBeforeIntegrated": true
     },
     "schema": [
@@ -27,8 +27,8 @@
         "key": "binaryPath",
         "type": "path",
         "label": "msi-mux-switch path",
-        "defaultValue": "/opt/msi-mux-switch/msi-mux-switch",
-        "description": "Absolute path to the msi-mux-switch binary. The plugin only switches when this file and every directory above it are owned by root and not writable by group or others; Set up backend in the panel fixes the file and its folder. Empty: the default."
+        "defaultValue": "",
+        "description": "Absolute path to the msi-mux-switch binary. Empty: /usr/bin/msi-mux-switch (the msi-gpu-mux-switch package) if anything is there, else /opt/msi-mux-switch/msi-mux-switch; a path set here is always the one used. The plugin only switches when this file and every directory above it are owned by root and not writable by group or others; for a binary outside /usr/bin, Set up backend in the panel fixes the file and its folder."
       },
       {
         "key": "warnBeforeIntegrated",
